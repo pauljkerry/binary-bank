@@ -1,0 +1,12 @@
+__pycache__/
+.ipynb_checkpoints/
+.env
+artifacts/
+input/
+output/
+data_description.txt
+docker-compose.yml
+todo.txt
+*.pyc
+*.log
+.virtual_documents/
