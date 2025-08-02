@@ -48,7 +48,7 @@ def create_objective(
                 "random_strength", 1, 80
             ),
             "border_count": trial.suggest_int(
-                "border_count", 64, 255
+                "border_count", 128, 255
             ),
             "task_type": task_type,
             "early_stopping_rounds": early_stopping_rounds,

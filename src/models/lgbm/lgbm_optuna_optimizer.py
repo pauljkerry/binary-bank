@@ -32,14 +32,14 @@ def create_objective(
         params = {
             "learning_rate": trial.suggest_float(
                 "learning_rate", 0.02, 0.02),
-            "max_depth": trial.suggest_int("max_depth", 5, 10),
-            "num_leaves": trial.suggest_int("num_leaves", 400, 800),
+            "max_depth": trial.suggest_int("max_depth", 5, 20),
+            "num_leaves": trial.suggest_int("num_leaves", 300, 1200),
             "min_child_samples": trial.suggest_int("min_child_samples",
-                                                   0, 2000),
+                                                   2000, 20000),
             "min_split_gain": trial.suggest_float("min_split_gain",
                                                   1e-5, 10, log=True),
             "feature_fraction": trial.suggest_float("feature_fraction",
-                                                    0.3, 0.45),
+                                                    0.3, 0.85),
             "bagging_fraction": trial.suggest_float("bagging_fraction",
                                                     0.65, 1.00),
             "bagging_freq": trial.suggest_int("bagging_freq", 1, 15),

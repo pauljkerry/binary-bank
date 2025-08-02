@@ -110,6 +110,7 @@ def plot_category_freq(df, cols=None):
     plt.show()
 
     for col, summary_df_T in summary_tables.items():
+        print(f"==== {col} ====")
         display(summary_df_T)
 
 

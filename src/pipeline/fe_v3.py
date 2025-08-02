@@ -2,8 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.preprocessing import StandardScaler
-from itertools import combinations
-import joblib
+from src.utils.target_encoding import target_encoding
 
 
 def feature_engineering(train_data, test_data):
@@ -26,62 +25,52 @@ def feature_engineering(train_data, test_data):
 
     Notes
     -----
-    - LogReg用
-    - 3変数交互作用を追加
+    - MLP用
+    - target encodingを行う
+    - defaultをdrop
     """
     # 全データを結合（train + original + test）
     all_data = pd.concat(
         [train_data, test_data], ignore_index=True
     )
 
-    # === 1) カテゴリー変数をOne Hot Encoding ===
-    cat_cols = all_data.select_dtypes(include=["category", "object"]).columns.difference(["target"])
+    # === 1) カテゴリー変数をTarget Encoding ===
+    base_cat_cols = all_data.select_dtypes(
+        include=["category", "object"]).columns.difference(["default"])
+    cat_cols_te = [col for col in base_cat_cols 
+                   if all_data[col].nunique() >= 3]
 
-    encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-    ohe_df = pd.DataFrame(
-        encoder.fit_transform(all_data[cat_cols]),
-        columns=encoder.get_feature_names_out(cat_cols),
+    te_df = target_encoding(train_data, test_data, cat_cols=cat_cols_te)
+
+    # === 2) カテゴリ変数をOne Hot Encoding ===
+    cat_cols_ohe = base_cat_cols.difference(cat_cols_te)
+    encoder = OneHotEncoder(
+        sparse_output=False, handle_unknown='ignore', drop="first")
+    cat_ohe_df = pd.DataFrame(
+        encoder.fit_transform(all_data[cat_cols_ohe]),
+        columns=encoder.get_feature_names_out(cat_cols_ohe),
         index=all_data.index)
 
     # === 2) 数値変数を標準化
-    num_df = all_data.select_dtypes(include=np.number).drop("target", erros="ignore")
+    num_df = all_data.select_dtypes(include=np.number).drop("target", errors="ignore")
+    te_df.index = all_data.index
+    merged_df = pd.concat([num_df, te_df], axis=1)
 
     scaler = StandardScaler()
-    scaled_array = scaler.fit_transform(num_df)
+    scaled_array = scaler.fit_transform(merged_df)
     num_scaled_df = pd.DataFrame(
         scaled_array,
-        columns=num_df.columns,
+        columns=merged_df.columns,
         index=all_data.index
     )
-
-    # === 2) 交互作用を追加
-    inter_df = pd.DataFrame(index=all_data.index)
-    inter_df2 = pd.DataFrame(index=all_data.index)
-    inter_df3 = pd.DataFrame(index=all_data.index)
-    merged_df = pd.concat([ohe_df, num_scaled_df], axis=1)
-
-    for col1, col2 in combinations(merged_df.columns, 2):
-        col_name = f"{col1}_{col2}"
-        inter_df2[col_name] = merged_df[col1] * merged_df[col2]
-
-    for col1, col2, col3 in combinations(merged_df.columns, 3):
-        col_name = f"{col1}_{col2}_{col3}"
-        inter_df3[col_name] = merged_df[col1] * merged_df[col2] * merged_df[col3]
-
-    inter_df = pd.concat([inter_df2, inter_df3], axis=1)
-
     # === dfを結合 ===
-    num_df = all_data.select_dtypes(
-        include=np.number
-    )
-    df_feat = pd.concat([num_scaled_df, ohe_df, inter_df], axis=1)
+    df_feat = pd.concat([num_scaled_df, cat_ohe_df], axis=1)
 
     # === データを分割 ===
     tr_df = df_feat.iloc[:len(train_data)].copy()
     test_df = df_feat.iloc[len(train_data):]
 
     # === targetを追加 ===
-    le_loaded = joblib.load("../artifacts/label_encoder.pkl")
-    tr_df["target"] = le_loaded.transform(train_data["target"])
+    tr_df["target"] = train_data["target"]
 
     return tr_df, test_df

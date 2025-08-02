@@ -224,7 +224,7 @@ class MLPCVTrainer:
             )
             criterion = nn.BCEWithLogitsLoss()
 
-            best_logloss = float("inf")
+            best_log_loss = float("inf")
             best_model_state = None
             best_epoch = 0
 
@@ -253,7 +253,7 @@ class MLPCVTrainer:
                         pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
                         preds.append(pred_probs)
                 val_pred = np.concatenate(preds)
-                val_logloss = log_loss(y_val, val_pred)
+                val_log_loss = log_loss(y_val, val_pred)
                 scheduler.step()
 
                 if (epoch + 1) % self.log_interval == 0 or epoch == 0:
@@ -269,16 +269,16 @@ class MLPCVTrainer:
                             train_targets.append(yb.numpy())
                     train_preds = np.concatenate(train_preds)
                     train_targets = np.concatenate(train_targets)
-                    train_logloss = log_loss(train_targets, train_preds)
+                    train_log_loss = log_loss(train_targets, train_preds)
 
                     print(
                         f"Epoch {epoch+1}: "
-                        f"Train Logloss = {train_logloss:.5f}, "
-                        f"Val Logloss = {val_logloss:.5f}"
+                        f"Train Logloss = {train_log_loss:.5f}, "
+                        f"Val Logloss = {val_log_loss:.5f}"
                     )
 
-                if val_logloss < best_logloss:
-                    best_logloss = val_logloss
+                if val_log_loss < best_log_loss:
+                    best_log_loss = val_log_loss
                     best_model_state = {
                         k: v.cpu().clone() for k, v
                         in model.state_dict().items()
@@ -286,14 +286,14 @@ class MLPCVTrainer:
                     best_epoch = epoch + 1
                     print(
                         f"New best model saved at epoch {epoch+1}, "
-                        f"Logloss: {val_logloss:.5f}")
+                        f"Logloss: {val_log_loss:.5f}")
                 elif (
                     (epoch - best_epoch >= self.early_stopping_rounds) and
                     (epoch + 1 >= self.min_epochs)
                 ):
                     print(f"Early stopping at epoch {epoch+1}")
                     print(f"Loading best model from epoch {best_epoch} "
-                          f"with Logloss {best_logloss:.5f}")
+                          f"with Logloss {best_log_loss:.5f}")
                     break
 
             model.load_state_dict(
@@ -306,7 +306,7 @@ class MLPCVTrainer:
                 fold,
                 best_rounds=best_epoch
             ))
-            self.fold_scores.append(best_logloss)
+            self.fold_scores.append(best_log_loss)
 
             epoch_list.append(best_epoch)
 
@@ -324,7 +324,7 @@ class MLPCVTrainer:
                 test_preds += test_probs.cpu().numpy().ravel()
 
             end = time.time()
-            print(f"Best RMSE: {best_logloss:.5f}")
+            print(f"Best Logloss: {best_log_loss:.5f}")
             print_duration(start, end)
 
         self.oof_score = log_loss(y, oof_preds)
@@ -418,7 +418,7 @@ class MLPCVTrainer:
         )
         criterion = nn.BCEWithLogitsLoss()
 
-        best_rmse = float("inf")
+        best_logloss = float("inf")
         best_model_state = None
         best_epoch = 0
 
@@ -447,7 +447,7 @@ class MLPCVTrainer:
                     pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
                     preds.append(pred_probs)
             val_pred = np.concatenate(preds)
-            val_rmse = log_loss(y_val, val_pred)
+            val_logloss = log_loss(y_val, val_pred)
             scheduler.step()
 
             if (epoch + 1) % 1 == 0 or epoch == 0:
@@ -464,16 +464,16 @@ class MLPCVTrainer:
                         train_targets.append(yb.numpy())
                 train_preds = np.concatenate(train_preds)
                 train_targets = np.concatenate(train_targets)
-                train_logloss = log_loss(train_targets, train_preds)
+                train_log_loss = log_loss(train_targets, train_preds)
 
                 print(
                     f"Epoch {epoch+1}: "
-                    f"Train RMSE = {train_logloss:.5f}, "
-                    f"Val RMSE = {val_rmse:.5f}"
+                    f"Train Logloss = {train_log_loss:.5f}, "
+                    f"Val Logloss = {val_logloss:.5f}"
                 )
 
-            if val_rmse < best_rmse:
-                best_rmse = val_rmse
+            if val_logloss < best_logloss:
+                best_logloss = val_logloss
                 best_model_state = model.state_dict()
                 best_model_state = {
                     k: v.cpu().clone() for k, v
@@ -481,7 +481,7 @@ class MLPCVTrainer:
                 }
                 print(
                     f"New best model saved at epoch {epoch+1}, "
-                    f"RMSE: {val_rmse:.5f}")
+                    f"Logloss: {val_logloss:.5f}")
                 best_epoch = epoch + 1
             elif (
                 (epoch - best_epoch >= self.early_stopping_rounds) and
@@ -490,7 +490,7 @@ class MLPCVTrainer:
                 print(f"Early stopping at epoch {epoch+1}")
                 print(
                     f"Loading best model from epoch {best_epoch} "
-                    f"with RMSE {best_rmse:.5f}")
+                    f"with Logloss {best_logloss:.5f}")
                 break
 
         model.load_state_dict(
@@ -499,7 +499,7 @@ class MLPCVTrainer:
 
         end = time.time()
         print_duration(start, end)
-        print(f"Best RMSE: {best_rmse:.5f}")
+        print(f"Best Logloss: {best_logloss:.5f}")
 
         self.fold_models.append(MLPFoldModel(
             model,
@@ -508,7 +508,7 @@ class MLPCVTrainer:
             0,
             best_rounds=best_epoch
         ))
-        self.fold_scores.append(best_rmse)
+        self.fold_scores.append(best_logloss)
 
 
 class MLPFoldModel:

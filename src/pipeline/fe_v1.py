@@ -1,7 +1,6 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
-import joblib
 
 
 def feature_engineering(train_data, test_data):
@@ -33,7 +32,7 @@ def feature_engineering(train_data, test_data):
     )
 
     # === 1) カテゴリー変数をlabel encoding ===
-    cat_cols = all_data.select_dtypes(include=["category", "object"]).columns.difference(["target"])
+    cat_cols = all_data.select_dtypes(include=["category", "object"]).columns
     le_df = pd.DataFrame(index=all_data.index)
 
     for c in cat_cols:
@@ -42,7 +41,7 @@ def feature_engineering(train_data, test_data):
     le_df = le_df.astype("str")
 
     # === dfを結合 ===
-    num_df = all_data.select_dtypes(include=np.number).drop("target", erros="ignore")
+    num_df = all_data.select_dtypes(include=np.number).drop("target", errors="ignore")
     df_feat = pd.concat([num_df, le_df], axis=1)
 
     # === データを分割 ===
@@ -50,7 +49,6 @@ def feature_engineering(train_data, test_data):
     test_df = df_feat.iloc[len(train_data):]
 
     # === targetを追加 ===
-    le_loaded = joblib.load("../artifacts/label_encoder.pkl")
-    tr_df["target"] = le_loaded.transform(train_data["target"])
+    tr_df["target"] = train_data["target"]
 
     return tr_df, test_df

@@ -360,9 +360,14 @@ class XGBFoldModel:
         sample : int, default 1000
             可視化に使用するサンプル数。
         """
-        explainer = shap.TreeExplainer(self.model)
-        shap_values = explainer(self.X_valid[:sample])
-        shap.summary_plot(shap_values, self.X_valid[:sample])
+        sample_X = self.X_valid[:sample].copy()
+        for col in sample_X.select_dtypes(include="category").columns:
+            sample_X[col] = sample_X[col].cat.codes
+
+        explainer = shap.TreeExplainer(
+            self.model, feature_perturbation='interventional')
+        shap_values = explainer.shap_values(sample_X)
+        shap.summary_plot(shap_values, sample_X)
 
     def plot_gain_importance(self):
         """

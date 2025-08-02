@@ -18,7 +18,7 @@ def preprocessing():
     test_data = test_data.copy()
 
     rename_map = {
-        "ABCDE": "target"
+        "y": "target"
     }
 
     train_renamed = train_data.rename(

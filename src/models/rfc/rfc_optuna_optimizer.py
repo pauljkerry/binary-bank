@@ -20,8 +20,8 @@ def create_objective(tr_df, n_splits=5):
     """
     def objective(trial):
         params = {
-            "n_estimators": trial.suggest_int("n_estimators", 50, 100),
-            "max_depth": trial.suggest_int("max_depth", 4, 20)
+            "n_estimators": trial.suggest_int("n_estimators", 50, 150),
+            "max_depth": trial.suggest_int("max_depth", 4, 100)
         }
 
         trainer = RFCCVTrainer(

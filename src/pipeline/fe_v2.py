@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.preprocessing import StandardScaler
-import joblib
 
 
 def feature_engineering(train_data, test_data):
@@ -63,7 +62,6 @@ def feature_engineering(train_data, test_data):
     test_df = df_feat.iloc[len(train_data):]
 
     # === targetを追加 ===
-    le_loaded = joblib.load("../artifacts/label_encoder.pkl")
-    tr_df["target"] = le_loaded.transform(train_data["target"])
+    tr_df["target"] = train_data["target"]
 
     return tr_df, test_df

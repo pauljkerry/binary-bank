@@ -7,6 +7,7 @@ def create_objective(
     n_splits=5,
     epochs=100,
     early_stopping_rounds=20,
+    min_epochs=30,
     use_gpu=True,
 ):
     """
@@ -22,6 +23,8 @@ def create_objective(
         エポック数。
     early_stopping_rounds : int, default 200
         早期停止ラウンド数。
+    min_epochs : int, default 50
+        最低限学習するエポック数
     use_gpu : bool, default True
         Trueの場合はGPUが使用可能であれば使用する。
 
@@ -31,33 +34,47 @@ def create_objective(
         Optunaで使用する目的関数。
     """
     def objective(trial):
-        hidden_dim1 = trial.suggest_int("hidden_dim1", 64, 512, step=32)
+        num_layers = trial.suggest_int("num_layers", 2, 4)
+
+        hidden_dim1 = trial.suggest_int("hidden_dim1", 256, 1024, step=32)
         hidden_dim2 = trial.suggest_int(
-            "hidden_dim2", 32, hidden_dim1, step=32
-        )
+            "hidden_dim2", 128, hidden_dim1, step=32)
+        hidden_dim3 = trial.suggest_int(
+            "hidden_dim3", 64, hidden_dim2, step=32
+        ) if num_layers >= 3 else None
+        hidden_dim4 = trial.suggest_int(
+            "hidden_dim4", 32, hidden_dim3, step=32
+        ) if num_layers >= 4 else None
+
+        hidden_dims = [hidden_dim1, hidden_dim2]
+        if num_layers >= 3:
+            hidden_dims.append(hidden_dim3)
+        if num_layers >= 4:
+            hidden_dims.append(hidden_dim4)
+
         params = {
             "n_splits": n_splits,
             "epochs": epochs,
             "early_stopping_rounds": early_stopping_rounds,
+            "min_epochs": min_epochs,
             "use_gpu": use_gpu,
             "batch_size": trial.suggest_int(
-                "batch_size", 32, 256, step=32
+                "batch_size", 256, 2048, step=32
             ),
-            "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
+            "lr": trial.suggest_float("lr", 1e-3, 1e-1, log=True),
+            "eta_min": trial.suggest_float("eta_min", 1e-4, 1e-3, log=True),
             "dropout_rate": round(trial.suggest_float(
-                "dropout_rate", 0, 0.3, step=0.05), 2),
+                "dropout_rate", 0.1, 0.4, step=0.05), 2),
             "activation": trial.suggest_categorical("activation", [
                 "ReLU",
-                "Tanh",
                 "LeakyReLU",
-                "ELU",
                 "GELU",
                 "SiLU",
-                "Sigmoid"
+                # "Tanh",
+                # "ELU",
+                # "Sigmoid"
             ]),
-            "hidden_dim1": hidden_dim1,
-            "hidden_dim2": hidden_dim2
-            # dim3 = trial.suggest_int("hidden_dim3", 32, dim2, step=32)
+            "hidden_dims": hidden_dims,
         }
 
         trainer = MLPCVTrainer(**params)
