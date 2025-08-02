@@ -32,7 +32,7 @@ def feature_engineering(train_data, test_data):
 
     # === 1) カテゴリー変数をOne Hot Encoding ===
     cat_cols = [col for col in all_data.columns if all_data[col].dtype == pl.Utf8]
-    ohe_df = all_data.select(pl.get_dummies(all_data.select(cat_cols)))
+    ohe_df = all_data.select(cat_cols).to_dummies()
 
     # === 2) 数値変数を標準化
     num_cols = [col for col in all_data.columns if all_data[col].dtype in [pl.Float64, pl.Int64] and col != "target"]
@@ -44,16 +44,17 @@ def feature_engineering(train_data, test_data):
     # === 2) 交互作用を追加
     merged_df = pl.concat([ohe_df, num_scaled_df], how="horizontal")
     inter_2 = []
-    inter_3 = []
+    # inter_3 = []
     colnames = merged_df.columns
 
     for col1, col2 in combinations(colnames, 2):
         inter_2.append((merged_df[col1] * merged_df[col2]).alias(f"{col1}_{col2}"))
 
+    """
     for col1, col2, col3 in combinations(colnames, 3):
         inter_3.append((merged_df[col1] * merged_df[col2] * merged_df[col3]).alias(f"{col1}_{col2}_{col3}"))
-
-    inter_df = pl.DataFrame(inter_2 + inter_3)
+    """
+    inter_df = pl.DataFrame(inter_2)
 
     # === dfを結合 ===
     feat_df = pl.concat([num_scaled_df, ohe_df, inter_df], how="horizontal")
