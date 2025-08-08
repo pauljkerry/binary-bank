@@ -2,7 +2,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import log_loss
+from sklearn.metrics import roc_auc_score
 import shap
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -48,7 +48,7 @@ class LGBMCVTrainer:
         """
         default_params = {
             "objective": "binary",
-            "metric": "binary_logloss",
+            "metric": "auc",
             "learning_rate": 0.1,
             "num_leaves": 500,
             "max_depth": -1,
@@ -107,7 +107,7 @@ class LGBMCVTrainer:
 
         oof_preds = np.zeros(len(X))
         test_preds = np.zeros(len(test_df))
-        test_df = test_df.to_numpy()
+        test_df = test_df
 
         skf = StratifiedKFold(
             n_splits=self.n_splits, shuffle=True,
@@ -149,7 +149,7 @@ class LGBMCVTrainer:
             )
 
             # oof
-            val = X.iloc[val_idx].to_numpy()
+            val = X.iloc[val_idx]
             oof_preds[val_idx] = model.predict(val)
 
             test_preds += model.predict(test_df)
@@ -158,10 +158,10 @@ class LGBMCVTrainer:
             print_duration(start, end)
 
             best_iter = model.best_iteration
-            train_score = evals_result["train"]["binary_logloss"][best_iter-1]
-            eval_score = evals_result["eval"]["binary_logloss"][best_iter-1]
-            print(f"Train Logloss: {train_score:.5f}")
-            print(f"Valid Logloss: {eval_score:.5f}")
+            train_score = evals_result["train"]["auc"][best_iter-1]
+            eval_score = evals_result["eval"]["auc"][best_iter-1]
+            print(f"Train AUC: {train_score:.5f}")
+            print(f"Valid AUC: {eval_score:.5f}")
 
             self.fold_models.append(LGBMFoldModel(
                 model, X_val, y_val, fold))
@@ -176,7 +176,7 @@ class LGBMCVTrainer:
             f"Std: {np.std(self.fold_scores):.5f}"
         )
 
-        self.oof_score = log_loss(y, oof_preds)
+        self.oof_score = roc_auc_score(y, oof_preds)
         print(f"OOF score: {self.oof_score:.5f}")
         print(f"Avg best iteration: {np.mean(iteration_list)}")
         print(f"Best iterations: \n{iteration_list}")
@@ -327,10 +327,10 @@ class LGBMCVTrainer:
         print_duration(start, end)
 
         best_iter = model.best_iteration
-        train_score = evals_result["train"]["binary_logloss"][best_iter-1]
-        eval_score = evals_result["eval"]["binary_logloss"][best_iter-1]
-        print(f"Train Logloss: {train_score:.5f}")
-        print(f"Valid Logloss: {eval_score:.5f}")
+        train_score = evals_result["train"]["auc"][best_iter-1]
+        eval_score = evals_result["eval"]["auc"][best_iter-1]
+        print(f"Train AUC: {train_score:.5f}")
+        print(f"Valid AUC: {eval_score:.5f}")
 
         self.fold_models.append(
             LGBMFoldModel(model, X_val, y_val, fold))

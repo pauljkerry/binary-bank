@@ -33,7 +33,7 @@ def create_objective(
     def objective(trial):
         params = {
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.03),
-            "max_depth": trial.suggest_int("max_depth", 3, 20),
+            "max_depth": trial.suggest_int("max_depth", 3, 30),
             "min_child_weight": trial.suggest_float(
                 "min_child_weight", 0, 100),
             "colsample_bytree": trial.suggest_float(

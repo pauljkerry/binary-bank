@@ -30,10 +30,10 @@ def feature_engineering(train_data, test_data):
     # 全データを結合（train + original + test）
     all_data = pd.concat(
         [train_data, test_data], ignore_index=True
-    )
+    ).drop("target", axis=1, errors="ignore")
 
     # === 1) カテゴリー変数をOne Hot Encoding ===
-    cat_cols = all_data.select_dtypes(include=["category", "object"]).columns.difference(["target"])
+    cat_cols = all_data.select_dtypes(include=["category", "object"]).columns
 
     encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
     cat_ohe_df = pd.DataFrame(
@@ -42,7 +42,7 @@ def feature_engineering(train_data, test_data):
         index=all_data.index)
 
     # === 2) 数値変数を標準化
-    num_df = all_data.select_dtypes(include=np.number).drop("target", erros="ignore")
+    num_df = all_data.select_dtypes(include=np.number)
 
     scaler = StandardScaler()
     scaled_array = scaler.fit_transform(num_df)

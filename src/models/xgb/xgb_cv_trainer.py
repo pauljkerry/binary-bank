@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import shap
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import log_loss
+from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
@@ -48,7 +48,7 @@ class XGBCVTrainer:
         """
         default_params = {
             "objective": "binary:logistic",
-            "eval_metric": "logloss",
+            "eval_metric": "auc",
             "learning_rate": 0.1,
             "max_depth": 7,
             "min_child_weight": 10.0,
@@ -158,10 +158,10 @@ class XGBCVTrainer:
             print_duration(start, end)
 
             best_iter = model.best_iteration
-            train_score = evals_result["train"]["logloss"][best_iter]
-            eval_score = evals_result["eval"]["logloss"][best_iter]
-            print(f"Train Logloss: {train_score:.5f}")
-            print(f"Valid Logloss: {eval_score:.5f}")
+            train_score = evals_result["train"]["auc"][best_iter]
+            eval_score = evals_result["eval"]["auc"][best_iter]
+            print(f"Train AUC: {train_score:.5f}")
+            print(f"Valid AUC: {eval_score:.5f}")
 
             self.fold_models.append(
                 XGBFoldModel(model, X_val, y_val, fold))
@@ -169,14 +169,14 @@ class XGBCVTrainer:
 
             iteration_list.append(best_iter)
 
-        print("\n=== CV 結果 ===")
+        print("\n=== CV Results ===")
         print(f"Fold scores: {self.fold_scores}")
         print(
             f"Mean: {np.mean(self.fold_scores):.5f}, "
             f"Std: {np.std(self.fold_scores):.5f}"
         )
 
-        self.oof_score = log_loss(y, oof_preds)
+        self.oof_score = roc_auc_score(y, oof_preds)
         print(f"OOF score: {self.oof_score:.5f}")
         print(f"Avg best iteration: {np.mean(iteration_list)}")
         print(f"Best iterations: \n{iteration_list}")
@@ -320,10 +320,10 @@ class XGBCVTrainer:
         print_duration(start, end)
 
         best_iter = model.best_iteration
-        train_score = evals_result["train"]["logloss"][best_iter]
-        eval_score = evals_result["eval"]["logloss"][best_iter]
-        print(f"Train Logloss: {train_score:.5f}")
-        print(f"Valid Logloss: {eval_score:.5f}")
+        train_score = evals_result["train"]["auc"][best_iter]
+        eval_score = evals_result["eval"]["auc"][best_iter]
+        print(f"Train AUC: {train_score:.5f}")
+        print(f"Valid AUC: {eval_score:.5f}")
 
         self.fold_models.append(XGBFoldModel(model, X_val, y_val, fold))
         self.fold_scores.append(eval_score)

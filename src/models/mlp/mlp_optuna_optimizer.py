@@ -21,7 +21,7 @@ def create_objective(
         CV分割数。
     epochs : int, default 100
         エポック数。
-    early_stopping_rounds : int, default 200
+    early_stopping_rounds : int, default 20
         早期停止ラウンド数。
     min_epochs : int, default 50
         最低限学習するエポック数
@@ -34,7 +34,7 @@ def create_objective(
         Optunaで使用する目的関数。
     """
     def objective(trial):
-        num_layers = trial.suggest_int("num_layers", 2, 4)
+        num_layers = trial.suggest_int("num_layers", 4, 4)
 
         hidden_dim1 = trial.suggest_int("hidden_dim1", 256, 1024, step=32)
         hidden_dim2 = trial.suggest_int(
@@ -59,7 +59,7 @@ def create_objective(
             "min_epochs": min_epochs,
             "use_gpu": use_gpu,
             "batch_size": trial.suggest_int(
-                "batch_size", 256, 2048, step=32
+                "batch_size", 512, 1120, step=32
             ),
             "lr": trial.suggest_float("lr", 1e-3, 1e-1, log=True),
             "eta_min": trial.suggest_float("eta_min", 1e-4, 1e-3, log=True),

@@ -35,10 +35,7 @@ def save_ensemble_prediction(test_preds_list, weights_dict, ID):
     # 加重平均
     y_prob = sum(w * p for w, p in zip(weights, prob_list))
 
-    # 確率→クラス変換
-    y_pred = (y_prob > 0.5).astype(int)
-
     save_path = f"../artifacts/preds/ens/ens_{ID}.npy"
 
-    np.save(save_path, y_pred)
+    np.save(save_path, y_prob)
     print("Ensemble preds saved successfully")

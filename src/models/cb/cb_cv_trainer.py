@@ -1,6 +1,6 @@
 from catboost import CatBoostClassifier, Pool
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import log_loss
+from sklearn.metrics import roc_auc_score
 import numpy as np
 import pandas as pd
 import shap
@@ -49,7 +49,7 @@ class CBCVTrainer:
             "eval_metric": "Logloss",
             "learning_rate": 0.1,
             "depth": 6,
-            "iterations": 10000,
+            "iterations": 20000,
             "min_data_in_leaf": 1,
             "l2_leaf_reg": 3.0,
             "bagging_temperature": 1,
@@ -57,11 +57,10 @@ class CBCVTrainer:
             "border_count": 128,
             "grow_policy": "SymmetricTree",
             "random_seed": self.seed,
-            "verbose": 100,
             "task_type": "GPU",  # or CPU
             "early_stopping_rounds": 100,
             "allow_writing_files": False,
-            "verbose": 100  # ログ出力周期
+            "verbose": 100
         }
         return default_params
 
@@ -139,41 +138,34 @@ class CBCVTrainer:
                 train_pool, eval_set=val_pool, use_best_model=True
             )
 
-            val_preds = model.predict_proba(X_val)
+            val_preds = model.predict_proba(X_val)[:, 1]
             oof_preds[val_idx] = val_preds
 
-            test_preds += model.predict_proba(test_df)
+            test_preds += model.predict_proba(test_df)[:, 1]
 
+            val_auc = roc_auc_score(y_val, val_preds)
             best_iteration = model.best_iteration_
-            evals_result = model.evals_result_
-            train_logloss = evals_result["learn"]["Logloss"][best_iteration]
-            valid_logloss = evals_result["validation"]["Logloss"][best_iteration]
-
-            print(f"Train Logloss: {train_logloss:.5f}")
-            print(f"Valid Logloss: {valid_logloss:.5f}")
+            print(f"Valid AUC: {val_auc:.5f}")
 
             end = time.time()
             print_duration(start, end)
-
-            fold_score = log_loss(y_val, val_preds)
-            print(f"Valid Logloss: {fold_score:.5f}")
 
             self.fold_models.append(
                 CBFoldModel(
                     model, X_val, y_val, fold
                 ))
-            self.fold_scores.append(fold_score)
+            self.fold_scores.append(val_auc)
 
             iteration_list.append(best_iteration)
 
-        print("\n=== CV 結果 ===")
+        print("\n=== CV Results ===")
         print(f"Fold scores: {self.fold_scores}")
         print(
             f"Mean: {np.mean(self.fold_scores):.5f}, "
             f"Std: {np.std(self.fold_scores):.5f}"
         )
 
-        self.oof_score = log_loss(y, oof_preds)
+        self.oof_score = roc_auc_score(y, oof_preds)
         print(f" OOF score: {self.oof_score:.5f}")
         print(f"Avg best iteration: {np.mean(iteration_list)}")
         print(f"Best iterations: \n{iteration_list}")
@@ -236,7 +228,7 @@ class CBCVTrainer:
                 model, None, None, None
             ))
 
-        test_preds = model.predict_proba(test_df)
+        test_preds = model.predict_proba(test_df)[:, 1]
 
         path = f"../artifacts/preds/{level}/test_full_{ID}.npy"
         np.save(path, test_preds)
@@ -300,15 +292,12 @@ class CBCVTrainer:
         model = CatBoostClassifier(**self.params)
 
         model.fit(
-            train_pool, eval_set=val_pool, use_best_model=True
+            train_pool, eval_set=val_pool, use_best_model=True, 
         )
-        best_iteration = model.best_iteration_
-        evals_result = model.evals_result_
-        train_logloss = evals_result["learn"]["Logloss"][best_iteration - 1]
-        valid_logloss = evals_result["validation"]["Logloss"][best_iteration - 1]
 
-        print(f"Train Logloss: {train_logloss:.5f}")
-        print(f"Valid Logloss: {valid_logloss:.5f}")
+        preds = model.predict_proba(X_val)[:, 1]
+        auc = roc_auc_score(y_val, preds)
+        print(f"Valid AUC: {auc:.5f}")
 
         self.fold_models.append(CBFoldModel(
             model,
@@ -316,7 +305,7 @@ class CBCVTrainer:
             y_val,
             fold
         ))
-        self.fold_scores.append(valid_logloss)
+        self.fold_scores.append(auc)
         end = time.time()
         print_duration(start, end)
 

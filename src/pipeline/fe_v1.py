@@ -29,7 +29,7 @@ def feature_engineering(train_data, test_data):
     # 全データを結合（train + original + test）
     all_data = pd.concat(
         [train_data, test_data], ignore_index=True
-    )
+    ).drop("target", axis=1, errors="ignore")
 
     # === 1) カテゴリー変数をlabel encoding ===
     cat_cols = all_data.select_dtypes(include=["category", "object"]).columns
@@ -41,7 +41,7 @@ def feature_engineering(train_data, test_data):
     le_df = le_df.astype("str")
 
     # === dfを結合 ===
-    num_df = all_data.select_dtypes(include=np.number).drop("target", errors="ignore")
+    num_df = all_data.select_dtypes(include=np.number)
     df_feat = pd.concat([num_df, le_df], axis=1)
 
     # === データを分割 ===

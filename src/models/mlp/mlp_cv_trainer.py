@@ -328,7 +328,7 @@ class MLPCVTrainer:
             print_duration(start, end)
 
         self.oof_score = log_loss(y, oof_preds)
-        print("\n=== CV 結果 ===")
+        print("\n=== CV Results ===")
         print(f"Fold scores: {self.fold_scores}")
         print(
             f"Mean: {np.mean(self.fold_scores):.5f}, "

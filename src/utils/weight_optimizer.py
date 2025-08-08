@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import optuna
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import roc_auc_score
 
 
 def create_objective(oof_list):
@@ -18,7 +18,7 @@ def create_objective(oof_list):
     objective : function
         optunaで使う目的関数
     """
-    tr_df3 = pd.read_parquet("../artifacts/features/base/tr_df3.parquet")
+    tr_df3 = pd.read_parquet("../artifacts/features/base/tr_df1.parquet")
     y_true = tr_df3["target"].to_numpy()
     n_models = len(oof_list)
 
@@ -27,7 +27,7 @@ def create_objective(oof_list):
                        for i in range(n_models)]
         weight_sum = sum(raw_weights)
         weights = [w / weight_sum for w in raw_weights]  # 正規化
-    
+
         # 各 oof を「クラス1の確率」に統一
         prob_list = []
         for oof in oof_list:
@@ -41,14 +41,11 @@ def create_objective(oof_list):
                 # predict_proba 出力（CatBoostなど）
                 prob = oof[:, 1]  # クラス1の確率
             prob_list.append(prob)
-    
+
         # 加重平均
         y_prob = sum(w * p for w, p in zip(weights, prob_list))
-    
-        # 確率→クラス変換
-        y_pred = (y_prob > 0.5).astype(int)
-    
-        acc = accuracy_score(y_true, y_pred)
+
+        acc = roc_auc_score(y_true, y_prob)
         return acc
 
     return objective

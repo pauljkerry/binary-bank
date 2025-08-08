@@ -276,5 +276,5 @@ def show_corr_heatmap(df, cols=None):
     num_df = df[cols]
     corr_df = num_df.corr()
     plt.figure(figsize=(5, 5))
-    sns.heatmap(corr_df, annot=True, fmt=".2f", cmap='coolwarm')
+    sns.heatmap(corr_df, annot=True, fmt=".4f", cmap='coolwarm')
     plt.title('Correlation heatmap')

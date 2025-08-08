@@ -1,7 +1,6 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-import joblib
 
 
 def create_meta_features(ID_list, level, fe_version=None, scale=False):
@@ -37,6 +36,12 @@ def create_meta_features(ID_list, level, fe_version=None, scale=False):
     for ID in ID_list:
         array_tr = np.load(f"../artifacts/preds/{level}/oof_single_{ID}.npy")
         array_test = np.load(f"../artifacts/preds/{level}/test_single_{ID}.npy")
+
+        if array_tr.ndim == 1:
+            pass
+        elif array_tr.shape[1] == 2:
+            array_tr = array_tr[:, 1]
+            array_test = array_test[:, 1]
 
         if array_tr.ndim == 1:
             columns = [f"pred_{ID}"]
@@ -78,7 +83,6 @@ def create_meta_features(ID_list, level, fe_version=None, scale=False):
 
     # targetの追加
     train_data = pd.read_parquet("../artifacts/prepro/train_data3.parquet")
-    le_loaded = joblib.load("../artifacts/label_encoder.pkl")
-    tr_df["target"] = le_loaded.transform(train_data["target"])
+    tr_df["target"] = train_data["target"]
 
     return tr_df, test_df

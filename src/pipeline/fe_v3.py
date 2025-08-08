@@ -32,7 +32,7 @@ def feature_engineering(train_data, test_data):
     # 全データを結合（train + original + test）
     all_data = pd.concat(
         [train_data, test_data], ignore_index=True
-    )
+    ).drop("target", axis=1, errors="ignore")
 
     # === 1) カテゴリー変数をTarget Encoding ===
     base_cat_cols = all_data.select_dtypes(
@@ -52,7 +52,7 @@ def feature_engineering(train_data, test_data):
         index=all_data.index)
 
     # === 2) 数値変数を標準化
-    num_df = all_data.select_dtypes(include=np.number).drop("target", errors="ignore")
+    num_df = all_data.select_dtypes(include=np.number)
     te_df.index = all_data.index
     merged_df = pd.concat([num_df, te_df], axis=1)
 
