@@ -12,52 +12,81 @@ from src.utils.print_duration import print_duration
 
 class SimpleMLP(nn.Module):
     """
-    シンプルな多層パーセプトロン（MLP）モデル。
-
-    3層の全結合層（ReLU活性化 + Dropout）を通じて回帰タスクに対応。
-
     Parameters
     ----------
     input_dim : int
-        入力特徴量の次元数。
+        数値特徴量の次元数（カテゴリ変数を除いたもの）
     hidden_dims : list of int
-        各隠れ層のユニット数。
+        MLPの隠れ層サイズリスト
     dropout_rate : float
-        各層に適用するドロップアウト率。
+        ドロップアウト率
     activation : nn.Module
-        活性化関数のクラス
+        活性化関数
+    num_idxs : list
+        数値変数のインデックスのリスト
+    cat_idxs : list
+        カテゴリ変数のインデックスのリスト
+    cat_dims : list
+        カテゴリ変数のユニークな値のリスト
     """
 
-    def __init__(self, input_dim, hidden_dims, dropout_rate, activation):
+    def __init__(self, input_dim, hidden_dims, dropout_rate, activation,
+                 num_idxs, cat_idxs, cat_dims):
         super().__init__()
-        layers = []
-        prev_dim = input_dim
+        self.num_idxs = num_idxs
+        self.cat_idxs = cat_idxs
 
+        self.embedding_layers = nn.ModuleList([
+            nn.Embedding(
+                num_embeddings=n, embedding_dim=min(50, (n + 1) // 2))
+            for n in cat_dims
+        ])
+
+        total_embedding_dim = sum(
+            min(50, (n + 1) // 2) for n in cat_dims
+        )
+        net_input_dim = len(num_idxs) + total_embedding_dim
+
+        layers = []
+        prev_dim = net_input_dim
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, hidden_dim))
             layers.append(nn.BatchNorm1d(hidden_dim))
             layers.append(activation())
             layers.append(nn.Dropout(dropout_rate))
             prev_dim = hidden_dim
-
         layers.append(nn.Linear(prev_dim, 1))
+
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, xb):
         """
-        入力データに対する順伝播を行い、予測値を返す。
-
         Parameters
         ----------
-        x : torch.Tensor
-            形状が (バッチサイズ, 入力次元) の入力テンソル。
+        xb : torch.Tensor
+            数値特徴量とカテゴリ特徴量を統合したもの
 
         Returns
         -------
         torch.Tensor
-            形状が (バッチサイズ,) の出力テンソル。
+            (B,) の予測
         """
-        return self.net(x).squeeze(-1)  # (B,) にする
+        emb_list = [
+            self.embedding_layers[i](xb[:, cat_idx].long())
+            for i, cat_idx in enumerate(self.cat_idxs)
+        ]
+        x_emb = torch.cat(emb_list, dim=1) if emb_list else None
+
+        # 数値部分
+        x_num = xb[:, self.num_idxs]
+
+        # 結合
+        if x_emb is not None:
+            x = torch.cat([x_num, x_emb], dim=1)
+        else:
+            x = x_num
+
+        return self.net(x).squeeze(-1)
 
 
 class MLPCVTrainer:
@@ -127,6 +156,11 @@ class MLPCVTrainer:
         self.t_max = t_max
         self.eta_min = eta_min
         self.min_epochs = min_epochs
+        self.num_cols = []
+        self.cat_cols = []
+        self.cat_idxs = []
+        self.num_idxs = []
+        self.cat_dims = []
 
         if hidden_dims is not None:
             self.hidden_dims = hidden_dims
@@ -174,9 +208,20 @@ class MLPCVTrainer:
         else:
             weights = np.ones(len(tr_df), dtype="float32")
 
+        self.cat_cols = tr_df.select_dtypes(
+            include=["object", "category"]).columns.tolist()
+        self.num_cols = [col for col in tr_df.columns
+                         if col not in self.cat_cols + ["target"]]
+
+        self.cat_idxs = [tr_df.columns.get_loc(col) for col in self.cat_cols]
+        self.num_idxs = [tr_df.columns.get_loc(col) for col in self.num_cols]
+        self.cat_dims = [tr_df[col].nunique() for col in self.cat_cols]
+
+        # dtypeの変更
         X = tr_df.drop("target", axis=1).to_numpy().astype(np.float32)
-        y = tr_df["target"].to_numpy().astype(np.float32)
         X_test = test_df.to_numpy().astype(np.float32)
+
+        y = tr_df["target"].to_numpy().astype(np.float32)
 
         oof_preds = np.zeros(len(X))
         test_preds = np.zeros(len(X_test))
@@ -189,8 +234,13 @@ class MLPCVTrainer:
             print(f"\nFold {fold + 1}")
             start = time.time()
 
-            X_tr, y_tr, w_tr = X[tr_idx], y[tr_idx], weights[tr_idx]
-            X_val, y_val = X[val_idx], y[val_idx]
+            X_tr, y_tr, w_tr = (
+                X[tr_idx],
+                y[tr_idx],
+                weights[tr_idx])
+            X_val, y_val = (
+                X[val_idx],
+                y[val_idx])
 
             # Dataloaders
             train_dataset = TensorDataset(
@@ -214,7 +264,10 @@ class MLPCVTrainer:
                 input_dim=X.shape[1],
                 hidden_dims=self.hidden_dims,
                 dropout_rate=self.dropout_rate,
-                activation=self.activation
+                activation=self.activation,
+                num_idxs=self.num_idxs,
+                cat_idxs=self.cat_idxs,
+                cat_dims=self.cat_dims
             ).to(self.device)
             optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
             scheduler = CosineAnnealingLR(
@@ -231,11 +284,10 @@ class MLPCVTrainer:
             for epoch in range(self.epochs):
                 model.train()
                 for xb, yb, wb in train_loader:
-                    xb, yb, wb = (
-                        xb.to(self.device),
-                        yb.to(self.device),
-                        wb.to(self.device)
-                    )
+                    xb = xb.to(self.device)
+                    yb = yb.to(self.device)
+                    wb = wb.to(self.device)
+
                     preds = model(xb)
                     loss = criterion(preds, yb)
                     loss = (loss * wb).mean()
@@ -264,7 +316,8 @@ class MLPCVTrainer:
                         for xb, yb, wb in train_loader:
                             xb = xb.to(self.device)
                             pred_logits = model(xb)
-                            pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
+                            pred_probs = torch.sigmoid(
+                                pred_logits).cpu().numpy()
                             train_preds.append(pred_probs)
                             train_targets.append(yb.numpy())
                     train_preds = np.concatenate(train_preds)
@@ -310,15 +363,18 @@ class MLPCVTrainer:
 
             epoch_list.append(best_epoch)
 
-            # Save OOF
             model.eval()
             with torch.no_grad():
-                val_tensor = torch.tensor(X_val).to(self.device)
+                # Validation用データ作成
+                val_tensor = torch.tensor(X_val).float().to(self.device)
+
                 val_logits = model(val_tensor)
                 val_probs = torch.sigmoid(val_logits)
                 oof_preds[val_idx] = val_probs.cpu().numpy().ravel()
 
-                test_tensor = torch.tensor(X_test).to(self.device)
+                # Test用データ作成
+                test_tensor = torch.tensor(X_test).float().to(self.device)
+
                 test_logits = model(test_tensor)
                 test_probs = torch.sigmoid(test_logits)
                 test_preds += test_probs.cpu().numpy().ravel()
@@ -375,15 +431,27 @@ class MLPCVTrainer:
         else:
             weights = np.ones(len(tr_df), dtype="float32")
 
+        self.cat_cols = tr_df.select_dtypes(
+            include=["object", "category"]).columns.tolist()
+        self.num_cols = [col for col in tr_df.columns
+                         if col not in self.cat_cols + ["target"]]
+
+        self.cat_idxs = [tr_df.columns.get_loc(col) for col in self.cat_cols]
+        self.num_idxs = [tr_df.columns.get_loc(col) for col in self.num_cols]
+        self.cat_dims = [tr_df[col].nunique() for col in self.cat_cols]
+
+        # dtypeの変更
         X = tr_df.drop("target", axis=1).to_numpy().astype(np.float32)
         y = tr_df["target"].to_numpy().astype(np.float32)
 
-        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.seed)
+        skf = StratifiedKFold(
+            n_splits=self.n_splits, shuffle=True, random_state=self.seed)
 
         tr_idx, val_idx = list(skf.split(X, y))[fold]
         start = time.time()
 
-        X_tr, y_tr, w_tr = X[tr_idx], y[tr_idx], weights[tr_idx]
+        X_tr, y_tr, w_tr = (
+            X[tr_idx], y[tr_idx], weights[tr_idx])
         X_val, y_val = X[val_idx], y[val_idx]
 
         # Dataloaders
@@ -408,7 +476,10 @@ class MLPCVTrainer:
             input_dim=X.shape[1],
             hidden_dims=self.hidden_dims,
             dropout_rate=self.dropout_rate,
-            activation=self.activation
+            activation=self.activation,
+            num_idxs=self.num_idxs,
+            cat_idxs=self.cat_idxs,
+            cat_dims=self.cat_dims
         ).to(self.device)
         optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
         scheduler = CosineAnnealingLR(
@@ -425,11 +496,10 @@ class MLPCVTrainer:
         for epoch in range(self.epochs):
             model.train()
             for xb, yb, wb in train_loader:
-                xb, yb, wb = (
-                    xb.to(self.device),
-                    yb.to(self.device),
-                    wb.to(self.device)
-                )
+                xb = xb.to(self.device)
+                yb = yb.to(self.device)
+                wb = wb.to(self.device)
+
                 preds = model(xb)
                 loss = criterion(preds, yb)
                 loss = (loss * wb).mean()
@@ -443,6 +513,7 @@ class MLPCVTrainer:
             with torch.no_grad():
                 for xb, yb in val_loader:
                     xb = xb.to(self.device)
+
                     pred_logits = model(xb)
                     pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
                     preds.append(pred_probs)
@@ -458,6 +529,7 @@ class MLPCVTrainer:
                 with torch.no_grad():
                     for xb, yb, wb in train_loader:
                         xb = xb.to(self.device)
+
                         pred_logits = model(xb)
                         pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
                         train_preds.append(pred_probs)
@@ -529,9 +601,11 @@ class MLPFoldModel:
         最良スコア時のエポック数
     """
 
-    def __init__(self, model, X_val, y_val, fold_index, best_rounds):
+    def __init__(
+        self, model, X_val, y_val, fold_index, best_rounds
+    ):
         self.model = model
-        self.X_val = X_val
+        self.X_val_num = X_val
         self.y_val = y_val
         self.fold_index = fold_index
         self.best_rounds = best_rounds
