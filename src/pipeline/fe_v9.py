@@ -24,42 +24,50 @@ def feature_engineering(train_data, test_data):
     Notes
     -----
     - GBDT用
-    - 2変数TE
+    - 1変数 + 2変数TE
     """
     # === 初期情報 ===
     train_len = len(train_data)
+    print("phase1")
 
+    # === test dataにtargetを追加 ===
     test_data = test_data.with_columns([
         pl.lit(0).cast(pl.Int64).alias("target")
     ])
+    print("phase2")
 
+    # === Dataの結合とTarget以外をカテゴリ変数に ===
     all_data = pl.concat([train_data, test_data])
+    all_data = all_data.select([
+        pl.col(c).cast(pl.Utf8) if c != "target" else pl.col(c)
+        for c in all_data.columns
+    ])
+    print("phase3")
 
-    # === 1) 数値特徴量（そのまま） ===
-    numeric_dtypes = {pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64, pl.Float32, pl.Float64}
-    num_cols = [col for col, dtype in zip(all_data.columns, all_data.dtypes) if dtype in numeric_dtypes]
-    num_df = all_data.select(num_cols)
-
-    # === 2) 単体のカテゴリ特徴量のTarget Encoding ===
+    # === 1変数の Target Encoding ===
+    train_data = all_data[:train_len]
+    test_data = all_data[train_len:]
     te_single = target_encoding(train_data, test_data)
+    print("phase4")
 
-    # === 3) 全列を文字列化して、2変数の交互作用を作成 ===
-    str_all_data = all_data.select([pl.col(c).cast(pl.Utf8) for c in all_data.columns])
+    # === 2変数の交互作用 ===
     inter_exprs2 = [
         pl.format("{}_{}", pl.col(col1), pl.col(col2)).alias(f"{col1}_{col2}")
-        for col1, col2 in combinations(str_all_data.columns, 2)
+        for col1, col2 in combinations(all_data.columns, 2)
         if "target" not in (col1, col2)   # targetは除外
     ]
-    inter_df2 = str_all_data.select(inter_exprs2)
+    inter_df2 = all_data.select(inter_exprs2)
     inter_train = inter_df2[:train_len]
     inter_train = inter_train.with_columns(
         train_data["target"].alias("target")
     )
     inter_test = inter_df2[train_len:]
     te_inter2 = target_encoding(inter_train, inter_test)
+    print("phase5")
 
-    # === 4) 全特徴量を結合 ===
-    df_feat = pl.concat([num_df, te_single, te_inter2], how="horizontal")
+    # === すべて結合 ===
+    df_feat = pl.concat([te_single, te_inter2], how="horizontal")
+    print("phase6")
 
     # === 5) 再分割 ===
     tr_df = df_feat[:train_len]

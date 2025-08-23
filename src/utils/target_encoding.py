@@ -1,62 +1,96 @@
-import numpy as np
+import polars as pl
 import pandas as pd
+import numpy as np
 from sklearn.model_selection import StratifiedKFold
+from tqdm.notebook import tqdm
 
 
 def target_encoding(
-    tr_df, test_df, target_col="target", cat_cols=None,
-    n_splits=5, seed=42
+    tr_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    target_col="target",
+    cat_cols=None,
+    n_splits=5,
+    seed=42
 ):
     """
     Target Encodingを行う関数
 
     Parameters
     ----------
-    tr_df : pd.DataFrame
-        Label付きデータ
-    test_df : pd.DataFrame
-        Labelなしデータ
-    target_col : str, default "target"
-        目的変数の列名
-    cat_cols : list, default None
-        質的変数名のリスト。
-        Noneの場合はすべての質的変数を用いる
-    n_splits : int, default 5
-        KFoldの分割数
-    seed : int, default 42
-        乱数シード
+    tr_df : pl.DataFrame
+        Training data
+    test_df : pl.DataFrame
+        Unlabeled data
+    target_col : str
+        Targetカラムの列名
+    cat_cols : list
+        カテゴリ変数の列名のリスト
+    n_splits : int
+        SKFの分割数
+    seed : int
+        Random seed
 
     Returns
     -------
-    te_df : pd.DataFrame
-        Target EncodingしたものをまとめたDF
+    te_df : pl.DataFrame
+        Target Encodingを行ったDF
     """
+    """
+    if isinstance(tr_df, pd.DataFrame):
+        tr_df = pl.from_pandas(tr_df)
+    elif isinstance(tr_df, pl.DataFrame):
+        tr_df = tr_df
+    else:
+        raise TypeError("Expected pandas.DataFrame or polars.DataFrame")
+    """
+
+    tr_df = tr_df.with_columns(pl.arange(0, tr_df.height).alias("id"))
+    test_df = test_df.with_columns(pl.arange(0, test_df.height).alias("id"))
+
+    y = tr_df[target_col].to_numpy()
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
-    te_tr = pd.DataFrame(index=tr_df.index)
-    te_test = pd.DataFrame(index=test_df.index)
-
     if cat_cols is None:
-        cat_cols = tr_df.select_dtypes(
-            include=["category", "object"]).columns.difference([target_col])
+        cat_cols = [c for c, t in tr_df.schema.items() if t == pl.Utf8 and c != target_col]
 
-    for col in cat_cols:
-        oof = np.zeros(len(tr_df))
-        test_vals = np.zeros(len(test_df))
+    te_tr_dict = {f"{col}_te": np.zeros(tr_df.height) for col in cat_cols}
+    te_test_dict = {f"{col}_te": np.zeros(test_df.height) for col in cat_cols}
 
-        for tr_idx, val_idx in skf.split(tr_df, tr_df[target_col]):
-            tr_fold = tr_df.iloc[tr_idx]
-            val_fold = tr_df.iloc[val_idx]
+    for fold_idx, (tr_idx, val_idx) in enumerate(
+        tqdm(skf.split(tr_df.to_pandas(), y))
+    ):
+        train_pl = tr_df.filter(pl.arange(0, tr_df.height).is_in(tr_idx))
+        val_pl = tr_df.filter(pl.arange(0, tr_df.height).is_in(val_idx))
 
-            means = tr_fold.groupby(col)[target_col].mean()
-            oof[val_idx] = val_fold[col].map(means)
+        for col in tqdm(cat_cols):
+            # 1. trainデータでグループごとの平均計算（Polars）
+            means_df = (
+                train_pl.group_by(col)
+                .agg(pl.col(target_col).mean())
+                .rename({target_col: "mean_target"})
+            )
 
-            test_vals += test_df[col].map(means).fillna(means.mean()).to_numpy()
+            # 2. valデータにマッピング（Polarsのjoinで結合）
+            val_with_mean = val_pl.join(means_df, on=col, how="left").sort("id")
 
-        # 平均（テストは各foldの平均→kで割る）
-        te_tr[f"{col}_te"] = oof
-        te_test[f"{col}_te"] = test_vals / n_splits
+            # 3. マッピングできなかったものは平均値で補完
+            overall_mean = means_df["mean_target"].mean()
+            val_te = val_with_mean["mean_target"].fill_null(overall_mean).to_numpy()
 
-    te_df = pd.concat([te_tr, te_test], axis=0)
+            te_tr_dict[f"{col}_te"][val_idx] = val_te
 
-    return te_df
+            # 4. テストデータも同様にjoin
+            test_with_mean = test_df.join(means_df, on=col, how="left").sort("id")
+            test_te = test_with_mean["mean_target"].fill_null(overall_mean).to_numpy()
+
+            te_test_dict[f"{col}_te"] += test_te / n_splits
+
+    te_tr = pl.DataFrame(te_tr_dict).with_columns([
+        pl.col(col).cast(pl.Float32) for col in te_tr_dict.keys()
+    ])
+    te_test = pl.DataFrame(te_test_dict).with_columns([
+        pl.col(col).cast(pl.Float32) for col in te_test_dict.keys()
+    ])
+
+    return pl.concat([te_tr, te_test], how="vertical")

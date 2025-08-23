@@ -9,11 +9,9 @@ from src.utils.print_duration import print_duration
 
 class TabNetCVTrainer:
     def __init__(
-        self, n_splits=5, seed=42, max_epochs=100,
-        batch_size=1024, early_stopping_rounds=20,
-        lr=2e-2, weight_decay=1e-5, use_gpu=True,
-        log_interval=10, verbose=10,
-        **tabnet_params
+        self, n_splits=5, seed=42, max_epochs=100, batch_size=1024,
+        early_stopping_rounds=20, lr=2e-2, weight_decay=1e-5, use_gpu=True,
+        hidden_dims=None, log_interval=10, t_max=50, lr_min=1e-6, **kwargs
     ):
         self.n_splits = n_splits
         self.seed = seed
@@ -22,13 +20,24 @@ class TabNetCVTrainer:
         self.early_stopping_rounds = early_stopping_rounds
         self.lr = lr
         self.weight_decay = weight_decay
-        self.device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            "cuda" if use_gpu and torch.cuda.is_available() else "cpu")
         self.fold_models = []
         self.fold_scores = []
         self.oof_score = None
         self.log_interval = log_interval
-        self.verbose = verbose
-        self.tabnet_params = tabnet_params
+        self.t_max = t_max
+        self.lr_min = lr_min
+        self.tabnet_params = kwargs
+
+        if hidden_dims is not None:
+            self.hidden_dims = hidden_dims
+        else:
+            dims_from_kwargs = [
+                v for k, v in sorted(kwargs.items())
+                if k.startswith("hidden_dim")
+            ]
+            self.hidden_dims = dims_from_kwargs or [128, 64]
 
     def fit(self, tr_df, test_df):
         tr_df = tr_df.copy()
@@ -83,7 +92,7 @@ class TabNetCVTrainer:
                 optimizer_params=dict(lr=self.lr),
                 scheduler_params={
                     "T_max": self.t_max,
-                    "eta_min": self.eta_min,
+                    "eta_min": self.lr_min,
                     "verbose": False
                 },
                 scheduler_fn=torch.optim.lr_scheduler.CosineAnnealingLR,
@@ -95,10 +104,10 @@ class TabNetCVTrainer:
 
             model.fit(
                 X_train=X_train,
-                y_train=y_train.reshape(-1, 1),
-                eval_set=[(X_val, y_val.reshape(-1, 1))],
+                y_train=y_train.flatten(),
+                eval_set=[(X_val, y_val.flatten())],
                 eval_metric=["logloss"],
-                max_epochs=self.epochs,
+                max_epochs=self.max_epochs,
                 patience=self.early_stopping_rounds,
                 batch_size=self.batch_size,
                 virtual_batch_size=128,

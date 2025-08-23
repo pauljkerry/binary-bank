@@ -1,4 +1,3 @@
-import optuna
 from src.models.cb.cb_cv_trainer import CBCVTrainer
 
 
@@ -64,56 +63,3 @@ def create_objective(
 
         return trainer.fold_scores[0]
     return objective
-
-
-def run_optuna_search(
-    objective, n_trials=50, n_jobs=1,
-    direction="minimize", study_name="cb_study", storage=None,
-    initial_params: dict = None, sampler=None
-):
-    """
-    Optunaによるハイパーパラメータ探索を実行する関数。
-
-    Parameters
-    ----------
-    objective : function
-        Optunaの目的関数。
-    n_trials : int, default 50
-        試行回数。
-    n_jobs : int, default 1
-        並列実行数。
-    direction : str, default "minimize"
-        Optunaの探索方向。
-    study_name : str or None, default "xgb_study"
-        StudyName。
-    storage : str or None, default None
-        保存先URL。
-    initial_params : dict or None, default None
-        初期の試行パラメータ。
-    sampler : optuna.samplers.BaseSampler or None, default TPESampler
-        使用するSampler。
-
-    Returns
-    -------
-    study : optuna.Study
-        探索結果のStudyオブジェクト。
-    """
-    study = optuna.create_study(
-        direction=direction,
-        study_name=study_name,
-        storage=storage,
-        load_if_exists=True,
-        sampler=sampler or optuna.samplers.TPESampler()
-    )
-
-    if initial_params is not None:
-        study.enqueue_trial(initial_params)
-
-    study.optimize(
-        objective,
-        n_trials=n_trials,
-        n_jobs=n_jobs,
-        show_progress_bar=True
-    )
-
-    return study

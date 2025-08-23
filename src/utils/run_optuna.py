@@ -1,42 +1,11 @@
 import optuna
-from src.models.ridge.ridge_cv_trainer import RidgeCVTrainer
-
-
-def create_objective(tr_df, n_splits=5):
-    """
-    Optunaの目的関数（objective）を生成する関数。
-
-    Parameters
-    ----------
-    tr_df : cudf.DataFrame
-        訓練データ。
-    n_splits : int, default 5
-        CV分割数。
-
-    Returns
-    -------
-    objective : function
-        optunaで使用する目的関数。
-    """
-    def objective(trial):
-        params = {
-            "alpha": trial.suggest_float("alpha", 1e-2, 1e2, log=True)
-        }
-
-        trainer = RidgeCVTrainer(
-            params=params,
-            n_splits=n_splits
-        )
-
-        trainer.fit_one_fold(tr_df, fold=0)
-
-        return trainer.fold_scores[0]
-    return objective
+from src.utils.telegram import send_telegram_message
 
 
 def run_optuna_search(
-    objective, n_trials=50, direction="minimize", study_name="ridge_study",
-    storage=None, initial_params: dict = None, sampler=None
+    objective, n_trials=50, n_jobs=1,
+    direction="minimize", study_name="mlp_study", storage=None,
+    initial_params: dict = None, sampler=None
 ):
     """
     Optunaによるハイパーパラメータ探索を実行する関数。
@@ -47,9 +16,11 @@ def run_optuna_search(
         Optunaの目的関数。
     n_trials : int, default 50
         試行回数。
+    n_jobs : int, default 1
+        並列実行数。
     direction : str, default "minimize"
         Optunaの探索方向。
-    study_name : str or None, default "lgbm_study"
+    study_name : str or None, default "mlp_study"
         StudyName。
     storage : str or None, default None
         保存先URL。
@@ -77,7 +48,15 @@ def run_optuna_search(
     study.optimize(
         objective,
         n_trials=n_trials,
+        n_jobs=n_jobs,
         show_progress_bar=True
     )
 
+    msg = (
+        "Training Complete!\n"
+        f"Study: {study.study_name}\n"
+        f"Best Value: {study.best_value:.5f}\n"
+        f"Trials: {n_trials}"
+    )
+    send_telegram_message(msg)
     return study

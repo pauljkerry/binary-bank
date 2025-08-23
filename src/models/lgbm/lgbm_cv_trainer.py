@@ -27,8 +27,8 @@ class LGBMCVTrainer:
         乱数シード。
     """
 
-    def __init__(self, params=None, n_splits=5,
-                 early_stopping_rounds=100, seed=42):
+    def __init__(self, tr_df, test_df=None, params=None, n_splits=5,
+                 early_stopping_rounds=100, num_boost_round=20000, seed=42):
         self.params = params or {}
         self.n_splits = n_splits
         self.early_stopping_rounds = early_stopping_rounds
@@ -37,16 +37,33 @@ class LGBMCVTrainer:
         self.seed = seed
         self.oof_score = None
 
-    def get_default_params(self):
-        """
-        LGBM用のデフォルトパラメータを返す。
+        self.cat_cols = tr_df.select_dtypes(include="object").columns.to_list()
+        tr_df[self.cat_cols] = tr_df[self.cat_cols].astype("category")
+        test_df[self.cat_cols] = test_df[self.cat_cols].astype("category")
 
-        Returns
-        -------
-        default_params : dict
-            デフォルトパラメータの辞書。
-        """
-        default_params = {
+        if "weight" in tr_df.columns:
+            self.weights = tr_df["weight"].astype("float32")
+            tr_df = tr_df.drop("weight", axis=1)
+        else:
+            self.weights = np.ones(len(tr_df), dtype="float32")
+
+        self.X = tr_df.drop("target", axis=1)
+        self.y = tr_df["target"].to_numpy()
+
+        # test
+        if test_df is not None:
+            test_df[self.cat_cols] = test_df[self.cat_cols].astype("category")
+            self.test = test_df
+        else:
+            self.test = None
+
+        # fold indices
+        skf = StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=seed
+        )
+        self.fold_indices = list(skf.split(self.X, self.y))
+
+        self.default_params = {
             "objective": "binary",
             "metric": "auc",
             "learning_rate": 0.1,
@@ -63,18 +80,10 @@ class LGBMCVTrainer:
             "verbosity": -1,
             "random_state": self.seed
         }
-        return default_params
 
-    def fit(self, tr_df, test_df):
+    def fit(self):
         """
         CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
-
-        Parameters
-        ----------
-        tr_df : pd.DataFrame
-            学習用データ。
-        test_df : pd.DataFrame
-            テスト用データ。
 
         Returns
         -------
@@ -83,52 +92,29 @@ class LGBMCVTrainer:
         test_preds : ndarray
             test_dfに対する予測配列
         """
-        tr_df = tr_df.copy()
-        test_df = test_df.copy()
+        if self.dtest is None:
+            raise ValueError("test_df not provided for XGBCVTrainer.")
 
-        if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32")
-            tr_df = tr_df.drop("weight", axis=1)
-        else:
-            weights = pd.Series(
-                np.ones(len(tr_df), dtype="float32"),
-                index=tr_df.index
-            )
-
-        cat_cols = tr_df.select_dtypes(include="object").columns.to_list()
-        tr_df[cat_cols] = tr_df[cat_cols].astype("category")
-        test_df[cat_cols] = test_df[cat_cols].astype("category")
-
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"]
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
-
-        oof_preds = np.zeros(len(X))
-        test_preds = np.zeros(len(test_df))
-        test_df = test_df
-
-        skf = StratifiedKFold(
-            n_splits=self.n_splits, shuffle=True,
-            random_state=self.seed)
+        self.params = {**self.default_params, **(self.params or {})}
+        oof_preds = np.zeros(len(self.X))
+        test_preds = np.zeros(len(self.test))
 
         iteration_list = []
 
-        for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
+        for fold, (tr_idx, val_idx) in enumerate(self.fold_indices):
             print(f"\nFold {fold + 1}")
             start = time.time()
 
             X_tr, y_tr, w_tr = (
-                X.iloc[tr_idx],
-                y.iloc[tr_idx],
-                weights.iloc[tr_idx]
+                self.X.iloc[tr_idx],
+                self.y.iloc[tr_idx],
+                self.weights.iloc[tr_idx]
             )
-            X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+            X_val, y_val = self.X.iloc[val_idx], self.y.iloc[val_idx]
 
             dtrain = lgb.Dataset(
                 X_tr, label=y_tr,
-                categorical_feature=cat_cols,
+                categorical_feature=self.cat_cols,
                 weight=w_tr)
 
             dvalid = lgb.Dataset(X_val, label=y_val, reference=dtrain)
@@ -138,7 +124,7 @@ class LGBMCVTrainer:
             model = lgb.train(
                 self.params,
                 dtrain,
-                num_boost_round=20000,
+                num_boost_round=self.num_boost_round,
                 valid_sets=[dtrain, dvalid],
                 valid_names=["train", "eval"],
                 callbacks=[
@@ -149,10 +135,10 @@ class LGBMCVTrainer:
             )
 
             # oof
-            val = X.iloc[val_idx]
+            val = self.X.iloc[val_idx]
             oof_preds[val_idx] = model.predict(val)
 
-            test_preds += model.predict(test_df)
+            test_preds += model.predict(self.test_df)
 
             end = time.time()
             print_duration(start, end)
@@ -169,14 +155,14 @@ class LGBMCVTrainer:
 
             iteration_list.append(best_iter)
 
-        print("\n=== CV 結果 ===")
+        print("\n=== CV Results ===")
         print(f"Fold scores: {self.fold_scores}")
         print(
             f"Mean: {np.mean(self.fold_scores):.5f}, "
             f"Std: {np.std(self.fold_scores):.5f}"
         )
 
-        self.oof_score = roc_auc_score(y, oof_preds)
+        self.oof_score = roc_auc_score(self.y, oof_preds)
         print(f"OOF score: {self.oof_score:.5f}")
         print(f"Avg best iteration: {np.mean(iteration_list)}")
         print(f"Best iterations: \n{iteration_list}")
@@ -185,15 +171,12 @@ class LGBMCVTrainer:
 
         return oof_preds, test_preds
 
-    def full_train(self, tr_df, test_df, iterations, ID, level="l1"):
+    def full_train(self, iterations, ID, level="l1"):
         """
         訓練データ全体でモデルを学習し、test_dfに対する予測結果をnpy形式で保存する。
 
         Parameters
-        tr_df : pd.DataFrame
-            学習用データ。
-        test_df : pd.DataFrame
-            テスト用データ。
+        ----------
         iterations : int
             学習の繰り返し回数。
         ID : str
@@ -201,34 +184,17 @@ class LGBMCVTrainer:
         level : str, default "l1"
             保存先のフォルダ名。
         """
-        tr_df = tr_df.copy()
-        test_df = test_df.copy()
+        if self.dtest is None:
+            raise ValueError("test_df not provided for XGBCVTrainer.")
 
-        cat_cols = tr_df.select_dtypes(include="object").columns.to_list()
-        tr_df[cat_cols] = tr_df[cat_cols].astype("category")
-        test_df[cat_cols] = test_df[cat_cols].astype("category")
-
-        if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32")
-            tr_df = tr_df.drop("weight", axis=1)
-        else:
-            weights = pd.Series(
-                np.ones(len(tr_df), dtype="float32"),
-                index=tr_df.index
-            )
-
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"]
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
+        self.params = {**self.default_params, **(self.params or {})}
 
         start = time.time()
 
         dtrain = lgb.Dataset(
-            X, label=y,
-            categorical_feature=cat_cols,
-            weight=weights)
+            self.X, label=self.y,
+            categorical_feature=self.cat_cols,
+            weight=self.weights)
 
         model = lgb.train(
             self.params,
@@ -242,7 +208,7 @@ class LGBMCVTrainer:
         print_duration(start, end)
 
         # test_dfの予測値
-        test_preds = model.predict(test_df.to_numpy())
+        test_preds = model.predict(self.test_df)
 
         path = f"../artifacts/preds/{level}/test_full_{ID}.npy"
         np.save(path, test_preds)
@@ -260,50 +226,26 @@ class LGBMCVTrainer:
         best_index = int(np.argmax(self.fold_scores))
         return best_index
 
-    def fit_one_fold(self, tr_df, fold=0):
+    def fit_one_fold(self, fold=0):
         """
         指定した1つのfoldのみを用いてモデルを学習する。
         主にOptunaによるハイパーパラメータ探索時に使用。
 
         Parameters
         ----------
-        tr_df : pd.DataFrame
-            学習用データ。
         fold : int
             学習に使うfold番号。
         """
-        tr_df = tr_df.copy()
-        cat_cols = tr_df.select_dtypes(include="object").columns.to_list()
-        tr_df[cat_cols] = tr_df[cat_cols].astype("category")
-
-        if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32")
-            tr_df = tr_df.drop("weight", axis=1)
-        else:
-            weights = pd.Series(
-                np.ones(len(tr_df), dtype="float32"),
-                index=tr_df.index
-            )
-
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"]
-
-        skf = StratifiedKFold(
-            n_splits=self.n_splits, shuffle=True, random_state=42
-        )
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
-
-        tr_idx, val_idx = list(skf.split(X, y))[fold]
+        self.params = {**self.default_params, **(self.params or {})}
+        tr_idx, val_idx = self.fold_indices[fold]
         start = time.time()
 
-        X_tr, y_tr, w_tr = X.iloc[tr_idx], y.iloc[tr_idx], weights.iloc[tr_idx]
-        X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+        X_tr, y_tr, w_tr = self.X.iloc[tr_idx], self.y.iloc[tr_idx], self.weights.iloc[tr_idx]
+        X_val, y_val = self.X.iloc[val_idx], self.y.iloc[val_idx]
 
         dtrain = lgb.Dataset(
             X_tr, label=y_tr,
-            categorical_feature=cat_cols,
+            categorical_feature=self.cat_cols,
             weight=w_tr)
 
         dvalid = lgb.Dataset(X_val, label=y_val, reference=dtrain)
@@ -313,7 +255,7 @@ class LGBMCVTrainer:
         model = lgb.train(
             self.params,
             dtrain,
-            num_boost_round=20000,
+            num_boost_round=self.num_boost_round,
             valid_sets=[dtrain, dvalid],
             valid_names=["train", "eval"],
             callbacks=[

@@ -27,26 +27,47 @@ class XGBCVTrainer:
         乱数シード。
     """
 
-    def __init__(self, params=None, n_splits=5,
-                 early_stopping_rounds=100, seed=42):
-        self.params = params or {}
+    def __init__(self, tr_df, test_df=None, params=None, n_splits=5,
+                 early_stopping_rounds=100, num_boost_round=20000, seed=42):
+        self.params = params
         self.n_splits = n_splits
         self.early_stopping_rounds = early_stopping_rounds
+        self.num_boost_round = num_boost_round
         self.fold_models = []
         self.fold_scores = []
         self.seed = seed
         self.oof_score = None
 
-    def get_default_params(self):
-        """
-        XGB用のデフォルトパラメータを返す。
+        # object → category
+        cat_cols = tr_df.select_dtypes(include="object").columns
+        tr_df[cat_cols] = tr_df[cat_cols].astype("category")
 
-        Returns
-        -------
-        default_params : dict
-            デフォルトパラメータの辞書。
-        """
-        default_params = {
+        # 重み
+        if "weight" in tr_df.columns:
+            self.weights = tr_df["weight"].astype("float32").to_numpy()
+            tr_df = tr_df.drop("weight", axis=1)
+        else:
+            self.weights = np.ones(len(tr_df), dtype="float32")
+
+        # target
+        self.X = tr_df.drop("target", axis=1)
+        self.y = tr_df["target"].to_numpy()
+
+        # test
+        if test_df is not None:
+            test_df[cat_cols] = test_df[cat_cols].astype("category")
+            self.dtest = xgb.DMatrix(
+                test_df, enable_categorical=True)
+        else:
+            self.dtest = None
+
+        # fold indices
+        skf = StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=seed
+        )
+        self.fold_indices = list(skf.split(self.X, self.y))
+
+        self.default_params = {
             "objective": "binary:logistic",
             "eval_metric": "auc",
             "learning_rate": 0.1,
@@ -58,25 +79,18 @@ class XGBCVTrainer:
             "reg_alpha": 0.0,
             "reg_lambda": 1.0,
             "verbosity": 0,
-            "tree_method": "gpu_hist",
+            "tree_method": "hist",
+            "device": "cuda",
             "random_state": self.seed,
             "max_bin": 512,
             "grow_policy": "depthwise",
             "single_precision_histogram": True,
             "predictor": "gpu_predictor"
         }
-        return default_params
 
-    def fit(self, tr_df, test_df):
+    def fit(self):
         """
         CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
-
-        Parameters
-        ----------
-        tr_df : pd.DataFrame
-            学習用データ。
-        test_df : pd.DataFrame
-            テスト用データ。
 
         Returns
         -------
@@ -85,50 +99,25 @@ class XGBCVTrainer:
         test_preds : ndarray
             test_dfに対する予測配列
         """
-        tr_df = tr_df.copy()
-        test_df = test_df.copy()
+        if self.dtest is None:
+            raise ValueError("test_df not provided for XGBCVTrainer.")
 
-        cat_cols = tr_df.select_dtypes(include="object").columns
-        tr_df[cat_cols] = tr_df[cat_cols].astype("category")
-        test_df[cat_cols] = test_df[cat_cols].astype("category")
-
-        dtest = xgb.DMatrix(test_df, enable_categorical=True)
-
-        if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32")
-            tr_df = tr_df.drop("weight", axis=1)
-        else:
-            weights = pd.Series(
-                np.ones(len(tr_df), dtype="float32"),
-                index=tr_df.index
-            )
-
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"]
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
-
-        oof_preds = np.zeros(len(X))
-        test_preds = np.zeros(len(test_df))
-
-        skf = StratifiedKFold(
-            n_splits=self.n_splits, shuffle=True,
-            random_state=self.seed
-        )
+        self.params = {**self.default_params, **(self.params or {})}
+        oof_preds = np.zeros(len(self.X))
+        test_preds = np.zeros(self.test_dmat.num_row())
 
         iteration_list = []
 
-        for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
+        for fold, (tr_idx, val_idx) in enumerate(self.fold_indices):
             print(f"\nFold {fold + 1}")
             start = time.time()
 
             X_tr, y_tr, w_tr = (
-                X.iloc[tr_idx],
-                y.iloc[tr_idx],
-                weights.iloc[tr_idx]
+                self.X.iloc[tr_idx],
+                self.y[tr_idx],
+                self.weights[tr_idx]
             )
-            X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+            X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
 
             dtrain = xgb.DMatrix(
                 X_tr, label=y_tr,
@@ -143,7 +132,7 @@ class XGBCVTrainer:
             model = xgb.train(
                 self.params,
                 dtrain,
-                num_boost_round=20000,
+                num_boost_round=self.num_boost_round,
                 evals=[(dtrain, "train"), (dvalid, "eval")],
                 early_stopping_rounds=self.early_stopping_rounds,
                 verbose_eval=100,
@@ -151,8 +140,8 @@ class XGBCVTrainer:
             )
 
             # oof
-            oof_preds[val_idx] = model.predict(dvalid)
-            test_preds += model.predict(dtest)
+            oof_preds[val_idx] = model.predict(dvalid, iteration_range=(0, model.best_iteration+1))
+            test_preds += model.predict(self.dtest, iteration_range=(0, model.best_iteration+1))
 
             end = time.time()
             print_duration(start, end)
@@ -176,7 +165,7 @@ class XGBCVTrainer:
             f"Std: {np.std(self.fold_scores):.5f}"
         )
 
-        self.oof_score = roc_auc_score(y, oof_preds)
+        self.oof_score = roc_auc_score(self.y, oof_preds)
         print(f"OOF score: {self.oof_score:.5f}")
         print(f"Avg best iteration: {np.mean(iteration_list)}")
         print(f"Best iterations: \n{iteration_list}")
@@ -190,10 +179,7 @@ class XGBCVTrainer:
         訓練データ全体でモデルを学習し、test_dfに対する予測結果をnpy形式で保存する。
 
         Parameters
-        tr_df : pd.DataFrame
-            学習用データ。
-        test_df : pd.DataFrame
-            テスト用データ。
+        ----------
         iterations : int
             学習の繰り返し回数。
         ID : str
@@ -201,33 +187,14 @@ class XGBCVTrainer:
         level : str, default "l1"
             保存先のフォルダ名。
         """
-        tr_df = tr_df.copy()
-        test_df = test_df.copy()
+        if self.dtest is None:
+            raise ValueError("test_df not provided for XGBCVTrainer.")
 
-        cat_cols = tr_df.select_dtypes(include="object").columns
-        tr_df[cat_cols] = tr_df[cat_cols].astype("category")
-        test_df[cat_cols] = test_df[cat_cols].astype("category")
-
-        if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32")
-            tr_df = tr_df.drop("weight", axis=1)
-        else:
-            weights = pd.Series(
-                np.ones(len(tr_df), dtype="float32"),
-                index=tr_df.index
-            )
-
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"]
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
-
+        self.params = {**self.default_params, **(self.params or {})}
         dtrain = xgb.DMatrix(
-            X, label=y,
-            weight=weights, enable_categorical=True
+            self.X, label=self.y,
+            weight=self.weights, enable_categorical=True
         )
-        dtest = xgb.DMatrix(test_df, enable_categorical=True)
 
         start = time.time()
 
@@ -241,64 +208,28 @@ class XGBCVTrainer:
         end = time.time()
         print_duration(start, end)
 
-        test_preds = model.predict(dtest)
+        test_preds = model.predict(self.dtest)
 
         path = f"../artifacts/preds/{level}/test_full_{ID}.npy"
         np.save(path, test_preds)
         print(f"Successfully saved test predictions to {path}")
 
-    def get_best_fold(self):
-        """
-        最もスコアの高かったfoldのインデックスを返す。
-
-        Returns
-        -------
-        best_index: int
-            ベストスコアのfoldのインデックス。
-        """
-        best_index = int(np.argmax(self.fold_scores))
-        return best_index
-
-    def fit_one_fold(self, tr_df, fold=0):
+    def fit_one_fold(self, fold=0):
         """
         指定した1つのfoldのみを用いてモデルを学習する。
         主にOptunaによるハイパーパラメータ探索時に使用。
 
         Parameters
         ----------
-        tr_df : pd.DataFrame
-            学習用データ。
         fold : int
             学習に使うfold番号。
         """
-        tr_df = tr_df.copy()
-        cat_cols = tr_df.select_dtypes(include="object").columns
-        tr_df[cat_cols] = tr_df[cat_cols].astype("category")
-
-        if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32")
-            tr_df = tr_df.drop("weight", axis=1)
-        else:
-            weights = pd.Series(
-                np.ones(len(tr_df), dtype="float32"),
-                index=tr_df.index
-            )
-
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"]
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
-
-        skf = StratifiedKFold(
-            n_splits=self.n_splits, shuffle=True, random_state=42
-        )
-
-        tr_idx, val_idx = list(skf.split(X, y))[fold]
+        self.params = {**self.default_params, **(self.params or {})}
+        tr_idx, val_idx = self.fold_indices[fold]
         start = time.time()
 
-        X_tr, y_tr, w_tr = X.iloc[tr_idx], y.iloc[tr_idx], weights.iloc[tr_idx]
-        X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+        X_tr, y_tr, w_tr = self.X.iloc[tr_idx], self.y[tr_idx], self.weights[tr_idx]
+        X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
 
         dtrain = xgb.DMatrix(X_tr, label=y_tr,
                              weight=w_tr, enable_categorical=True)
@@ -309,7 +240,7 @@ class XGBCVTrainer:
         model = xgb.train(
             self.params,
             dtrain,
-            num_boost_round=20000,
+            num_boost_round=self.num_boost_round,
             evals=[(dtrain, "train"), (dvalid, "eval")],
             early_stopping_rounds=self.early_stopping_rounds,
             verbose_eval=100,
@@ -325,7 +256,6 @@ class XGBCVTrainer:
         print(f"Train AUC: {train_score:.5f}")
         print(f"Valid AUC: {eval_score:.5f}")
 
-        self.fold_models.append(XGBFoldModel(model, X_val, y_val, fold))
         self.fold_scores.append(eval_score)
 
 

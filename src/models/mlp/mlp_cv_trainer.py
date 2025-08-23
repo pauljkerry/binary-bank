@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import log_loss
@@ -119,7 +119,7 @@ class MLPCVTrainer:
         scoreのログの表示頻度
     t_max : int, default 50
         CosineAnnealingLRにおける最大エポック数
-    eta_min : float, default 1e-6
+    lr_min : float, default 1e-6
         CosineAnnealingLRにおける最小学習率
     min_epochs : int, default 50
         最低限学習するエポック数
@@ -133,20 +133,19 @@ class MLPCVTrainer:
     """
 
     def __init__(
-        self, n_splits=5, seed=42, epochs=100, early_stopping_rounds=20,
+        self, n_splits=5, seed=42, max_epochs=100, early_stopping_rounds=20,
         batch_size=256, lr=1e-3, use_gpu=True, hidden_dims=None,
         dropout_rate=0.2, activation="ReLU", log_interval=1,
-        t_max=50, eta_min=1e-6, min_epochs=50, **kwargs
+        t_max=50, lr_min=1e-6, min_epochs=50, **kwargs
     ):
         self.n_splits = n_splits
         self.seed = seed
-        self.epochs = epochs
+        self.max_epochs = max_epochs
         self.batch_size = batch_size
         self.lr = lr
         self.early_stopping_rounds = early_stopping_rounds
         self.device = torch.device(
-            "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
-        )
+            "cuda" if use_gpu and torch.cuda.is_available() else "cpu")
         self.fold_models = []
         self.fold_scores = []
         self.oof_score = None
@@ -154,7 +153,7 @@ class MLPCVTrainer:
         self.dropout_rate = dropout_rate
         self.log_interval = log_interval
         self.t_max = t_max
-        self.eta_min = eta_min
+        self.lr_min = lr_min
         self.min_epochs = min_epochs
         self.num_cols = []
         self.cat_cols = []
@@ -165,10 +164,11 @@ class MLPCVTrainer:
         if hidden_dims is not None:
             self.hidden_dims = hidden_dims
         else:
-            self.hidden_dims = [
+            dims_from_kwargs = [
                 v for k, v in sorted(kwargs.items())
                 if k.startswith("hidden_dim")
             ]
+            self.hidden_dims = dims_from_kwargs or [128, 64]
 
         ACTIVATION_MAPPING = {
             "ReLU": nn.ReLU,
@@ -273,7 +273,7 @@ class MLPCVTrainer:
             scheduler = CosineAnnealingLR(
                 optimizer,
                 T_max=self.t_max,
-                eta_min=self.eta_min
+                lr_min=self.lr_min
             )
             criterion = nn.BCEWithLogitsLoss()
 
@@ -281,7 +281,7 @@ class MLPCVTrainer:
             best_model_state = None
             best_epoch = 0
 
-            for epoch in range(self.epochs):
+            for epoch in range(self.max_epochs):
                 model.train()
                 for xb, yb, wb in train_loader:
                     xb = xb.to(self.device)
@@ -485,7 +485,7 @@ class MLPCVTrainer:
         scheduler = CosineAnnealingLR(
             optimizer,
             T_max=self.t_max,
-            eta_min=self.eta_min
+            lr_min=self.lr_min
         )
         criterion = nn.BCEWithLogitsLoss()
 
@@ -493,7 +493,7 @@ class MLPCVTrainer:
         best_model_state = None
         best_epoch = 0
 
-        for epoch in range(self.epochs):
+        for epoch in range(self.max_epochs):
             model.train()
             for xb, yb, wb in train_loader:
                 xb = xb.to(self.device)
