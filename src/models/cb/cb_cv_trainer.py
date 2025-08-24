@@ -2,8 +2,8 @@ from catboost import CatBoostClassifier, Pool
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 import numpy as np
-import pandas as pd
 import shap
+import gc
 import joblib
 import time
 from src.utils.print_duration import print_duration
@@ -15,6 +15,10 @@ class CBCVTrainer:
 
     Attributes
     ----------
+    tr_df : pd.DataFrame
+        label付データ
+    test_df : pd.DataFrame, default None
+        labelなしデータ。CV学習とFull Trainはtest_df必須。
     params : dict
         CBのパラメータ。
     n_splits : int, default 5
@@ -25,26 +29,44 @@ class CBCVTrainer:
         乱数シード。
     """
 
-    def __init__(self, params=None, n_splits=5,
-                 early_stopping_rounds=100, seed=42):
+    def __init__(self, tr_df, test_df=None, params=None, n_splits=5,
+                 early_stopping_rounds=200, num_boost_round=20000, seed=42):
         self.params = params or {}
         self.n_splits = n_splits
         self.early_stopping_rounds = early_stopping_rounds
+        self.num_boost_round = num_boost_round
         self.fold_models = []
         self.fold_scores = []
         self.seed = seed
         self.oof_score = None
 
-    def get_default_params(self):
-        """
-        CB用のデフォルトパラメータを返す。
+        # object → category
+        self.cat_cols = tr_df.select_dtypes(include="object").columns.to_list() or []
 
-        Returns
-        -------
-        default_params : dict
-            デフォルトパラメータの辞書。
-        """
-        default_params = {
+        # 重み
+        if "weight" in tr_df.columns:
+            self.weights = tr_df["weight"].astype("float32").to_numpy()
+            tr_df = tr_df.drop("weight", axis=1)
+        else:
+            self.weights = np.ones(len(tr_df), dtype="float32")
+
+        # target
+        self.X = tr_df.drop("target", axis=1)
+        self.y = tr_df["target"].to_numpy()
+
+        # test
+        if test_df is not None:
+            self.test = test_df
+        else:
+            self.test = None
+
+        # fold indices
+        skf = StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=seed
+        )
+        self.fold_indices = list(skf.split(self.X, self.y))
+
+        self.default_params = {
             "loss_function": "Logloss",
             "eval_metric": "Logloss",
             "learning_rate": 0.1,
@@ -62,18 +84,10 @@ class CBCVTrainer:
             "allow_writing_files": False,
             "verbose": 100
         }
-        return default_params
 
-    def fit(self, tr_df, test_df):
+    def fit(self):
         """
         CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
-
-        Parameters
-        ----------
-        tr_df : pd.DataFrame
-            学習用データ。
-        test_df : pd.DataFrame
-            テスト用データ。
 
         Returns
         -------
@@ -82,54 +96,35 @@ class CBCVTrainer:
         test_preds : ndarray
             test_dfに対する予測配列
         """
-        tr_df = tr_df.copy()
-        test_df = test_df.copy()
+        if self.dtest is None:
+            raise ValueError("test_df not provided for CBCVTrainer.")
 
-        if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32")
-            tr_df = tr_df.drop("weight", axis=1)
-        else:
-            weights = pd.Series(
-                np.ones(len(tr_df), dtype="float32"),
-                index=tr_df.index
-            )
+        self.params = {**self.default_params, **(self.params or {})}
 
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"]
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
-
-        cat_cols = tr_df.select_dtypes(include="object").columns.to_list()
-
-        oof_preds = np.zeros((len(tr_df), 2))
-        test_preds = np.zeros((len(test_df), 2))
-
-        skf = StratifiedKFold(
-            n_splits=self.n_splits, shuffle=True,
-            random_state=self.seed)
+        oof_preds = np.zeros(len(self.X))
+        test_preds = np.zeros(len(self.test))
 
         iteration_list = []
 
-        for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
+        for fold, (tr_idx, val_idx) in enumerate(self.fold_indices):
             print(f"\nFold {fold + 1}")
             start = time.time()
 
             X_tr, y_tr, w_tr = (
-                X.iloc[tr_idx],
-                y.iloc[tr_idx],
-                weights.iloc[tr_idx]
+                self.X.iloc[tr_idx],
+                self.y[tr_idx],
+                self.weights[tr_idx]
             )
-            X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+            X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
 
             train_pool = Pool(
                 X_tr, y_tr,
-                cat_features=cat_cols,
+                cat_features=self.cat_cols,
                 weight=w_tr
             )
             val_pool = Pool(
                 X_val, y_val,
-                cat_features=cat_cols
+                cat_features=self.cat_cols
             )
 
             model = CatBoostClassifier(**self.params)
@@ -138,13 +133,13 @@ class CBCVTrainer:
                 train_pool, eval_set=val_pool, use_best_model=True
             )
 
-            val_preds = model.predict_proba(X_val)[:, 1]
+            best_iter = model.best_iteration_
+            val_preds = model.predict_proba(X_val, ntree_end=best_iter)[:, 1]
             oof_preds[val_idx] = val_preds
 
-            test_preds += model.predict_proba(test_df)[:, 1]
+            test_preds += model.predict_proba(self.test)[:, 1]
 
             val_auc = roc_auc_score(y_val, val_preds)
-            best_iteration = model.best_iteration_
             print(f"Valid AUC: {val_auc:.5f}")
 
             end = time.time()
@@ -156,7 +151,7 @@ class CBCVTrainer:
                 ))
             self.fold_scores.append(val_auc)
 
-            iteration_list.append(best_iteration)
+            iteration_list.append(best_iter)
 
         print("\n=== CV Results ===")
         print(f"Fold scores: {self.fold_scores}")
@@ -165,7 +160,7 @@ class CBCVTrainer:
             f"Std: {np.std(self.fold_scores):.5f}"
         )
 
-        self.oof_score = roc_auc_score(y, oof_preds)
+        self.oof_score = roc_auc_score(self.y, oof_preds)
         print(f" OOF score: {self.oof_score:.5f}")
         print(f"Avg best iteration: {np.mean(iteration_list)}")
         print(f"Best iterations: \n{iteration_list}")
@@ -174,42 +169,26 @@ class CBCVTrainer:
 
         return oof_preds, test_preds
 
-    def full_train(self, tr_df, test_df, ID, level="l1"):
+    def full_train(self, iterations, ID, level="l1"):
         """
         訓練データ全体でモデルを学習し、test_dfに対する予測結果をnpy形式で保存する。
 
         Parameters
-        tr_df : pd.DataFrame
-            学習用データ。
-        test_df : pd.DataFrame
-            テスト用データ。
+        ----------
         ID : str
             保存ファイル名に付加する識別子。
         level : str, default "l1"
             保存先のフォルダ名。
         """
-        tr_df = tr_df.copy()
-        test_df = test_df.copy()
+        if self.dtest is None:
+            raise ValueError("test_df not provided for CBCVTrainer.")
 
-        if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32")
-            tr_df = tr_df.drop("weight", axis=1)
-        else:
-            weights = pd.Series(
-                np.ones(len(tr_df), dtype="float32"),
-                index=tr_df.index
-            )
-
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"].values
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
-
-        cat_cols = tr_df.select_dtypes(include="object").columns.to_list()
+        iterations = iterations * self.n_splits/(self.n_splits-1)
+        self.params["iterations"] = iterations
+        self.params = {**self.default_params, **(self.params or {})}
 
         train_pool = Pool(
-            X, y, cat_features=cat_cols, weight=weights)
+            self.X, self.y, cat_features=self.cat_cols, weight=self.weights)
 
         start = time.time()
 
@@ -228,86 +207,65 @@ class CBCVTrainer:
                 model, None, None, None
             ))
 
-        test_preds = model.predict_proba(test_df)[:, 1]
+        test_preds = model.predict_proba(self.test)[:, 1]
 
         path = f"../artifacts/preds/{level}/test_full_{ID}.npy"
         np.save(path, test_preds)
         print(f"Successfully saved test predictions to {path}")
 
-    def fit_one_fold(self, tr_df, fold=0):
+    def fit_one_fold(self, fold=0):
         """
         指定した1つのfoldのみを用いてモデルを学習する。
         主にOptunaによるハイパーパラメータ探索時に使用。
 
         Parameters
         ----------
-        tr_df : pd.DataFrame
-            学習用データ。
         fold : int
             学習に使うfold番号。
+
+        Return
+        ------
+        auc : float
+            Score
         """
-        tr_df = tr_df.copy()
+        self.params = {**self.default_params, **(self.params or {})}
 
-        if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32")
-            tr_df = tr_df.drop("weight", axis=1)
-        else:
-            weights = pd.Series(
-                np.ones(len(tr_df), dtype="float32"),
-                index=tr_df.index
-            )
-
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"]
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
-
-        cat_cols = tr_df.select_dtypes(include="object").columns.to_list()
-
-        skf = StratifiedKFold(
-            n_splits=self.n_splits, shuffle=True,
-            random_state=self.seed)
-
-        tr_idx, val_idx = list(skf.split(X, y))[fold]
+        tr_idx, val_idx = list(self.fold_indices)[fold]
         start = time.time()
 
         X_tr, y_tr, w_tr = (
-            X.iloc[tr_idx],
-            y.iloc[tr_idx],
-            weights.iloc[tr_idx]
+            self.X.iloc[tr_idx],
+            self.y[tr_idx],
+            self.weights[tr_idx]
         )
-        X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+        X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
 
         train_pool = Pool(
             X_tr, y_tr,
-            cat_features=cat_cols,
+            cat_features=self.cat_cols,
             weight=w_tr
         )
         val_pool = Pool(
             X_val, y_val,
-            cat_features=cat_cols
+            cat_features=self.cat_cols
         )
 
         model = CatBoostClassifier(**self.params)
 
         model.fit(
-            train_pool, eval_set=val_pool, use_best_model=True, 
+            train_pool, eval_set=val_pool, use_best_model=True,
         )
 
         preds = model.predict_proba(X_val)[:, 1]
         auc = roc_auc_score(y_val, preds)
         print(f"Valid AUC: {auc:.5f}")
 
-        self.fold_models.append(CBFoldModel(
-            model,
-            X_val,
-            y_val,
-            fold
-        ))
-        self.fold_scores.append(auc)
         end = time.time()
         print_duration(start, end)
+
+        del model, train_pool, val_pool
+        gc.collect()
+        return auc
 
 
 class CBFoldModel:

@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import log_loss
+from sklearn.metrics import roc_auc_score
 import time
 import joblib
 from src.utils.print_duration import print_duration
@@ -119,7 +120,7 @@ class MLPCVTrainer:
         scoreのログの表示頻度
     t_max : int, default 50
         CosineAnnealingLRにおける最大エポック数
-    lr_min : float, default 1e-6
+    eta_min : float, default 1e-6
         CosineAnnealingLRにおける最小学習率
     min_epochs : int, default 50
         最低限学習するエポック数
@@ -132,43 +133,31 @@ class MLPCVTrainer:
         各隠れ層のユニット数。"hidden_dims"を指定しない場合に有効。
     """
 
-    def __init__(
-        self, n_splits=5, seed=42, max_epochs=100, early_stopping_rounds=20,
-        batch_size=256, lr=1e-3, use_gpu=True, hidden_dims=None,
-        dropout_rate=0.2, activation="ReLU", log_interval=1,
-        t_max=50, lr_min=1e-6, min_epochs=50, **kwargs
-    ):
+    def __init__(self, tr_df, test_df=None, params=None, n_splits=5):
+        self.params = params or {}
         self.n_splits = n_splits
-        self.seed = seed
-        self.max_epochs = max_epochs
-        self.batch_size = batch_size
-        self.lr = lr
-        self.early_stopping_rounds = early_stopping_rounds
-        self.device = torch.device(
-            "cuda" if use_gpu and torch.cuda.is_available() else "cpu")
         self.fold_models = []
         self.fold_scores = []
         self.oof_score = None
-        self.early_stopping_rounds = early_stopping_rounds
-        self.dropout_rate = dropout_rate
-        self.log_interval = log_interval
-        self.t_max = t_max
-        self.lr_min = lr_min
-        self.min_epochs = min_epochs
-        self.num_cols = []
-        self.cat_cols = []
-        self.cat_idxs = []
-        self.num_idxs = []
-        self.cat_dims = []
 
-        if hidden_dims is not None:
-            self.hidden_dims = hidden_dims
-        else:
-            dims_from_kwargs = [
-                v for k, v in sorted(kwargs.items())
-                if k.startswith("hidden_dim")
-            ]
-            self.hidden_dims = dims_from_kwargs or [128, 64]
+        self.default_params = {
+            "lr": 1e-3,
+            "batch_size": 256,
+            "dropout_rate": 0.2,
+            "hidden_dim1": 128,
+            "hidden_dim2": 64,
+            "hidden_dim3": None,
+            "hidden_dim4": None,
+            "max_epochs": 100,
+            "min_epochs": 50,
+            "activation": "ReLU",
+            "early_stopping_rounds": 20,
+            "t_max": 50,
+            "eta_min": 1e-6,
+            "log_interval": 1,
+            "seed": 42,
+            "device": "cuda"
+        }
 
         ACTIVATION_MAPPING = {
             "ReLU": nn.ReLU,
@@ -179,34 +168,24 @@ class MLPCVTrainer:
             "Tanh": nn.Tanh,
             "Sigmoid": nn.Sigmoid,
         }
-        self.activation = ACTIVATION_MAPPING[activation]
 
-    def fit(self, tr_df, test_df):
-        """
-        CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
+        self.params = {**self.default_params, **self.params}
 
-        Parameters
-        ----------
-        tr_df : cudf.DataFrame
-            学習用データ。
-        test_df : cudf.DataFrame
-            テスト用データ。
+        self.params["activation"] = ACTIVATION_MAPPING[self.params["activation"]]
 
-        Returns
-        -------
-        oof_preds : ndarray
-            OOF予測配列
-        test_preds : ndarray
-            test_dfに対する予測配列
-        """
-        tr_df = tr_df.copy()
-        test_df = test_df.copy()
+        hidden_dims = []
+        i = 1
+        while self.params.get(f"hidden_dim{i}") is not None:
+            hidden_dims.append(self.params[f"hidden_dim{i}"])
+            i += 1
+
+        self.params["hidden_dims"] = hidden_dims
 
         if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32").values
+            self.weights = tr_df["weight"].to_numpy(dtype=np.float32)
             tr_df = tr_df.drop("weight", axis=1)
         else:
-            weights = np.ones(len(tr_df), dtype="float32")
+            self.weights = np.ones(len(tr_df), dtype=np.float32)
 
         self.cat_cols = tr_df.select_dtypes(
             include=["object", "category"]).columns.tolist()
@@ -217,30 +196,49 @@ class MLPCVTrainer:
         self.num_idxs = [tr_df.columns.get_loc(col) for col in self.num_cols]
         self.cat_dims = [tr_df[col].nunique() for col in self.cat_cols]
 
-        # dtypeの変更
-        X = tr_df.drop("target", axis=1).to_numpy().astype(np.float32)
-        X_test = test_df.to_numpy().astype(np.float32)
+        self.X = tr_df.drop("target", axis=1).to_numpy(dtype=np.float32)
+        self.y = tr_df["target"].to_numpy(dtype=np.float32)
 
-        y = tr_df["target"].to_numpy().astype(np.float32)
+        if test_df is not None:
+            self.test = test_df.to_numpy(dtype=np.float32)
+        else:
+            self.test = None
 
-        oof_preds = np.zeros(len(X))
-        test_preds = np.zeros(len(X_test))
+        skf = StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=self.params["seed"]
+        )
+        self.fold_indices = list(skf.split(self.X, self.y))
 
-        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.seed)
+    def fit(self):
+        """
+        CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
+
+        Returns
+        -------
+        oof_preds : ndarray
+            OOF予測配列
+        test_preds : ndarray
+            test_dfに対する予測配列
+        """
+        if self.test is None:
+            raise ValueError("test_df not provided for MLPCVTrainer.")
+
+        oof_preds = np.zeros(len(self.X))
+        test_preds = np.zeros(len(self.test))
 
         epoch_list = []
 
-        for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
+        for fold, (tr_idx, val_idx) in enumerate(self.fold_indices):
             print(f"\nFold {fold + 1}")
             start = time.time()
 
             X_tr, y_tr, w_tr = (
-                X[tr_idx],
-                y[tr_idx],
-                weights[tr_idx])
+                self.X[tr_idx],
+                self.y[tr_idx],
+                self.weights[tr_idx])
             X_val, y_val = (
-                X[val_idx],
-                y[val_idx])
+                self.X[val_idx],
+                self.y[val_idx])
 
             # Dataloaders
             train_dataset = TensorDataset(
@@ -252,28 +250,40 @@ class MLPCVTrainer:
                 torch.tensor(X_val),
                 torch.tensor(y_val)
             )
+            test_dataset = TensorDataset(
+                torch.tensor(self.test).float()
+            )
 
             train_loader = DataLoader(
-                train_dataset, batch_size=self.batch_size, shuffle=True
+                train_dataset,
+                batch_size=self.params["batch_size"],
+                shuffle=True
             )
             val_loader = DataLoader(
-                val_dataset, batch_size=self.batch_size, shuffle=False
+                val_dataset,
+                batch_size=self.params["batch_size"],
+                shuffle=False
+            )
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=self.params["batch_size"],
+                shuffle=False
             )
 
             model = SimpleMLP(
-                input_dim=X.shape[1],
-                hidden_dims=self.hidden_dims,
-                dropout_rate=self.dropout_rate,
-                activation=self.activation,
+                input_dim=self.X.shape[1],
+                hidden_dims=self.params["hidden_dims"],
+                dropout_rate=self.params["dropout_rate"],
+                activation=self.params["activation"],
                 num_idxs=self.num_idxs,
                 cat_idxs=self.cat_idxs,
                 cat_dims=self.cat_dims
-            ).to(self.device)
-            optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+            ).to(self.params["device"])
+            optimizer = torch.optim.Adam(model.parameters(), lr=self.params["lr"])
             scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=self.t_max,
-                lr_min=self.lr_min
+                T_max=self.params["t_max"],
+                eta_min=self.params["eta_min"]
             )
             criterion = nn.BCEWithLogitsLoss()
 
@@ -281,12 +291,12 @@ class MLPCVTrainer:
             best_model_state = None
             best_epoch = 0
 
-            for epoch in range(self.max_epochs):
+            for epoch in range(self.params["max_epochs"]):
                 model.train()
                 for xb, yb, wb in train_loader:
-                    xb = xb.to(self.device)
-                    yb = yb.to(self.device)
-                    wb = wb.to(self.device)
+                    xb = xb.to(self.params["device"])
+                    yb = yb.to(self.params["device"])
+                    wb = wb.to(self.params["device"])
 
                     preds = model(xb)
                     loss = criterion(preds, yb)
@@ -300,7 +310,7 @@ class MLPCVTrainer:
                 preds = []
                 with torch.no_grad():
                     for xb, yb in val_loader:
-                        xb = xb.to(self.device)
+                        xb = xb.to(self.params["device"])
                         pred_logits = model(xb)
                         pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
                         preds.append(pred_probs)
@@ -308,13 +318,13 @@ class MLPCVTrainer:
                 val_log_loss = log_loss(y_val, val_pred)
                 scheduler.step()
 
-                if (epoch + 1) % self.log_interval == 0 or epoch == 0:
+                if (epoch + 1) % self.params["log_interval"] == 0 or epoch == 0:
                     model.eval()
                     train_preds = []
                     train_targets = []
                     with torch.no_grad():
                         for xb, yb, wb in train_loader:
-                            xb = xb.to(self.device)
+                            xb = xb.to(self.params["device"])
                             pred_logits = model(xb)
                             pred_probs = torch.sigmoid(
                                 pred_logits).cpu().numpy()
@@ -341,8 +351,8 @@ class MLPCVTrainer:
                         f"New best model saved at epoch {epoch+1}, "
                         f"Logloss: {val_log_loss:.5f}")
                 elif (
-                    (epoch - best_epoch >= self.early_stopping_rounds) and
-                    (epoch + 1 >= self.min_epochs)
+                    (epoch - best_epoch >= self.params["early_stopping_rounds"]) and
+                    (epoch + 1 >= self.params["min_epochs"])
                 ):
                     print(f"Early stopping at epoch {epoch+1}")
                     print(f"Loading best model from epoch {best_epoch} "
@@ -350,7 +360,7 @@ class MLPCVTrainer:
                     break
 
             model.load_state_dict(
-                {k: v.to(self.device) for k, v in best_model_state.items()}
+                {k: v.to(self.params["device"]) for k, v in best_model_state.items()}
             )
             self.fold_models.append(MLPFoldModel(
                 model,
@@ -364,26 +374,29 @@ class MLPCVTrainer:
             epoch_list.append(best_epoch)
 
             model.eval()
+            val_preds = []
             with torch.no_grad():
-                # Validation用データ作成
-                val_tensor = torch.tensor(X_val).float().to(self.device)
+                for xb, _ in val_loader:
+                    xb = xb.to(self.params["device"])
+                    val_logits = model(xb)
+                    val_probs = torch.sigmoid(val_logits).cpu().numpy()
+                    val_preds.append(val_probs)
+            oof_preds[val_idx] = np.concatenate(val_preds).ravel()
 
-                val_logits = model(val_tensor)
-                val_probs = torch.sigmoid(val_logits)
-                oof_preds[val_idx] = val_probs.cpu().numpy().ravel()
-
-                # Test用データ作成
-                test_tensor = torch.tensor(X_test).float().to(self.device)
-
-                test_logits = model(test_tensor)
-                test_probs = torch.sigmoid(test_logits)
-                test_preds += test_probs.cpu().numpy().ravel()
+            with torch.no_grad():
+                fold_test_preds = []
+                for xb in test_loader:
+                    xb = xb[0].to(self.params["device"])
+                    test_logits = model(xb)
+                    test_probs = torch.sigmoid(test_logits).cpu().numpy()
+                    fold_test_preds.append(test_probs)
+                test_preds += np.concatenate(fold_test_preds).ravel()
 
             end = time.time()
             print(f"Best Logloss: {best_log_loss:.5f}")
             print_duration(start, end)
 
-        self.oof_score = log_loss(y, oof_preds)
+        self.oof_score = roc_auc_score(self.y, oof_preds)
         print("\n=== CV Results ===")
         print(f"Fold scores: {self.fold_scores}")
         print(
@@ -397,62 +410,27 @@ class MLPCVTrainer:
         test_preds /= self.n_splits
         return oof_preds, test_preds
 
-    def get_best_fold(self):
-        """
-        最もスコアの高かったfoldのインデックスとそのスコアを返す。
-
-        Returns
-        -------
-        best_index: int
-            ベストスコアのfoldのインデックス。
-        self.fold_scores[best_index] : float
-            スコア。
-        """
-        best_index = int(np.argmax(self.fold_scores))
-        return best_index, self.fold_scores[best_index]
-
-    def fit_one_fold(self, tr_df, fold=0):
+    def fit_one_fold(self, fold=0):
         """
         指定した1つのfoldのみを用いてモデルを学習する。
         主にOptunaによるハイパーパラメータ探索時に使用。
 
         Parameters
         ----------
-        tr_df : pd.DataFrame
-            学習用データ。
         fold : int
             学習に使うfold番号。
+
+        Rerurn
+        ------
+        best_logloss : float
+            Score
         """
-        tr_df = tr_df.copy()
-
-        if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32").values
-            tr_df = tr_df.drop("weight", axis=1)
-        else:
-            weights = np.ones(len(tr_df), dtype="float32")
-
-        self.cat_cols = tr_df.select_dtypes(
-            include=["object", "category"]).columns.tolist()
-        self.num_cols = [col for col in tr_df.columns
-                         if col not in self.cat_cols + ["target"]]
-
-        self.cat_idxs = [tr_df.columns.get_loc(col) for col in self.cat_cols]
-        self.num_idxs = [tr_df.columns.get_loc(col) for col in self.num_cols]
-        self.cat_dims = [tr_df[col].nunique() for col in self.cat_cols]
-
-        # dtypeの変更
-        X = tr_df.drop("target", axis=1).to_numpy().astype(np.float32)
-        y = tr_df["target"].to_numpy().astype(np.float32)
-
-        skf = StratifiedKFold(
-            n_splits=self.n_splits, shuffle=True, random_state=self.seed)
-
-        tr_idx, val_idx = list(skf.split(X, y))[fold]
+        tr_idx, val_idx = self.fold_indices[fold]
         start = time.time()
 
         X_tr, y_tr, w_tr = (
-            X[tr_idx], y[tr_idx], weights[tr_idx])
-        X_val, y_val = X[val_idx], y[val_idx]
+            self.X[tr_idx], self.y[tr_idx], self.weights[tr_idx])
+        X_val, y_val = self.X[val_idx], self.y[val_idx]
 
         # Dataloaders
         train_dataset = TensorDataset(
@@ -466,26 +444,26 @@ class MLPCVTrainer:
         )
 
         train_loader = DataLoader(
-            train_dataset, batch_size=self.batch_size, shuffle=True
+            train_dataset, batch_size=self.params["batch_size"], shuffle=True
         )
         val_loader = DataLoader(
-            val_dataset, batch_size=self.batch_size, shuffle=False
+            val_dataset, batch_size=self.params["batch_size"], shuffle=False
         )
 
         model = SimpleMLP(
-            input_dim=X.shape[1],
-            hidden_dims=self.hidden_dims,
-            dropout_rate=self.dropout_rate,
-            activation=self.activation,
+            input_dim=self.X.shape[1],
+            hidden_dims=self.params["hidden_dims"],
+            dropout_rate=self.params["dropout_rate"],
+            activation=self.params["activation"],
             num_idxs=self.num_idxs,
             cat_idxs=self.cat_idxs,
             cat_dims=self.cat_dims
-        ).to(self.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+        ).to(self.params["device"])
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.params["lr"])
         scheduler = CosineAnnealingLR(
             optimizer,
-            T_max=self.t_max,
-            lr_min=self.lr_min
+            T_max=self.params["t_max"],
+            eta_min=self.params["eta_min"]
         )
         criterion = nn.BCEWithLogitsLoss()
 
@@ -493,12 +471,12 @@ class MLPCVTrainer:
         best_model_state = None
         best_epoch = 0
 
-        for epoch in range(self.max_epochs):
+        for epoch in range(self.params["max_epochs"]):
             model.train()
             for xb, yb, wb in train_loader:
-                xb = xb.to(self.device)
-                yb = yb.to(self.device)
-                wb = wb.to(self.device)
+                xb = xb.to(self.params["device"])
+                yb = yb.to(self.params["device"])
+                wb = wb.to(self.params["device"])
 
                 preds = model(xb)
                 loss = criterion(preds, yb)
@@ -512,7 +490,7 @@ class MLPCVTrainer:
             preds = []
             with torch.no_grad():
                 for xb, yb in val_loader:
-                    xb = xb.to(self.device)
+                    xb = xb.to(self.params["device"])
 
                     pred_logits = model(xb)
                     pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
@@ -528,7 +506,7 @@ class MLPCVTrainer:
                 train_targets = []
                 with torch.no_grad():
                     for xb, yb, wb in train_loader:
-                        xb = xb.to(self.device)
+                        xb = xb.to(self.params["device"])
 
                         pred_logits = model(xb)
                         pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
@@ -556,8 +534,8 @@ class MLPCVTrainer:
                     f"Logloss: {val_logloss:.5f}")
                 best_epoch = epoch + 1
             elif (
-                (epoch - best_epoch >= self.early_stopping_rounds) and
-                (epoch + 1 >= self.min_epochs)
+                (epoch - best_epoch >= self.params["early_stopping_rounds"]) and
+                (epoch + 1 >= self.params["min_epochs"])
             ):
                 print(f"Early stopping at epoch {epoch+1}")
                 print(
@@ -566,21 +544,27 @@ class MLPCVTrainer:
                 break
 
         model.load_state_dict(
-            {k: v.to(self.device) for k, v in best_model_state.items()}
+            {k: v.to(self.params["device"]) for k, v in best_model_state.items()}
         )
+
+        model.eval()
+        final_preds = []
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(self.params["device"])
+                pred_logits = model(xb)
+                pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
+                final_preds.append(pred_probs)
+
+        final_preds = np.concatenate(final_preds)
+        best_auc = roc_auc_score(y_val, final_preds)
 
         end = time.time()
         print_duration(start, end)
         print(f"Best Logloss: {best_logloss:.5f}")
+        print(f"Best AUC: {best_auc:.5f}")
 
-        self.fold_models.append(MLPFoldModel(
-            model,
-            X_val,
-            y_val,
-            0,
-            best_rounds=best_epoch
-        ))
-        self.fold_scores.append(best_logloss)
+        return best_auc
 
 
 class MLPFoldModel:

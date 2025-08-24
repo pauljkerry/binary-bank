@@ -1,5 +1,4 @@
 import polars as pl
-import pandas as pd
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from tqdm.notebook import tqdm
@@ -45,8 +44,8 @@ def target_encoding(
         raise TypeError("Expected pandas.DataFrame or polars.DataFrame")
     """
 
-    tr_df = tr_df.with_columns(pl.arange(0, tr_df.height).alias("id"))
-    test_df = test_df.with_columns(pl.arange(0, test_df.height).alias("id"))
+    tr_df = tr_df.with_row_count("id")
+    test_df = test_df.with_row_count("id")
 
     y = tr_df[target_col].to_numpy()
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
@@ -60,8 +59,8 @@ def target_encoding(
     for fold_idx, (tr_idx, val_idx) in enumerate(
         tqdm(skf.split(tr_df.to_pandas(), y))
     ):
-        train_pl = tr_df.filter(pl.arange(0, tr_df.height).is_in(tr_idx))
-        val_pl = tr_df.filter(pl.arange(0, tr_df.height).is_in(val_idx))
+        val_pl = tr_df[val_idx]
+        train_pl = tr_df[tr_idx]
 
         for col in tqdm(cat_cols):
             # 1. trainデータでグループごとの平均計算（Polars）

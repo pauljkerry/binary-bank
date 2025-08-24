@@ -49,7 +49,7 @@ def create_objective(
 
         trainer.params = params
 
-        trainer.fit_one_fold(fold=0)
+        score = trainer.fit_one_fold(fold=0)
 
-        return trainer.fold_scores[0]
+        return score
     return objective

@@ -17,29 +17,38 @@ class LGBMCVTrainer:
 
     Attributes
     ----------
+    tr_df : pd.DataFrame
+        label付データ
+    test_df : pd.DataFrame, default None
+        labelなしデータ。CV学習とFull Trainはtest_df必須。
     params : dict
-        XGBのパラメータ。
+        LGBMのパラメータ。
     n_splits : int, default 5
         StratifiedKFoldの分割数。
-    early_stopping_rounds : int, default 100
+    early_stopping_rounds : int, default 200
         早期停止ラウンド数。
+    num_boost_round : int, default 20000
+        iterationの最大値。
     seed : int, default 42
         乱数シード。
     """
 
     def __init__(self, tr_df, test_df=None, params=None, n_splits=5,
-                 early_stopping_rounds=100, num_boost_round=20000, seed=42):
+                 early_stopping_rounds=200, num_boost_round=20000, seed=42):
         self.params = params or {}
         self.n_splits = n_splits
         self.early_stopping_rounds = early_stopping_rounds
+        self.num_boost_round = num_boost_round
         self.fold_models = []
         self.fold_scores = []
         self.seed = seed
         self.oof_score = None
 
-        self.cat_cols = tr_df.select_dtypes(include="object").columns.to_list()
-        tr_df[self.cat_cols] = tr_df[self.cat_cols].astype("category")
-        test_df[self.cat_cols] = test_df[self.cat_cols].astype("category")
+        self.cat_cols = tr_df.select_dtypes(include="object").columns.to_list() or []
+
+        if self.cat_cols:
+            tr_df[self.cat_cols] = tr_df[self.cat_cols].astype("category")
+            test_df[self.cat_cols] = test_df[self.cat_cols].astype("category")
 
         if "weight" in tr_df.columns:
             self.weights = tr_df["weight"].astype("float32")
@@ -92,8 +101,8 @@ class LGBMCVTrainer:
         test_preds : ndarray
             test_dfに対する予測配列
         """
-        if self.dtest is None:
-            raise ValueError("test_df not provided for XGBCVTrainer.")
+        if self.test is None:
+            raise ValueError("test_df not provided for LGBMCVTrainer.")
 
         self.params = {**self.default_params, **(self.params or {})}
         oof_preds = np.zeros(len(self.X))
@@ -107,10 +116,10 @@ class LGBMCVTrainer:
 
             X_tr, y_tr, w_tr = (
                 self.X.iloc[tr_idx],
-                self.y.iloc[tr_idx],
-                self.weights.iloc[tr_idx]
+                self.y[tr_idx],
+                self.weights[tr_idx]
             )
-            X_val, y_val = self.X.iloc[val_idx], self.y.iloc[val_idx]
+            X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
 
             dtrain = lgb.Dataset(
                 X_tr, label=y_tr,
@@ -138,7 +147,7 @@ class LGBMCVTrainer:
             val = self.X.iloc[val_idx]
             oof_preds[val_idx] = model.predict(val)
 
-            test_preds += model.predict(self.test_df)
+            test_preds += model.predict(self.test)
 
             end = time.time()
             print_duration(start, end)
@@ -184,8 +193,8 @@ class LGBMCVTrainer:
         level : str, default "l1"
             保存先のフォルダ名。
         """
-        if self.dtest is None:
-            raise ValueError("test_df not provided for XGBCVTrainer.")
+        if self.test is None:
+            raise ValueError("test_df not provided for LGBMCVTrainer.")
 
         self.params = {**self.default_params, **(self.params or {})}
 
@@ -208,23 +217,11 @@ class LGBMCVTrainer:
         print_duration(start, end)
 
         # test_dfの予測値
-        test_preds = model.predict(self.test_df)
+        test_preds = model.predict(self.test)
 
         path = f"../artifacts/preds/{level}/test_full_{ID}.npy"
         np.save(path, test_preds)
         print(f"Successfully saved test predictions to {path}")
-
-    def get_best_fold(self):
-        """
-        最もスコアの高かったfoldのインデックスを返す。
-
-        Returns
-        -------
-        best_index: int
-            ベストスコアのfoldのインデックス。
-        """
-        best_index = int(np.argmax(self.fold_scores))
-        return best_index
 
     def fit_one_fold(self, fold=0):
         """
@@ -235,13 +232,18 @@ class LGBMCVTrainer:
         ----------
         fold : int
             学習に使うfold番号。
+
+        Return
+        ------
+        eval_score : float
+            Score
         """
         self.params = {**self.default_params, **(self.params or {})}
         tr_idx, val_idx = self.fold_indices[fold]
         start = time.time()
 
-        X_tr, y_tr, w_tr = self.X.iloc[tr_idx], self.y.iloc[tr_idx], self.weights.iloc[tr_idx]
-        X_val, y_val = self.X.iloc[val_idx], self.y.iloc[val_idx]
+        X_tr, y_tr, w_tr = self.X.iloc[tr_idx], self.y[tr_idx], self.weights[tr_idx]
+        X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
 
         dtrain = lgb.Dataset(
             X_tr, label=y_tr,
@@ -274,19 +276,17 @@ class LGBMCVTrainer:
         print(f"Train AUC: {train_score:.5f}")
         print(f"Valid AUC: {eval_score:.5f}")
 
-        self.fold_models.append(
-            LGBMFoldModel(model, X_val, y_val, fold))
-        self.fold_scores.append(eval_score)
+        return eval_score
 
 
 class LGBMFoldModel:
     """
-    XGBoostのfold単位のモデルを保持するクラス。
+    LGBMoostのfold単位のモデルを保持するクラス。
 
     Attributes
     ----------
-    model : xgb.Booster
-        学習済みのXGBoostモデル。
+    model : lgb.Booster
+        学習済みのLGBMoostモデル。
     X_val : pd.DataFrame
         検証用の特徴量データ。
     y_val : pd.Series

@@ -75,9 +75,8 @@ def create_objective(
             ]),
             "hidden_dims": hidden_dims,
         }
+        trainer = MLPCVTrainer(tr_df, params=params, n_splits=n_splits)
+        score = trainer.fit_one_fold(fold=0)
 
-        trainer = MLPCVTrainer(**params)
-        trainer.fit_one_fold(tr_df, fold=0)
-
-        return trainer.fold_scores[0]
+        return score
     return objective

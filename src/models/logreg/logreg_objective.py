@@ -17,17 +17,16 @@ def create_objective(tr_df, n_splits=5):
     objective : function
         optunaで使用する目的関数。
     """
+    trainer = LogRegCVTrainer(tr_df, n_splits=n_splits)
+
     def objective(trial):
         params = {
             "C": trial.suggest_float("C", 1e-2, 1e2, log=True)
         }
 
-        trainer = LogRegCVTrainer(
-            params=params,
-            n_splits=n_splits
-        )
+        trainer.params = params
 
-        trainer.fit_one_fold(tr_df, fold=0)
+        score = trainer.fit_one_fold(fold=0)
 
-        return trainer.fold_scores[0]
+        return score
     return objective

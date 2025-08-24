@@ -1,8 +1,7 @@
 from cuml.linear_model import LogisticRegression
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import log_loss
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import roc_auc_score
 import joblib
 import time
 from src.utils.print_duration import print_duration
@@ -14,6 +13,10 @@ class LogRegCVTrainer:
 
     Attributes
     ----------
+    tr_df : pd.DataFrame
+        label付データ
+    test_df : pd.DataFrame, default None
+        labelなしデータ。CV学習はtest_df必須。
     params : dict
         LogRegのパラメータ。
     n_splits : int, default 5
@@ -24,7 +27,10 @@ class LogRegCVTrainer:
         乱数シード。
     """
 
-    def __init__(self, params=None, n_splits=5, max_iter=1000, seed=42):
+    def __init__(
+        self, tr_df, test_df=None, params=None, n_splits=5,
+        max_iter=1000, seed=42
+    ):
         self.params = params or {}
         self.n_splits = n_splits
         self.max_iter = max_iter
@@ -33,34 +39,36 @@ class LogRegCVTrainer:
         self.seed = seed
         self.oof_score = None
 
-    def get_default_params(self):
-        """
-        LogReg用のデフォルトパラメータを返す。
+        if "weight" in tr_df.columns:
+            tr_df = tr_df.drop("weight", axis=1)
 
-        Returns
-        -------
-        default_params : dict
-            デフォルトパラメータの辞書。
-        """
-        default_params = {
+        self.X = tr_df.drop("target", axis=1)
+        self.y = tr_df["target"].to_cupy()
+
+        # test
+        if test_df is not None:
+            self.test = test_df
+        else:
+            self.test = None
+
+        # fold indices
+        skf = StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=seed
+        )
+        self.fold_indices = list(
+            skf.split(self.X.to_pandas(), self.y.get()))
+
+        self.default_params = {
             "C": 1.0,
             "penalty": "l2",
             "solver": "qn",
             "max_iter": self.max_iter,
             "class_weight": None
         }
-        return default_params
 
-    def fit(self, tr_df, test_df):
+    def fit(self):
         """
         CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
-
-        Parameters
-        ----------
-        tr_df : cudf.DataFrame
-            学習用データ。
-        test_df : cudf.DataFrame
-            テスト用データ。
 
         Returns
         -------
@@ -69,45 +77,31 @@ class LogRegCVTrainer:
         test_preds : ndarray
             test_dfに対する予測配列
         """
-        tr_df = tr_df.copy()
-        test_df = test_df.copy()
+        if self.test is None:
+            raise ValueError("test_df not provided for LogRegCVTrainer.")
 
-        if "weight" in tr_df.columns:
-            tr_df = tr_df.drop("weight", axis=1)
+        self.params = {**self.default_params, **self.params}
 
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"]
+        oof_preds = np.zeros(len(self.X))
+        test_preds = np.zeros(len(self.test))
 
-        X_pd = X.to_pandas()
-        y_pd = y.to_pandas()
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
-
-        oof_preds = np.zeros((len(X), len(np.unique(y))))
-        test_preds = np.zeros((len(test_df), len(np.unique(y))))
-
-        skf = StratifiedKFold(
-            n_splits=self.n_splits, shuffle=True
-        )
-
-        for fold, (tr_idx, val_idx) in enumerate(skf.split(X_pd, y_pd)):
+        for fold, (tr_idx, val_idx) in enumerate(self.fold_indices):
             print(f"\nFold {fold + 1}")
             start = time.time()
-            X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
-            X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+            X_tr, y_tr = self.X.iloc[tr_idx], self.y[tr_idx]
+            X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
 
             model = LogisticRegression(**self.params)
             model.fit(X_tr, y_tr)
 
-            oof_preds[val_idx] = model.predict_proba(X_val).to_numpy()
-            test_preds += model.predict_proba(test_df).to_numpy()
+            oof_preds[val_idx] = model.predict_proba(X_val).to_numpy()[:, 1]
+            test_preds += model.predict_proba(self.test).to_numpy()[:, 1]
 
             end = time.time()
             print_duration(start, end)
 
-            logloss = log_loss(y_val.to_numpy(), oof_preds[val_idx])
-            print(f"Valid log_loss: {logloss:.5f}")
+            score = roc_auc_score(y_val.get(), oof_preds[val_idx])
+            print(f"Valid AUC: {score:.5f}")
 
             self.fold_models.append(LogRegFoldModel(
                 model=model,
@@ -115,10 +109,10 @@ class LogRegCVTrainer:
                 y_val=y_val,
                 fold=fold,
             ))
-            self.fold_scores.append(logloss)
+            self.fold_scores.append(score)
 
-        self.oof_score = log_loss(y.to_numpy(), oof_preds)
-        print("\n=== CV 結果 ===")
+        self.oof_score = roc_auc_score(self.y.get(), oof_preds)
+        print("\n=== CV Results ===")
         print(f"Fold scores: {self.fold_scores}")
         print(
             f"Mean: {np.mean(self.fold_scores):.5f}, "
@@ -130,53 +124,28 @@ class LogRegCVTrainer:
 
         return oof_preds, test_preds
 
-    def get_best_fold(self):
-        """
-        最もスコアの高かったfoldのインデックスを返す。
-
-        Returns
-        -------
-        best_index: int
-            ベストスコアのfoldのインデックス。
-        """
-        best_index = int(np.argmax(self.fold_scores))
-        return best_index
-
-    def fit_one_fold(self, tr_df, fold=0):
+    def fit_one_fold(self, fold=0):
         """
         指定した1つのfoldのみを用いてモデルを学習する。
         主にOptunaによるハイパーパラメータ探索時に使用。
 
         Parameters
         ----------
-        tr_df : cudf.DataFrame
-            学習用データ。
         fold : int
             学習に使うfold番号。
+
+        Return
+        ------
+        score : float
+            Score
         """
-        tr_df = tr_df.copy()
-
-        if "weight" in tr_df.columns:
-            tr_df = tr_df.drop("weight", axis=1)
-
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"]
-
-        X_pd = X.to_pandas()
-        y_pd = y.to_pandas()
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
-
-        skf = StratifiedKFold(
-            n_splits=self.n_splits, shuffle=True
-        )
+        self.params = {**self.default_params, **self.params}
 
         start = time.time()
-        tr_idx, va_idx = list(skf.split(X_pd, y_pd))[fold]
+        tr_idx, va_idx = list(self.fold_indices)[fold]
 
-        X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
-        X_val, y_val = X.iloc[va_idx], y.iloc[va_idx]
+        X_tr, y_tr = self.X.iloc[tr_idx], self.y[tr_idx]
+        X_val, y_val = self.X.iloc[va_idx], self.y[va_idx]
 
         model = LogisticRegression(**self.params)
         model.fit(X_tr, y_tr)
@@ -184,20 +153,11 @@ class LogRegCVTrainer:
         end = time.time()
         print_duration(start, end)
 
-        preds = model.predict_proba(X_val)
-        pred_labels = model.predict(X_val)
-        logloss = log_loss(y_val.to_numpy(), preds.to_numpy())
-        acc = accuracy_score(y_val.to_numpy(), pred_labels.to_numpy())
-        print(f"Valid Log Loss: {logloss:.5f}")
-        print(f"Valid Accuracy: {acc:.5f}")
+        preds = model.predict_proba(X_val).to_numpy()[:, 1]
+        score = roc_auc_score(y_val.get(), preds)
+        print(f"Valid AUC: {score:.5f}")
 
-        self.fold_models.append(LogRegFoldModel(
-            model=model,
-            X_val=X_val,
-            y_val=y_val,
-            fold=fold,
-        ))
-        self.fold_scores.append(logloss)
+        return score
 
 
 class LogRegFoldModel:

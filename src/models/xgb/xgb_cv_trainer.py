@@ -17,18 +17,24 @@ class XGBCVTrainer:
 
     Attributes
     ----------
+    tr_df : pd.DataFrame
+        label付データ
+    test_df : pd.DataFrame, default None
+        labelなしデータ。CV学習とFull Trainはtest_df必須。
     params : dict
         XGBのパラメータ。
     n_splits : int, default 5
         StratifiedKFoldの分割数。
     early_stopping_rounds : int, default 100
         早期停止ラウンド数。
+    num_boost_round : int, default 20000
+        iterationの最大値。
     seed : int, default 42
         乱数シード。
     """
 
     def __init__(self, tr_df, test_df=None, params=None, n_splits=5,
-                 early_stopping_rounds=100, num_boost_round=20000, seed=42):
+                 early_stopping_rounds=200, num_boost_round=20000, seed=42):
         self.params = params
         self.n_splits = n_splits
         self.early_stopping_rounds = early_stopping_rounds
@@ -56,10 +62,10 @@ class XGBCVTrainer:
         # test
         if test_df is not None:
             test_df[cat_cols] = test_df[cat_cols].astype("category")
-            self.dtest = xgb.DMatrix(
+            self.test = xgb.DMatrix(
                 test_df, enable_categorical=True)
         else:
-            self.dtest = None
+            self.test = None
 
         # fold indices
         skf = StratifiedKFold(
@@ -99,12 +105,12 @@ class XGBCVTrainer:
         test_preds : ndarray
             test_dfに対する予測配列
         """
-        if self.dtest is None:
+        if self.test is None:
             raise ValueError("test_df not provided for XGBCVTrainer.")
 
         self.params = {**self.default_params, **(self.params or {})}
         oof_preds = np.zeros(len(self.X))
-        test_preds = np.zeros(self.test_dmat.num_row())
+        test_preds = np.zeros(self.test.num_row())
 
         iteration_list = []
 
@@ -141,7 +147,7 @@ class XGBCVTrainer:
 
             # oof
             oof_preds[val_idx] = model.predict(dvalid, iteration_range=(0, model.best_iteration+1))
-            test_preds += model.predict(self.dtest, iteration_range=(0, model.best_iteration+1))
+            test_preds += model.predict(self.test, iteration_range=(0, model.best_iteration+1))
 
             end = time.time()
             print_duration(start, end)
@@ -187,7 +193,7 @@ class XGBCVTrainer:
         level : str, default "l1"
             保存先のフォルダ名。
         """
-        if self.dtest is None:
+        if self.test is None:
             raise ValueError("test_df not provided for XGBCVTrainer.")
 
         self.params = {**self.default_params, **(self.params or {})}
@@ -208,7 +214,7 @@ class XGBCVTrainer:
         end = time.time()
         print_duration(start, end)
 
-        test_preds = model.predict(self.dtest)
+        test_preds = model.predict(self.test)
 
         path = f"../artifacts/preds/{level}/test_full_{ID}.npy"
         np.save(path, test_preds)
@@ -223,6 +229,11 @@ class XGBCVTrainer:
         ----------
         fold : int
             学習に使うfold番号。
+
+        Rerurn
+        ------
+        score : float
+            Score
         """
         self.params = {**self.default_params, **(self.params or {})}
         tr_idx, val_idx = self.fold_indices[fold]
@@ -256,7 +267,10 @@ class XGBCVTrainer:
         print(f"Train AUC: {train_score:.5f}")
         print(f"Valid AUC: {eval_score:.5f}")
 
-        self.fold_scores.append(eval_score)
+        self.fold_models.append(
+            XGBFoldModel(model, X_val, y_val, fold))
+
+        return eval_score
 
 
 class XGBFoldModel:
