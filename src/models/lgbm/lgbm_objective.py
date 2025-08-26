@@ -27,11 +27,6 @@ def create_objective(
     objective : function
         optunaで使用する目的関数。
     """
-    trainer = LGBMCVTrainer(
-        tr_df, n_splits=n_splits,
-        early_stopping_rounds=early_stopping_rounds
-    )
-
     def objective(trial):
         params = {
             "learning_rate": trial.suggest_float(
@@ -57,7 +52,10 @@ def create_objective(
         min_required_depth = int(math.log2(params["num_leaves"])) + 1
         params["max_depth"] = max(params["max_depth"], min_required_depth)
 
-        trainer.params = params
+        trainer = LGBMCVTrainer(
+            tr_df, params=params, n_splits=n_splits,
+            early_stopping_rounds=early_stopping_rounds
+        )
 
         score = trainer.fit_one_fold(fold=0)
 

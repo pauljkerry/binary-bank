@@ -89,6 +89,7 @@ class LGBMCVTrainer:
             "verbosity": -1,
             "random_state": self.seed
         }
+        self.params = {**self.default_params, **(self.params or {})}
 
     def fit(self):
         """
@@ -104,7 +105,6 @@ class LGBMCVTrainer:
         if self.test is None:
             raise ValueError("test_df not provided for LGBMCVTrainer.")
 
-        self.params = {**self.default_params, **(self.params or {})}
         oof_preds = np.zeros(len(self.X))
         test_preds = np.zeros(len(self.test))
 
@@ -196,8 +196,6 @@ class LGBMCVTrainer:
         if self.test is None:
             raise ValueError("test_df not provided for LGBMCVTrainer.")
 
-        self.params = {**self.default_params, **(self.params or {})}
-
         start = time.time()
 
         dtrain = lgb.Dataset(
@@ -238,7 +236,6 @@ class LGBMCVTrainer:
         eval_score : float
             Score
         """
-        self.params = {**self.default_params, **(self.params or {})}
         tr_idx, val_idx = self.fold_indices[fold]
         start = time.time()
 

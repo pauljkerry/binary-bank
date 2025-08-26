@@ -4,7 +4,7 @@ from src.utils.telegram import send_telegram_message
 
 def run_optuna_search(
     objective, n_trials=50, n_jobs=1,
-    direction="minimize", study_name="mlp_study", storage=None,
+    direction="minimize", study_name="study", storage=None,
     initial_params: dict = None, sampler=None
 ):
     """
@@ -20,11 +20,11 @@ def run_optuna_search(
         並列実行数。
     direction : str, default "minimize"
         Optunaの探索方向。
-    study_name : str or None, default "mlp_study"
+    study_name : str or None, default "study"
         StudyName。
     storage : str or None, default None
         保存先URL。
-    initial_params : dict or None, default None
+    initial_params : dict, list[dict] or None, default None
         初期の試行パラメータ。
     sampler : optuna.samplers.BaseSampler or None, default TPESampler
         使用するSampler。
@@ -43,7 +43,15 @@ def run_optuna_search(
     )
 
     if initial_params is not None:
-        study.enqueue_trial(initial_params)
+        if isinstance(initial_params, dict):
+            study.enqueue_trial(initial_params)
+        elif isinstance(initial_params, list):
+            for p in initial_params:
+                if not isinstance(p, dict):
+                    raise ValueError("initial_paramsの各要素はdictである必要があります。")
+                study.enqueue_trial(p)
+        else:
+            raise ValueError("initial_paramsはdictまたはlist[dict]である必要があります。")
 
     study.optimize(
         objective,

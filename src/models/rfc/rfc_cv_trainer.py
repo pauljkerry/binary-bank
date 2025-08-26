@@ -59,6 +59,7 @@ class RFCCVTrainer:
             "random_state": self.seed,
             "n_streams": 1
         }
+        self.params = {**self.default_params, **self.params}
 
     def fit(self):
         """
@@ -73,8 +74,6 @@ class RFCCVTrainer:
         """
         if self.test is None:
             raise ValueError("test_df not provided for RFCCVTrainer.")
-
-        self.params = {**self.default_params, **self.params}
 
         oof_preds = np.zeros(len(self.X))
         test_preds = np.zeros(len(self.test))
@@ -135,8 +134,6 @@ class RFCCVTrainer:
         score : float
             Score
         """
-        self.params = {**self.default_params, **(self.params or {})}
-
         start = time.time()
         tr_idx, va_idx = self.fold_indices[fold]
 

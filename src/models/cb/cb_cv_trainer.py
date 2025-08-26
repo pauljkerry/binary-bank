@@ -84,6 +84,7 @@ class CBCVTrainer:
             "allow_writing_files": False,
             "verbose": 100
         }
+        self.params = {**self.default_params, **(self.params or {})}
 
     def fit(self):
         """
@@ -96,10 +97,8 @@ class CBCVTrainer:
         test_preds : ndarray
             test_dfに対する予測配列
         """
-        if self.dtest is None:
+        if self.test is None:
             raise ValueError("test_df not provided for CBCVTrainer.")
-
-        self.params = {**self.default_params, **(self.params or {})}
 
         oof_preds = np.zeros(len(self.X))
         test_preds = np.zeros(len(self.test))
@@ -180,12 +179,11 @@ class CBCVTrainer:
         level : str, default "l1"
             保存先のフォルダ名。
         """
-        if self.dtest is None:
+        if self.test is None:
             raise ValueError("test_df not provided for CBCVTrainer.")
 
         iterations = iterations * self.n_splits/(self.n_splits-1)
         self.params["iterations"] = iterations
-        self.params = {**self.default_params, **(self.params or {})}
 
         train_pool = Pool(
             self.X, self.y, cat_features=self.cat_cols, weight=self.weights)
@@ -228,8 +226,6 @@ class CBCVTrainer:
         auc : float
             Score
         """
-        self.params = {**self.default_params, **(self.params or {})}
-
         tr_idx, val_idx = list(self.fold_indices)[fold]
         start = time.time()
 

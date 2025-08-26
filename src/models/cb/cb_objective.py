@@ -29,9 +29,6 @@ def create_objective(
     function
         Optunaで使用する目的関数。
     """
-    trainer = CBCVTrainer(
-        tr_df, n_splits=n_splits, early_stopping_rounds=early_stopping_rounds)
-
     def objective(trial):
         params = {
             "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.02),
@@ -56,8 +53,11 @@ def create_objective(
             "early_stopping_rounds": early_stopping_rounds,
         }
 
-        trainer.params = params
-        score = trainer.fit_one_fold(fold=0)
+        trainer = CBCVTrainer(
+            tr_df, params=params, n_splits=n_splits,
+            early_stopping_rounds=early_stopping_rounds)
+
+        score = trainer.fit_one_fold()
 
         return score
     return objective

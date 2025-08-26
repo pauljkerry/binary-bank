@@ -14,6 +14,10 @@ class RFRCVTrainer:
 
     Attributes
     ----------
+    tr_df : pd.DataFrame
+        label付データ
+    test_df : pd.DataFrame, default None
+        labelなしデータ。CV学習はtest_df必須。
     params : dict
         RFRのパラメータ。
     n_splits : int, default 5
@@ -22,7 +26,7 @@ class RFRCVTrainer:
         乱数シード。
     """
 
-    def __init__(self, params=None, n_splits=5, seed=42):
+    def __init__(self, tr_df, test_df=None, params=None, n_splits=5, seed=42):
         self.params = params or {}
         self.n_splits = n_splits
         self.fold_models = []
@@ -30,34 +34,38 @@ class RFRCVTrainer:
         self.seed = seed
         self.oof_score = None
 
-    def get_default_params(self):
-        """
-        RFR用のデフォルトパラメータを返す。
+        if "weight" in tr_df.columns:
+            tr_df = tr_df.drop("weight", axis=1)
 
-        Returns
-        -------
-        default_params : dict
-            デフォルトパラメータの辞書。
-        """
-        default_params = {
+        self.X = tr_df.drop("target", axis=1)
+        self.y = tr_df["target"].to_cupy()
+
+        # test
+        if test_df is not None:
+            self.test = test_df
+        else:
+            self.test = None
+
+        # fold indices
+        skf = KFold(
+            n_splits=n_splits, shuffle=True, random_state=seed
+        )
+        self.fold_indices = list(
+            skf.split(self.X.to_pandas()))
+
+        self.default_params = {
             "n_estimators": 100,
             "max_depth": 16,
             "bootstrap": True,
             "random_state": self.seed,
             "n_streams": 1
         }
-        return default_params
 
-    def fit(self, tr_df, test_df):
+        self.params = {**self.default_params, **self.params}
+
+    def fit(self):
         """
         CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
-
-        Parameters
-        ----------
-        tr_df : cudf.DataFrame
-            学習用データ。
-        test_df : cudf.DataFrame
-            テスト用データ。
 
         Returns
         -------
@@ -66,38 +74,23 @@ class RFRCVTrainer:
         test_preds : ndarray
             test_dfに対する予測配列
         """
-        tr_df = tr_df.copy()
-        test_df = test_df.copy()
+        if self.test is None:
+            raise ValueError("test_df not provided for RFCCVTrainer.")
 
-        if "weight" in tr_df.columns:
-            tr_df = tr_df.drop("weight", axis=1)
+        oof_preds = np.zeros(len(self.X))
+        test_preds = np.zeros(len(self.test))
 
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"]
-
-        X_pd = X.to_pandas()
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
-
-        oof_preds = np.zeros(len(X))
-        test_preds = np.zeros(len(test_df))
-
-        skf = KFold(
-            n_splits=self.n_splits, shuffle=True
-        )
-
-        for fold, (tr_idx, val_idx) in enumerate(skf.split(X_pd)):
+        for fold, (tr_idx, val_idx) in enumerate(self.fold_indices):
             print(f"\nFold {fold + 1}")
             start = time.time()
-            X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
-            X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+            X_tr, y_tr = self.X.iloc[tr_idx], self.y[tr_idx]
+            X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
 
             model = RandomForestRegressor(**self.params)
             model.fit(X_tr, y_tr)
 
             oof_preds[val_idx] = model.predict(X_val).to_numpy()
-            test_preds += model.predict(test_df).to_numpy()
+            test_preds += model.predict(self.test).to_numpy()
 
             end = time.time()
             print_duration(start, end)
@@ -115,66 +108,40 @@ class RFRCVTrainer:
             ))
             self.fold_scores.append(score)
 
-        print("\n=== CV 結果 ===")
+        print("\n=== CV Results ===")
         print(f"Fold scores: {self.fold_scores}")
         print(
             f"Mean: {np.mean(self.fold_scores):.5f}, "
             f"Std: {np.std(self.fold_scores):.5f}"
         )
 
-        self.oof_score = np.sqrt(mse(y.to_numpy(), oof_preds))
+        self.oof_score = np.sqrt(mse(self.y.get(), oof_preds))
         print(f"OOF score: {self.oof_score:.5f}")
 
         test_preds /= self.n_splits
 
         return oof_preds, test_preds
 
-    def get_best_fold(self):
-        """
-        最もスコアの高かったfoldのインデックスを返す。
-
-        Returns
-        -------
-        best_index: int
-            ベストスコアのfoldのインデックス。
-        """
-        best_index = int(np.argmax(self.fold_scores))
-        return best_index
-
-    def fit_one_fold(self, tr_df, fold=0):
+    def fit_one_fold(self, fold=0):
         """
         指定した1つのfoldのみを用いてモデルを学習する。
         主にOptunaによるハイパーパラメータ探索時に使用。
 
         Parameters
         ----------
-        tr_df : cudf.DataFrame
-            学習用データ。
         fold : int
             学習に使うfold番号。
+
+        Rerurn
+        ------
+        rmse : float
+            Score
         """
-        tr_df = tr_df.copy()
-
-        if "weight" in tr_df.columns:
-            tr_df = tr_df.drop("weight", axis=1)
-
-        X = tr_df.drop("target", axis=1)
-        y = tr_df["target"]
-
-        X_pd = X.to_pandas()
-
-        default_params = self.get_default_params()
-        self.params = {**default_params, **self.params}
-
-        skf = KFold(
-            n_splits=self.n_splits, shuffle=True
-        )
-
         start = time.time()
-        tr_idx, va_idx = list(skf.split(X_pd))[fold]
+        tr_idx, va_idx = self.fold_indices[fold]
 
-        X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
-        X_val, y_val = X.iloc[va_idx], y.iloc[va_idx]
+        X_tr, y_tr = self.X.iloc[tr_idx], self.y[tr_idx]
+        X_val, y_val = self.X.iloc[va_idx], self.y[va_idx]
 
         model = RandomForestRegressor(**self.params)
         model.fit(X_tr, y_tr)
@@ -183,19 +150,13 @@ class RFRCVTrainer:
         print_duration(start, end)
 
         preds = model.predict(X_val)
-        rmse = np.sqrt(mse(y_val.to_numpy(), preds.to_numpy()))
-        r2 = r2_score(y_val.to_numpy(), preds.to_numpy())
+        rmse = np.sqrt(mse(y_val.get(), preds.to_numpy()))
+        r2 = r2_score(y_val.get(), preds.to_numpy())
 
         print(f"Valid RMSE: {rmse:.5f}")
         print(f"Valid R^2: {r2:.5f}")
 
-        self.fold_models.append(RFRFoldModel(
-            model=model,
-            X_val=X_val,
-            y_val=y_val,
-            fold=fold,
-        ))
-        self.fold_scores.append(rmse)
+        return rmse
 
 
 class RFRFoldModel:

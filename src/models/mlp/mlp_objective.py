@@ -33,7 +33,7 @@ def create_objective(
         Optunaで使用する目的関数。
     """
     def objective(trial):
-        num_layers = trial.suggest_int("num_layers", 4, 4)
+        num_layers = trial.suggest_int("num_layers", 1, 4)
 
         hidden_dim1 = trial.suggest_int("hidden_dim1", 256, 1024, step=32)
         hidden_dim2 = trial.suggest_int(
@@ -63,7 +63,7 @@ def create_objective(
             "lr": trial.suggest_float("lr", 1e-3, 1e-1, log=True),
             "lr_min": trial.suggest_float("lr_min", 1e-4, 1e-3, log=True),
             "dropout_rate": round(trial.suggest_float(
-                "dropout_rate", 0.1, 0.4, step=0.05), 2),
+                "dropout_rate", 0.1, 0.6, step=0.05), 2),
             "activation": trial.suggest_categorical("activation", [
                 "ReLU",
                 "LeakyReLU",

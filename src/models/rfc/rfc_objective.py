@@ -17,15 +17,13 @@ def create_objective(tr_df, n_splits=5):
     objective : function
         optunaで使用する目的関数。
     """
-    trainer = RFCCVTrainer(tr_df, n_splits=n_splits)
-
     def objective(trial):
         params = {
             "n_estimators": trial.suggest_int("n_estimators", 50, 150),
             "max_depth": trial.suggest_int("max_depth", 4, 100)
         }
 
-        trainer.params = params
+        trainer = RFCCVTrainer(tr_df, params=params, n_splits=n_splits)
         score = trainer.fit_one_fold(fold=0)
 
         return score

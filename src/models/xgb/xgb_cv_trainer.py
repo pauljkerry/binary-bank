@@ -93,6 +93,7 @@ class XGBCVTrainer:
             "single_precision_histogram": True,
             "predictor": "gpu_predictor"
         }
+        self.params = {**self.default_params, **(self.params or {})}
 
     def fit(self):
         """
@@ -108,7 +109,6 @@ class XGBCVTrainer:
         if self.test is None:
             raise ValueError("test_df not provided for XGBCVTrainer.")
 
-        self.params = {**self.default_params, **(self.params or {})}
         oof_preds = np.zeros(len(self.X))
         test_preds = np.zeros(self.test.num_row())
 
@@ -196,7 +196,6 @@ class XGBCVTrainer:
         if self.test is None:
             raise ValueError("test_df not provided for XGBCVTrainer.")
 
-        self.params = {**self.default_params, **(self.params or {})}
         dtrain = xgb.DMatrix(
             self.X, label=self.y,
             weight=self.weights, enable_categorical=True
@@ -235,7 +234,6 @@ class XGBCVTrainer:
         score : float
             Score
         """
-        self.params = {**self.default_params, **(self.params or {})}
         tr_idx, val_idx = self.fold_indices[fold]
         start = time.time()
 

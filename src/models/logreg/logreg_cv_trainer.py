@@ -65,6 +65,7 @@ class LogRegCVTrainer:
             "max_iter": self.max_iter,
             "class_weight": None
         }
+        self.params = {**self.default_params, **self.params}
 
     def fit(self):
         """
@@ -79,8 +80,6 @@ class LogRegCVTrainer:
         """
         if self.test is None:
             raise ValueError("test_df not provided for LogRegCVTrainer.")
-
-        self.params = {**self.default_params, **self.params}
 
         oof_preds = np.zeros(len(self.X))
         test_preds = np.zeros(len(self.test))

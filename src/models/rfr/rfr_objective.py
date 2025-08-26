@@ -23,12 +23,9 @@ def create_objective(tr_df, n_splits=5):
             "max_depth": trial.suggest_int("max_depth", 4, 20)
         }
 
-        trainer = RFRCVTrainer(
-            params=params,
-            n_splits=n_splits
-        )
+        trainer = RFRCVTrainer(tr_df, params=params, n_splits=n_splits)
 
-        trainer.fit_one_fold(tr_df, fold=0)
+        score = trainer.fit_one_fold(fold=0)
 
-        return trainer.fold_scores[0]
+        return score
     return objective
