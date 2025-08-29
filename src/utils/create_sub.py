@@ -1,4 +1,3 @@
-import numpy as np
 import pandas as pd
 
 
@@ -13,9 +12,8 @@ def create_sub(preds, ID):
     ID : str
         ファイルの識別子
     """
-    sub_df = pd.DataFrame({
-        "id": np.arange(750000, 750000 + len(preds)),
-        "Personality": preds
-    })
+    sub_df = pd.read_csv("../input/sample_submission.csv")
+    sub_df.iloc[:, 1] = preds
+
     sub_df.to_csv(f"../output/submission_{ID}.csv", index=False)
     print("Saved submission file successfully!")

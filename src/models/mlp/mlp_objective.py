@@ -4,9 +4,9 @@ from src.models.mlp.mlp_cv_trainer import MLPCVTrainer
 def create_objective(
     tr_df,
     n_splits=5,
-    max_epochs=100,
-    early_stopping_rounds=20,
-    min_epochs=30,
+    max_epochs=30,
+    early_stopping_rounds=5,
+    min_epochs=10,
     use_gpu=True,
 ):
     """
@@ -22,7 +22,7 @@ def create_objective(
         エポック数。
     early_stopping_rounds : int, default 20
         早期停止ラウンド数。
-    min_epochs : int, default 50
+    min_epochs : int, default 10
         最低限学習するエポック数
     use_gpu : bool, default True
         Trueの場合はGPUが使用可能であれば使用する。
@@ -36,22 +36,30 @@ def create_objective(
         num_layers = trial.suggest_int("num_layers", 1, 4)
 
         hidden_dim1 = trial.suggest_int("hidden_dim1", 256, 1024, step=32)
-        hidden_dim2 = trial.suggest_int(
-            "hidden_dim2", 128, hidden_dim1, step=32)
-        hidden_dim3 = trial.suggest_int(
-            "hidden_dim3", 64, hidden_dim2, step=32
-        ) if num_layers >= 3 else None
-        hidden_dim4 = trial.suggest_int(
-            "hidden_dim4", 32, hidden_dim3, step=32
-        ) if num_layers >= 4 else None
 
-        hidden_dims = [hidden_dim1, hidden_dim2]
+        if num_layers >= 2:
+            hidden_dim2 = trial.suggest_int("hidden_dim2", 128, hidden_dim1, step=32)
+        else:
+            hidden_dim2 = -1
+            trial.suggest_int("hidden_dim2", -1, -1)
+
         if num_layers >= 3:
-            hidden_dims.append(hidden_dim3)
+            hidden_dim3 = trial.suggest_int("hidden_dim3", 64, hidden_dim2, step=32)
+        else:
+            hidden_dim3 = -1
+            trial.suggest_int("hidden_dim3", -1, -1)
+
         if num_layers >= 4:
-            hidden_dims.append(hidden_dim4)
+            hidden_dim4 = trial.suggest_int("hidden_dim4", 32, hidden_dim3, step=32)
+        else:
+            hidden_dim4 = -1
+            trial.suggest_int("hidden_dim4", -1, -1)
 
         params = {
+            "hidden_dim1": hidden_dim1,
+            "hidden_dim2": hidden_dim2,
+            "hidden_dim3": hidden_dim3,
+            "hidden_dim4": hidden_dim4,
             "n_splits": n_splits,
             "max_epochs": max_epochs,
             "early_stopping_rounds": early_stopping_rounds,
@@ -73,7 +81,6 @@ def create_objective(
                 # "ELU",
                 # "Sigmoid"
             ]),
-            "hidden_dims": hidden_dims,
         }
         trainer = MLPCVTrainer(tr_df, params=params, n_splits=n_splits)
         score = trainer.fit_one_fold(fold=0)

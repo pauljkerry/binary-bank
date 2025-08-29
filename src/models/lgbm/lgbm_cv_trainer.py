@@ -68,7 +68,7 @@ class LGBMCVTrainer:
 
         # fold indices
         skf = StratifiedKFold(
-            n_splits=n_splits, shuffle=True, random_state=seed
+            n_splits=n_splits, shuffle=True, random_state=self.seed
         )
         self.fold_indices = list(skf.split(self.X, self.y))
 

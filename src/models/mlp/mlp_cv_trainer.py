@@ -94,48 +94,31 @@ class MLPCVTrainer:
     """
     MLPを使ったCVトレーナー。
 
-    Parameters
+    Attributes
     ----------
+    tr_df : pd.DataFrame
+        学習用データ
+    test_df : pd.DataFrame, default None
+        ラベルなしデータ
+    params : dict, default None
+        Parameters
     n_splits : int, default 5
-        StratifiedKFoldの分割数。
+        KFoldの分割数
     seed : int, default 42
-        乱数シード。
-    epochs : int, default 100
-        エポック数。
-    early_stopping_rounds : int, default 20
-        早期停止ラウンド数
-    batch_size : int, default 256
-        バッチサイズ。
-    lr : float, default 1e-3
-        learning rate。
-    use_gpu : bool, default True
-        Trueの場合はGPUが使用可能であれば使用する。
-    hidden_dims : list of int, default [128, 64]
-        各隠れ層のユニット数。
-    dropout_rate : float, default 0.2
-        各層に適用するドロップアウト率。
-    activation : str, default "ReLU"
-        活性化関数のクラス
-    log_interval : int, default 1
-        scoreのログの表示頻度
-    t_max : int, default 50
-        CosineAnnealingLRにおける最大エポック数
-    eta_min : float, default 1e-6
-        CosineAnnealingLRにおける最小学習率
-    min_epochs : int, default 50
-        最低限学習するエポック数
-
-    Other Parameters
-    ----------------
-    hidden_dim1 : int, optional
-    hidden_dim2 : int, optional
-    hidden_dim3 : int, optional
-        各隠れ層のユニット数。"hidden_dims"を指定しない場合に有効。
+        乱数シード
     """
 
-    def __init__(self, tr_df, test_df=None, params=None, n_splits=5):
+    def __init__(
+        self,
+        tr_df,
+        test_df=None,
+        params=None,
+        n_splits=5,
+        seed=42
+    ):
         self.params = params or {}
         self.n_splits = n_splits
+        self.seed = seed
         self.fold_models = []
         self.fold_scores = []
         self.oof_score = None
@@ -149,13 +132,12 @@ class MLPCVTrainer:
             "hidden_dim3": None,
             "hidden_dim4": None,
             "max_epochs": 100,
-            "min_epochs": 50,
+            "min_epochs": 30,
             "activation": "ReLU",
-            "early_stopping_rounds": 20,
+            "early_stopping_rounds": 10,
             "t_max": 50,
             "eta_min": 1e-6,
             "log_interval": 1,
-            "seed": 42,
             "device": "cuda"
         }
 
@@ -175,8 +157,11 @@ class MLPCVTrainer:
 
         hidden_dims = []
         i = 1
-        while self.params.get(f"hidden_dim{i}") is not None:
-            hidden_dims.append(self.params[f"hidden_dim{i}"])
+        while f"hidden_dim{i}" in self.params:
+            dim = self.params[f"hidden_dim{i}"]
+            if dim is None or dim == -1:
+                break
+            hidden_dims.append(dim)
             i += 1
 
         self.params["hidden_dims"] = hidden_dims
@@ -205,9 +190,11 @@ class MLPCVTrainer:
             self.test = None
 
         skf = StratifiedKFold(
-            n_splits=n_splits, shuffle=True, random_state=self.params["seed"]
+            n_splits=n_splits, shuffle=True, random_state=self.seed
         )
         self.fold_indices = list(skf.split(self.X, self.y))
+
+        torch.cuda.manual_seed(self.seed)
 
     def fit(self):
         """

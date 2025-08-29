@@ -3,16 +3,21 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 
 
-def create_meta_features(ID_list, level, fe_version=None, scale=False):
+def create_meta_features(
+    oof_list: list[str],
+    test_list: list[str],
+    fe_version=None,
+    scale=False
+):
     """
     stackingのためのメタ特徴量を作成する
 
     Parameters
     ----------
-    ID_list : list
-        使用する予測値のID
-    level : str
-        predsの階層, "base", "l1" or "l2"
+    oof_list : list[np.ndarray]
+        oofを格納したリスト
+    test_list : list[np.ndarray]
+        test predsを格納したリスト
     fe_version : str, default None
         特徴量エンジニアリングのversion名
     scale : bool, default False
@@ -29,42 +34,20 @@ def create_meta_features(ID_list, level, fe_version=None, scale=False):
     -----
     - scale=Trueにすると予測値部分にStandardScalerを適用
     """
-    # 予測値の読み込みと結合
-    tr_list = []
-    test_list = []
-
-    for ID in ID_list:
-        array_tr = np.load(f"../artifacts/preds/{level}/oof_single_{ID}.npy")
-        array_test = np.load(f"../artifacts/preds/{level}/test_single_{ID}.npy")
-
-        if array_tr.ndim == 1:
-            pass
-        elif array_tr.shape[1] == 2:
-            array_tr = array_tr[:, 1]
-            array_test = array_test[:, 1]
-
-        if array_tr.ndim == 1:
-            columns = [f"pred_{ID}"]
-        else:
-            n_classes = array_tr.shape[1]
-            columns = [f"pred_{ID}_{i}" for i in range(n_classes)]
-
-        tr_list.append(pd.DataFrame(array_tr, columns=columns))
-        test_list.append(pd.DataFrame(array_test, columns=columns))
-
-    tr_pred_df = pd.concat(tr_list, axis=1)
-    test_pred_df = pd.concat(test_list, axis=1)
+    columns = [f"model_{i}" for i in range(len(oof_list))]
+    oof_df = pd.DataFrame(np.array(oof_list).T, columns=columns)
+    test_df = pd.DataFrame(np.array(test_list).T, columns=columns)
 
     # スケーリング（予測値のみ）
     if scale:
         scaler = StandardScaler()
-        tr_pred_df = pd.DataFrame(
-            scaler.fit_transform(tr_pred_df),
-            columns=tr_pred_df.columns
+        oof_df = pd.DataFrame(
+            scaler.fit_transform(oof_df),
+            columns=columns
         )
-        test_pred_df = pd.DataFrame(
-            scaler.transform(test_pred_df),
-            columns=test_pred_df.columns
+        test_df = pd.DataFrame(
+            scaler.transform(test_df),
+            columns=columns
         )
 
     # 特徴量エンジニアリングの追加
@@ -75,14 +58,14 @@ def create_meta_features(ID_list, level, fe_version=None, scale=False):
         test_fe = pd.read_parquet(
             f"../artifacts/features/base/test_df{fe_version}.parquet"
         )
-        tr_df = pd.concat([tr_fe, tr_pred_df], axis=1)
-        test_df = pd.concat([test_fe, test_pred_df], axis=1)
+        tr_df = pd.concat([tr_fe, oof_df], axis=1)
+        test_df = pd.concat([test_fe, test_df], axis=1)
     else:
-        tr_df = tr_pred_df
-        test_df = test_pred_df
+        tr_df = oof_df
+        test_df = test_df
 
     # targetの追加
-    train_data = pd.read_parquet("../artifacts/prepro/train_data3.parquet")
-    tr_df["target"] = train_data["target"]
+    y = np.load("../artifacts/y_true.npy")
+    tr_df["target"] = y
 
     return tr_df, test_df

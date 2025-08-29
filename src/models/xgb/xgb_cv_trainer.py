@@ -69,7 +69,7 @@ class XGBCVTrainer:
 
         # fold indices
         skf = StratifiedKFold(
-            n_splits=n_splits, shuffle=True, random_state=seed
+            n_splits=n_splits, shuffle=True, random_state=self.seed
         )
         self.fold_indices = list(skf.split(self.X, self.y))
 
@@ -180,18 +180,19 @@ class XGBCVTrainer:
 
         return oof_preds, test_preds
 
-    def full_train(self, tr_df, test_df, iterations, ID, level="l1"):
+    def full_train(self, iterations):
         """
-        訓練データ全体でモデルを学習し、test_dfに対する予測結果をnpy形式で保存する。
+        訓練データ全体でモデルを学習し、test_dfに対する予測結果をnpy形式で返す
 
         Parameters
         ----------
         iterations : int
             学習の繰り返し回数。
-        ID : str
-            保存ファイル名に付加する識別子。
-        level : str, default "l1"
-            保存先のフォルダ名。
+
+        Returns
+        -------
+        test_prads : np.ndarray
+            test dataの予測値
         """
         if self.test is None:
             raise ValueError("test_df not provided for XGBCVTrainer.")
@@ -215,9 +216,7 @@ class XGBCVTrainer:
 
         test_preds = model.predict(self.test)
 
-        path = f"../artifacts/preds/{level}/test_full_{ID}.npy"
-        np.save(path, test_preds)
-        print(f"Successfully saved test predictions to {path}")
+        return test_preds
 
     def fit_one_fold(self, fold=0):
         """

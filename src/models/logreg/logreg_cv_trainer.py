@@ -1,5 +1,7 @@
 from cuml.linear_model import LogisticRegression
 import numpy as np
+import cudf
+import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 import joblib
@@ -42,18 +44,24 @@ class LogRegCVTrainer:
         if "weight" in tr_df.columns:
             tr_df = tr_df.drop("weight", axis=1)
 
+        if isinstance(tr_df, pd.DataFrame):
+            tr_df = cudf.DataFrame.from_pandas(tr_df)
+
         self.X = tr_df.drop("target", axis=1)
         self.y = tr_df["target"].to_cupy()
 
         # test
         if test_df is not None:
-            self.test = test_df
+            if isinstance(test_df, pd.DataFrame):
+                self.test = cudf.DataFrame.from_pandas(test_df)
+            else:
+                self.test = test_df
         else:
             self.test = None
 
         # fold indices
         skf = StratifiedKFold(
-            n_splits=n_splits, shuffle=True, random_state=seed
+            n_splits=n_splits, shuffle=True, random_state=self.seed
         )
         self.fold_indices = list(
             skf.split(self.X.to_pandas(), self.y.get()))
