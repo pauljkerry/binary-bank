@@ -35,7 +35,7 @@ def seed_ens(
         seed ensembleを行うseedのリスト
     full : bool, default False
         Trueの場合、full trainを行う
-    iterations : list[int], default None
+    iterations : int, default None
         full trainで学習するiteration数
     """
     if full:
@@ -50,15 +50,19 @@ def seed_ens(
     else:
         level = "base"
 
+    if iterations is None:
+        iterations = list(range(len(seed_list)))
+
     y_true = np.load("../artifacts/y_true.npy")
     all_oof = []
     all_test_preds = []
     score_history = []
 
-    seed_linked = "".join(str(seed) for seed in seed_list)
+    seed_linked = "-".join(str(seed) for seed in seed_list)
 
     for i, seed in enumerate(seed_list):
-        oof, test_preds = create_oof(
+        print(f"\n=== SEED {seed} ===")
+        oof_list, test_list = create_oof(
             tr_df,
             test_df,
             study_name,
@@ -66,18 +70,18 @@ def seed_ens(
             ID_list=[ID],
             seed=seed,
             full=full,
-            iterations_list=list(iterations),
+            iterations_list=[iterations] if full else None,
         )
-        all_oof.append(oof)
-        all_test_preds.append(test_preds)
+        all_test_preds.append(test_list[0])
 
         if not full:
+            all_oof.append(oof_list[0])
             oof_array = np.array(all_oof)
             mean_oof = np.mean(oof_array, axis=0)
             tmp_score = roc_auc_score(y_true, mean_oof)
             score_history.append(tmp_score)
 
-            print(f"Tmp Score with {i}OOF: {tmp_score:.5f}")
+            print(f"Tmp Score with {i+1} OOF: {tmp_score:.5f}")
 
     # test predsの平均化oofの保存
     mean_test = np.mean(np.array(all_test_preds), axis=0)
@@ -103,5 +107,7 @@ def seed_ens(
         plt.gca().yaxis.set_major_formatter(plt.FormatStrFormatter('%.5f'))
 
         plt.show()
+
+    te.send_telegram_message("SEED ENSEMBLE COMPLETE!")
 
     return all_oof, all_test_preds

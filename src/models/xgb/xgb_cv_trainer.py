@@ -2,6 +2,7 @@ import xgboost as xgb
 import numpy as np
 import pandas as pd
 import shap
+import wandb
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
@@ -252,7 +253,8 @@ class XGBCVTrainer:
             evals=[(dtrain, "train"), (dvalid, "eval")],
             early_stopping_rounds=self.early_stopping_rounds,
             verbose_eval=100,
-            evals_result=evals_result
+            evals_result=evals_result,
+            callbacks=[wandb.xgboost.WandbCallback()]
         )
 
         end = time.time()

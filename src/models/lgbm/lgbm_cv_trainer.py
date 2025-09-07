@@ -180,7 +180,7 @@ class LGBMCVTrainer:
 
         return oof_preds, test_preds
 
-    def full_train(self, iterations, ID, level="l1"):
+    def full_train(self, iterations):
         """
         訓練データ全体でモデルを学習し、test_dfに対する予測結果をnpy形式で保存する。
 
@@ -188,10 +188,11 @@ class LGBMCVTrainer:
         ----------
         iterations : int
             学習の繰り返し回数。
-        ID : str
-            保存ファイル名に付加する識別子。
-        level : str, default "l1"
-            保存先のフォルダ名。
+
+        Returns
+        -------
+        test_preds : np.ndarray
+            test dataの予測値
         """
         if self.test is None:
             raise ValueError("test_df not provided for LGBMCVTrainer.")
@@ -217,9 +218,7 @@ class LGBMCVTrainer:
         # test_dfの予測値
         test_preds = model.predict(self.test)
 
-        path = f"../artifacts/preds/{level}/test_full_{ID}.npy"
-        np.save(path, test_preds)
-        print(f"Successfully saved test predictions to {path}")
+        return test_preds
 
     def fit_one_fold(self, fold=0):
         """

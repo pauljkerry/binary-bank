@@ -2,6 +2,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
+import gc
 from src.utils.get_trainer import get_trainer
 import src.utils.telegram as te
 
@@ -96,6 +97,9 @@ def create_oof(
                 preds_path, f"test_full_{ID}_seed{seed}.npy")
 
             np.save(test_path, test_preds)
+
+            del trainer
+            gc.collect()
             continue
 
         oof, test_preds = trainer.fit()
@@ -111,6 +115,11 @@ def create_oof(
         np.save(oof_path, oof)
         np.save(test_path, test_preds)
 
-    te.send_telegram_message(f"{model.upper()} Training Complete!")
+        del trainer
+        gc.collect()
+
+    message = (f"{model.upper()} Training Complete!\n"
+               f"ID: {ID_list}, Seed: {seed}")
+    te.send_telegram_message(message)
 
     return all_oof, all_test_preds

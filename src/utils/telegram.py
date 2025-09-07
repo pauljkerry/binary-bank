@@ -21,8 +21,10 @@ def send_telegram_message(message):
     """
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     data = {"chat_id": CHAT_ID, "text": message}
-    response = requests.post(url, data=data)
-    if response.ok:
+
+    try:
+        response = requests.post(url, data=data, timeout=10)
+        response.raise_for_status()
         print("✅ Message sent successfully.")
-    else:
-        print("❌ Failed to send message:", response.text)
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Failed to send message: {e}")

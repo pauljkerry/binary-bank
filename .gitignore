@@ -10,3 +10,5 @@ todo.txt
 *.pyc
 *.log
 .virtual_documents/
+notebooks/wandb/
+notebooks/fe/AutogluonModels/

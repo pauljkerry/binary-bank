@@ -1,11 +1,14 @@
 from src.models.xgb.xgb_cv_trainer import XGBCVTrainer
+import wandb
 
 
 def create_objective(
     tr_df,
     n_splits=5,
     early_stopping_rounds=200,
-    n_jobs=1
+    n_jobs=1,
+    wandb_project="project",
+    study_name="study-xgb"
 ):
     """
     Optunaの目的関数（objective）を生成する関数。
@@ -29,7 +32,7 @@ def create_objective(
     def objective(trial):
         params = {
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.03),
-            "max_depth": trial.suggest_int("max_depth", 3, 15),
+            "max_depth": trial.suggest_int("max_depth", 3, 8),
             "min_child_weight": trial.suggest_float(
                 "min_child_weight", 0, 100),
             "colsample_bytree": trial.suggest_float(
@@ -43,6 +46,14 @@ def create_objective(
             "n_jobs": n_jobs
         }
 
+        wandb.init(
+            project=wandb_project,
+            group=study_name,
+            name=f"trial-{trial.number}",
+            reinit=True
+        )
+        wandb.config.update(params)
+
         trainer = XGBCVTrainer(
             tr_df, n_splits=n_splits,
             params=params,
@@ -50,6 +61,9 @@ def create_objective(
         )
 
         score = trainer.fit_one_fold(fold=0)
+
+        wandb.log({str(score): score})
+        wandb.finish()
 
         return score
     return objective

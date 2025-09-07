@@ -68,7 +68,7 @@ class OptunaVisualizer:
         print(f"=== Top {top_k} Trials ===")
 
         for t in sorted_trials[:top_k]:
-            print(f"=== Trial {t.number} ===")
+            print(f"\n=== Trial {t.number} ===")
             print(f"CV Score       : {t.value:.5f}")
 
             # params の値を文字列に変換（文字列はクォート付き）
