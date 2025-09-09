@@ -45,7 +45,7 @@ def target_encoding(
     te_test_dict = {f"{col}_te": np.zeros(test_df.height) for col in cat_cols}
 
     for fold_idx, (tr_idx, val_idx) in enumerate(
-        tqdm(skf.split(tr_df.to_pandas(), y))
+        tqdm(skf.split(tr_df.to_numpy(), y))
     ):
         val_pl = tr_df[val_idx]
         train_pl = tr_df[tr_idx]
