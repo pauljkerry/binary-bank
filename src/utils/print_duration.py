@@ -1,4 +1,4 @@
-def print_duration(start, end, label="Training time"):
+def print_duration(start, end, label="Training Time"):
     """
     経過時間を出力する関数。
 

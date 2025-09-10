@@ -1,9 +1,11 @@
 import glob
+import gc
 import os
-import time
+from time import perf_counter as now
 from pathlib import Path
 
 import cudf
+import cupy as cp
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,41 +21,96 @@ import xgboost as xgb
 from sklearn.metrics import roc_auc_score
 
 from src.utils.get_cat_cols import get_cat_cols
-from src.utils.make_fold_paths import make_fold_paths
 from src.utils.print_duration import print_duration
+
+try:
+    import cudf
+    _HAS_CUDF = True
+except Exception:
+    _HAS_CUDF = False
 
 
 class ParquetIter(xgb.core.DataIter):
-    """
-    ディスク上の Parquet をバッチで読み出し、XGBoost に逐次供給するための DataIter。
-    - path は str でも list[str] でもOK
-    - features: 学習に使う特徴量カラム名リスト
-    - target: 目的変数カラム名
-    - batch_rows: 1バッチの行数上限（大きすぎるとGPU/CPUメモリに乗らないことがある）
-    - use_cudf: True なら cuDF データフレームで渡す（GPU学習時に有利）
-    """
-
-    def __init__(self, path, features, target, cat_cols=None, batch_rows=1_000_000, use_cudf=None):
+    def __init__(
+        self,
+        paths,
+        features=None,
+        target="target",
+        cat_cols=None,
+        fold_col=None,
+        include_folds=None,
+        exclude_folds=None,
+        weight_col=None,
+        batch_rows=1_000_000,
+        use_cudf=None,
+        extra_exclude_cols=None,
+        predict_mode=False,      # ← 追加: 推論モード（test 用）
+        keep_row_ids=True,       # ← 追加: row_id を回収して後で取り出す
+    ):
         super().__init__()
-        if isinstance(path, (str, os.PathLike)):
-            path = [str(path)]
-        self.paths = list(path)
-        self.features = features
-        self.cat_cols = cat_cols if cat_cols else []
+        self._temporary_data = None 
+        if isinstance(paths, (str, os.PathLike)):
+            paths = [str(paths)]
+        self.paths = [str(p) for p in paths]
         self.target = target
+        self.weight_col = weight_col
+        self.fold_col = fold_col
+        self.include_folds = None if include_folds is None else set(include_folds)
+        self.exclude_folds = None if exclude_folds is None else set(exclude_folds)
         self.batch_rows = int(batch_rows)
-        self.use_cudf = use_cudf
+        self.cat_cols = list(cat_cols or [])
+
+        self.use_cudf = _HAS_CUDF if use_cudf is None else bool(use_cudf)
+
+        self.predict_mode = bool(predict_mode)
+        self.keep_row_ids = bool(keep_row_ids)
+        self._row_id_chunks = []
+        self._pass_count = 0
+
+        # --- スキーマから特徴量列を自動決定（features=Noneのとき） ---
+        schema = ds.dataset(self.paths, format="parquet").schema
+        all_cols = [f.name for f in schema]
+
+        if features is None:
+            meta = {"row_id"}
+            if (not self.predict_mode) and (self.target in all_cols):
+                meta.add(self.target)
+            if (not self.predict_mode) and self.weight_col:
+                meta.add(self.weight_col)
+            if (not self.predict_mode) and self.fold_col:
+                meta.add(self.fold_col)
+            if extra_exclude_cols:
+                meta |= set(extra_exclude_cols)
+            self.features = [c for c in all_cols if c not in meta]
+        else:
+            self.features = list(features)
+
+        # 入力列（重複除去）
+        cols = list(self.features)
+        if (not self.predict_mode) and (self.target in all_cols):
+            cols.append(self.target)
+        if (not self.predict_mode) and (self.weight_col in all_cols):
+            cols.append(self.weight_col)
+        if (not self.predict_mode) and self.fold_col:
+            cols.append(self.fold_col)
+        cols.append("row_id")
+        self._columns = list(dict.fromkeys(cols))
 
         # 内部状態
-        self._reader = None  # deque of RecordBatch
-        self._current_file_index = 0  # どのファイルを読んでいるか
+        self._reader = None
+        self._current_file_index = 0
 
-    # --- 必須: 反復の最初に呼ばれる ---
+    # row_id を取り出すためのヘルパ
+    def collected_row_ids(self):
+        if not self._row_id_chunks:
+            return None
+        return np.concatenate(self._row_id_chunks).flatten()
+
     def reset(self):
         self._current_file_index = 0
         self._reader = None
+        self._pass_count += 1 
 
-    # --- 必須: 次のバッチを input_data に詰めて 1 を返す。終端で 0 を返す ---
     def next(self, input_data):
         while True:
             if self._reader is None:
@@ -63,28 +120,56 @@ class ParquetIter(xgb.core.DataIter):
                 batch = next(self._reader)
             except StopIteration:
                 self._reader = None
-                continue  # 次ファイルへ
-            # Arrow -> pandas/cuDF
-            df = cudf.DataFrame.from_arrow(batch) if self.use_cudf else batch.to_pandas()
-            # カテゴリを数値化
-            if self.cat_cols:
-                df[self.cat_cols] = df[self.cat_cols].astype("category")
-            input_data(data=df[self.features], label=df[self.target])
-            del df  # 参照を切る（オプション）
+                continue
+
+            if self.use_cudf:
+                # RecordBatch -> Table -> cuDF
+                if isinstance(batch, pa.RecordBatch):
+                    batch = pa.Table.from_batches([batch])
+                df = cudf.DataFrame.from_arrow(batch)
+            else:
+                df = batch.to_pandas()
+
+            if self.cat_cols and not self.use_cudf:
+                for c in self.cat_cols:
+                    if c in df.columns:
+                        df[c] = df[c].astype("category")
+
+            if self.keep_row_ids and self._pass_count == 1 and "row_id" in df.columns:
+                self._row_id_chunks.append(df["row_id"].to_numpy())
+
+            if self.predict_mode:
+                input_data(data=df[self.features])
+            else:
+                # 学習/評価: data, label, (任意で weight)
+                kwargs = dict(data=df[self.features], label=df[self.target])
+                if self.weight_col and self.weight_col in df.columns:
+                    kwargs["weight"] = df[self.weight_col]
+                input_data(**kwargs)
+
+            del df
             return 1
 
-    # --- 内部: 次のファイルのバッチ列を準備する。準備できれば True ---
     def _prepare_next_file(self):
         while self._current_file_index < len(self.paths):
             path = self.paths[self._current_file_index]
             self._current_file_index += 1
-
-            # 単一ファイルの dataset を作る（列を絞る）
             dataset = ds.dataset(path, format="parquet")
-            cols = list(dict.fromkeys(self.features + [self.target]))
+
+            # fold フィルタ（predict_mode では原則無視）
+            fexpr = None
+            if (not self.predict_mode) and self.fold_col:
+                col = ds.field(self.fold_col)
+                if self.include_folds is not None:
+                    fexpr = col.isin(sorted(self.include_folds))
+                if self.exclude_folds is not None:
+                    ex = ~col.isin(sorted(self.exclude_folds))
+                    fexpr = ex if fexpr is None else (fexpr & ex)
 
             self._reader = dataset.scanner(
-                batch_size=self.batch_rows, columns=cols
+                columns=self._columns,
+                batch_size=self.batch_rows,
+                filter=fexpr,
             ).to_reader()
             return True
         self._reader = None
@@ -120,7 +205,8 @@ class XGBCVTrainer:
         seed=42
     ):
         self.data_id = DATA_ID
-        self.base_dir,
+        self.base_dir = Path(base_dir)
+        self.n_fold = n_fold
         self.params = params
         self.early_stopping_rounds = early_stopping_rounds
         self.num_boost_round = num_boost_round
@@ -144,14 +230,24 @@ class XGBCVTrainer:
             "tree_method": "hist",
             "device": "cuda",
             "random_state": self.seed,
-            "max_bin": 512,
+            "max_bin": 256,
             "grow_policy": "depthwise",
             "single_precision_histogram": True,
             "predictor": "gpu_predictor"
         }
         self.params = {**self.default_params, **(self.params or {})}
 
-    def fit(self):
+    def fit(
+        self,
+        features=None,
+        target="target",
+        cat_cols=None,
+        fold_col=None,
+        weight_col=None,
+        batch_rows=1_000_000,
+        use_cudf=True,
+        extra_exclue_cols=None
+    ):
         """
         CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
 
@@ -162,50 +258,80 @@ class XGBCVTrainer:
         test_preds : ndarray
             test_dfに対する予測配列
         """
-        oof_preds = np.zeros(len(self.X))
-        test_preds = np.zeros(self.test.num_row())
+        t_total_start = now()
+
+        train_path = self.base_dir / f"tr_df{self.data_id}-seed{self.seed}.parquet"
+        test_path = self.base_dir / f"test_df{self.data_id}.parquet"
+
+        train_rows = pq.ParquetFile(train_path).metadata.num_rows
+        test_rows = pq.ParquetFile(test_path).metadata.num_rows
+
+        oof_preds = np.zeros(train_rows, dtype=np.float32)
+        test_preds = np.zeros(test_rows,  dtype=np.float32)
 
         iteration_list = []
-        fold_col = f"{self.n_fold}fold-seed{self.SEED}"
+        fold_col = f"{self.n_fold}fold-seed{self.seed}"
+        cat_cols = get_cat_cols(train_path)
 
         for i in range(self.n_fold):
-            print(f"\nFold {i + 1}")
-            start = time.time()
-
-            train_files, valid_file = make_fold_paths(
-                self.base_dir,
-                self.DATA_ID,
-                self.seed,
-                valid_fold_idx=i
-            )
-            cat_cols = get_cat_cols(train_files[0])
+            print("="*28)
+            print(f"========== Fold {i + 1} ==========")
+            print("="*28)
+            t_fold_start = now()
+            t_qdm_start = now()
 
             train_it = ParquetIter(
-                path=train_files,
+                paths=train_path,
                 features=None,
                 target="target",
                 cat_cols=cat_cols,
+                fold_col=fold_col,
+                exclude_folds=[i],
                 batch_rows=200000,
-                use_cudf=True
+                use_cudf=True,
+                keep_row_ids=True
             )
-
             valid_it = ParquetIter(
-                path=valid_file,
+                paths=train_path,
                 features=None,
                 target="target",
                 cat_cols=cat_cols,
+                fold_col=fold_col,
+                include_folds=[i],
                 batch_rows=200000,
-                use_cudf=True
+                use_cudf=True,
+                keep_row_ids=True
+            )
+            test_it = ParquetIter(
+                paths=test_path,
+                features=None,
+                target="target",
+                cat_cols=cat_cols,
+                fold_col=None,
+                batch_rows=200000,
+                predict_mode=True,
+                use_cudf=True,
+                keep_row_ids=False
             )
 
-            dtrain = xgb.DMatrix(
+            dtrain = xgb.QuantileDMatrix(
                 train_it, enable_categorical=True
             )
-            dvalid = xgb.DMatrix(
+            dvalid = xgb.QuantileDMatrix(
                 valid_it,
-                enable_categorical=True
+                enable_categorical=True, ref=dtrain
             )
+            dtest = xgb.QuantileDMatrix(
+                test_it,
+                enable_categorical=True, ref=dtrain
+            )
+
+            val_idx = valid_it.collected_row_ids()
+
             evals_result = {}
+
+            t_qdm_end = now()
+            t_fit_start = now()
 
             model = xgb.train(
                 self.params,
@@ -218,37 +344,57 @@ class XGBCVTrainer:
             )
 
             # oof
-            oof_preds[val_idx] = model.predict(dvalid, iteration_range=(0, model.best_iteration+1))
-            test_preds += model.predict(self.test, iteration_range=(0, model.best_iteration+1))
+            oof_preds[val_idx] = model.predict(
+                dvalid, iteration_range=(0, model.best_iteration+1))
+            test_preds += model.predict(
+                dtest, iteration_range=(0, model.best_iteration+1))
 
-            end = time.time()
-            print_duration(start, end)
+            t_fit_end = now()
+            t_fold_end = now()
+
+            print_duration(
+                t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time"
+            )
+            print_duration(t_fit_start, t_fit_end)
+            print_duration(t_fold_start, t_fold_end, f"Fold{i} Runtime")
 
             best_iter = model.best_iteration
             train_score = evals_result["train"]["auc"][best_iter]
             eval_score = evals_result["eval"]["auc"][best_iter]
-            print(f"Train AUC: {train_score:.5f}")
-            print(f"Valid AUC: {eval_score:.5f}")
+            print(f"\nTrain AUC: {train_score:.5f}")
+            print(f"Valid AUC: {eval_score:.5f}\n")
 
-            self.fold_models.append(
-                XGBFoldModel(model, X_val, y_val, fold))
+            """self.fold_models.append(
+                XGBFoldModel(model, X_val, y_val, fold))"""
             self.fold_scores.append(eval_score)
 
             iteration_list.append(best_iter)
 
-        print("\n=== CV Results ===")
-        print(f"Fold scores: {self.fold_scores}")
+            del train_it, valid_it, test_it, dtrain, dvalid, dtest
+            gc.collect()
+            cp.get_default_memory_pool().free_all_blocks()
+
+        print("="*32)
+        print("========== CV Results ==========")
+        print("="*32)
+        print("Fold scores: [" + ", ".join(f"{x:.5f}" for x in self.fold_scores) + "]")
         print(
             f"Mean: {np.mean(self.fold_scores):.5f}, "
             f"Std: {np.std(self.fold_scores):.5f}"
         )
+        dataset = ds.dataset(train_path, format="parquet")
+        table = dataset.scanner(columns=[target]).to_table()
+        y = table[target].combine_chunks().to_numpy().astype(np.float32, copy=False)
 
-        self.oof_score = roc_auc_score(self.y, oof_preds)
+        self.oof_score = roc_auc_score(y, oof_preds)
         print(f"OOF score: {self.oof_score:.5f}")
         print(f"Avg best iteration: {np.mean(iteration_list)}")
         print(f"Best iterations: \n{iteration_list}")
 
-        test_preds /= self.n_splits
+        test_preds /= self.n_fold
+
+        t_total_end = now()
+        print_duration(t_total_start, t_total_end, "Total CV Runtime")
 
         return oof_preds, test_preds
 
@@ -266,15 +412,51 @@ class XGBCVTrainer:
         test_prads : np.ndarray
             test dataの予測値
         """
-        if self.test is None:
-            raise ValueError("test_df not provided for XGBCVTrainer.")
+        t_total_start = now()
 
-        dtrain = xgb.DMatrix(
-            self.X, label=self.y,
-            weight=self.weights, enable_categorical=True
+        train_path = self.base_dir / f"tr_df{self.data_id}-seed{self.seed}.parquet"
+        test_path = self.base_dir / f"test_df{self.data_id}.parquet"
+
+        test_rows = pq.ParquetFile(test_path).metadata.num_rows
+        test_preds = np.zeros(test_rows,  dtype=np.float32)
+
+        fold_col = f"{self.n_fold}fold-seed{self.seed}"
+        cat_cols = get_cat_cols(train_path)
+
+        t_qdm_start = now()
+
+        train_it = ParquetIter(
+            paths=train_path,
+            features=None,
+            target="target",
+            cat_cols=cat_cols,
+            fold_col=fold_col,
+            batch_rows=200000,
+            use_cudf=True,
+            keep_row_ids=True
         )
 
-        start = time.time()
+        test_it = ParquetIter(
+            paths=test_path,
+            features=None,
+            target="target",
+            cat_cols=cat_cols,
+            fold_col=None,
+            batch_rows=200000,
+            predict_mode=True,
+            use_cudf=True,
+            keep_row_ids=False
+        )
+
+        dtrain = xgb.QuantileDMatrix(
+            train_it, enable_categorical=True
+        )
+        dtest = xgb.QuantileDMatrix(
+            test_it,
+            enable_categorical=True, ref=dtrain
+        )
+        t_qdm_end = now()
+        t_fit_start = now()
 
         model = xgb.train(
             self.params,
@@ -282,11 +464,17 @@ class XGBCVTrainer:
             num_boost_round=int(iterations*1.25),
             evals=[]
         )
+        t_fit_end = now()
 
-        end = time.time()
-        print_duration(start, end)
+        print_duration(
+            t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time"
+        )
+        print_duration(t_fit_start, t_fit_end)
 
-        test_preds = model.predict(self.test)
+        test_preds = model.predict(dtest)
+
+        t_total_end = now()
+        print_duration(t_total_start, t_total_end, "Total CV Runtime")
 
         return test_preds
 
@@ -305,17 +493,49 @@ class XGBCVTrainer:
         score : float
             Score
         """
-        tr_idx, val_idx = self.fold_indices[fold]
-        start = time.time()
+        t_total_start = now()
 
-        X_tr, y_tr, w_tr = self.X.iloc[tr_idx], self.y[tr_idx], self.weights[tr_idx]
-        X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
-
-        dtrain = xgb.DMatrix(X_tr, label=y_tr,
-                             weight=w_tr, enable_categorical=True)
-        dvalid = xgb.DMatrix(X_val, label=y_val, enable_categorical=True)
+        train_path = self.base_dir / f"tr_df{self.data_id}-seed{self.seed}.parquet"
+        fold_col = f"{self.n_fold}fold-seed{self.seed}"
+        cat_cols = get_cat_cols(train_path)
 
         evals_result = {}
+
+        t_qdm_start = now()
+
+        train_it = ParquetIter(
+            paths=train_path,
+            features=None,
+            target="target",
+            cat_cols=cat_cols,
+            fold_col=fold_col,
+            exclude_folds=[fold],
+            batch_rows=200000,
+            use_cudf=True,
+            keep_row_ids=True
+        )
+        valid_it = ParquetIter(
+            paths=train_path,
+            features=None,
+            target="target",
+            cat_cols=cat_cols,
+            fold_col=fold_col,
+            include_folds=[fold],
+            batch_rows=200000,
+            use_cudf=True,
+            keep_row_ids=True
+        )
+
+        dtrain = xgb.QuantileDMatrix(
+            train_it, enable_categorical=True
+        )
+        dvalid = xgb.QuantileDMatrix(
+            valid_it,
+            enable_categorical=True, ref=dtrain
+        )
+
+        t_qdm_end = now()
+        t_fit_start = now()
 
         model = xgb.train(
             self.params,
@@ -325,20 +545,27 @@ class XGBCVTrainer:
             early_stopping_rounds=self.early_stopping_rounds,
             verbose_eval=100,
             evals_result=evals_result,
-            callbacks=[wandb.xgboost.WandbCallback()]
+            # callbacks=[wandb.xgboost.WandbCallback()]
         )
 
-        end = time.time()
-        print_duration(start, end)
+        t_fit_end = now()
+        print_duration(
+            t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time"
+        )
+        print_duration(t_fit_start, t_fit_end)
 
         best_iter = model.best_iteration
         train_score = evals_result["train"]["auc"][best_iter]
         eval_score = evals_result["eval"]["auc"][best_iter]
-        print(f"Train AUC: {train_score:.5f}")
+        print(f"\nTrain AUC: {train_score:.5f}")
         print(f"Valid AUC: {eval_score:.5f}")
 
-        self.fold_models.append(
-            XGBFoldModel(model, X_val, y_val, fold))
+        del train_it, valid_it, dtrain, dvalid
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
+
+        t_total_end = now()
+        print_duration(t_total_start, t_total_end, "Total Runtime")
 
         return eval_score
 

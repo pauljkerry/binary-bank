@@ -21,6 +21,6 @@ def get_cat_cols(path):
 
         if is_cat_meta or is_dict:
             cats.append(field.name)
-    print(cats)
+    print(f"CATS: {len(cats)} columns")
 
     return cats
