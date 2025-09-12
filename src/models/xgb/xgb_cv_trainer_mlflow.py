@@ -1,13 +1,15 @@
-import glob
 import gc
 import os
 from time import perf_counter as now
+import time
+import psutil
 from pathlib import Path
 
 import cudf
 import cupy as cp
 import joblib
 import matplotlib.pyplot as plt
+import mlflow
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -16,12 +18,13 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import seaborn as sns
 import shap
-import wandb
 import xgboost as xgb
 from sklearn.metrics import roc_auc_score
+from xgboost.callback import TrainingCallback
 
 from src.utils.get_cat_cols import get_cat_cols
 from src.utils.print_duration import print_duration
+
 
 try:
     import cudf
@@ -109,7 +112,7 @@ class ParquetIter(xgb.core.DataIter):
     def reset(self):
         self._current_file_index = 0
         self._reader = None
-        self._pass_count += 1 
+        self._pass_count += 1
 
     def next(self, input_data):
         while True:
@@ -260,7 +263,7 @@ class XGBCVTrainer:
         """
         t_total_start = now()
 
-        train_path = self.base_dir / f"tr_df{self.data_id}-seed{self.seed}.parquet"
+        train_path = self.base_dir / f"tr_df{self.data_id}-s{self.seed}.parquet"
         test_path = self.base_dir / f"test_df{self.data_id}.parquet"
 
         train_rows = pq.ParquetFile(train_path).metadata.num_rows
@@ -270,7 +273,7 @@ class XGBCVTrainer:
         test_preds = np.zeros(test_rows,  dtype=np.float32)
 
         iteration_list = []
-        fold_col = f"{self.n_fold}fold-seed{self.seed}"
+        fold_col = f"{self.n_fold}fold-s{self.seed}"
         cat_cols = get_cat_cols(train_path)
 
         for i in range(self.n_fold):
@@ -414,13 +417,13 @@ class XGBCVTrainer:
         """
         t_total_start = now()
 
-        train_path = self.base_dir / f"tr_df{self.data_id}-seed{self.seed}.parquet"
+        train_path = self.base_dir / f"tr_df{self.data_id}-s{self.seed}.parquet"
         test_path = self.base_dir / f"test_df{self.data_id}.parquet"
 
         test_rows = pq.ParquetFile(test_path).metadata.num_rows
         test_preds = np.zeros(test_rows,  dtype=np.float32)
 
-        fold_col = f"{self.n_fold}fold-seed{self.seed}"
+        fold_col = f"{self.n_fold}fold-s{self.seed}"
         cat_cols = get_cat_cols(train_path)
 
         t_qdm_start = now()
@@ -495,8 +498,8 @@ class XGBCVTrainer:
         """
         t_total_start = now()
 
-        train_path = self.base_dir / f"tr_df{self.data_id}-seed{self.seed}.parquet"
-        fold_col = f"{self.n_fold}fold-seed{self.seed}"
+        train_path = self.base_dir / f"tr_df{self.data_id}-s{self.seed}.parquet"
+        fold_col = f"{self.n_fold}fold-s{self.seed}"
         cat_cols = get_cat_cols(train_path)
 
         evals_result = {}
@@ -545,7 +548,6 @@ class XGBCVTrainer:
             early_stopping_rounds=self.early_stopping_rounds,
             verbose_eval=100,
             evals_result=evals_result,
-            # callbacks=[wandb.xgboost.WandbCallback()]
         )
 
         t_fit_end = now()
@@ -560,7 +562,13 @@ class XGBCVTrainer:
         print(f"\nTrain AUC: {train_score:.5f}")
         print(f"Valid AUC: {eval_score:.5f}")
 
-        del train_it, valid_it, dtrain, dvalid
+        for i, (tr, va) in enumerate(
+            zip(evals_result["train"]["logloss"],
+                evals_result["valid"]["logloss"]), start=1):
+            mlflow.log_metric("train_logloss", tr, step=i)
+            mlflow.log_metric("valid_logloss", va, step=i)
+
+        del train_it, valid_it, dtrain, dvalid, model
         gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
 

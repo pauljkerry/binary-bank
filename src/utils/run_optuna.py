@@ -3,9 +3,15 @@ from src.utils.telegram import send_telegram_message
 
 
 def run_optuna_search(
-    objective, n_trials=50, n_jobs=1,
-    direction="minimize", study_name="study", storage=None,
-    initial_params: dict = None, sampler=None
+    objective,
+    n_trials=50,
+    n_jobs=1,
+    direction="minimize",
+    study_name="study",
+    storage=None,
+    initial_params: dict = None,
+    sampler=None,
+    pruner=None
 ):
     """
     Optunaによるハイパーパラメータ探索を実行する関数。
@@ -39,7 +45,8 @@ def run_optuna_search(
         study_name=study_name,
         storage=storage,
         load_if_exists=True,
-        sampler=sampler or optuna.samplers.TPESampler()
+        sampler=sampler or optuna.samplers.TPESampler(),
+        pruner=pruner
     )
 
     if initial_params is not None:

@@ -1,5 +1,5 @@
-import wandb
-from src.models.xgb.xgb_cv_trainer import XGBCVTrainer
+import mlflow
+from src.models.xgb.xgb_cv_trainer_mlflow import XGBCVTrainer
 
 
 def create_objective(
@@ -10,8 +10,8 @@ def create_objective(
     fold=0,
     early_stopping_rounds=200,
     n_jobs=1,
-    wandb_project="project",
-    study_name="study-xgb"
+    study_name="study-xgb",
+    tracking_uri=None
 ):
     """
     Optunaの目的関数（objective）を生成する関数。
@@ -48,32 +48,38 @@ def create_objective(
                                               1e-4, 10.0, log=True),
             "n_jobs": n_jobs
         }
-        trial.set_user_attr("data_id", data_id)
-        trial.set_user_attr("seed", seed)
-        trial.set_user_attr("n_fold", n_fold)
-        trial.set_user_attr("fold_used", fold)
 
-        run = wandb.init(
-            project=wandb_project,
-            group=study_name,                   # 同じstudyでグルーピング
-            name=f"tr{trial.number}",
-            config={"data_id": data_id, "seed": seed, "n_fold": n_fold, **params},
-            reinit=True,
-        )
-        wandb.config.update(params)
-        trial.set_user_attr("wandb_run_id", run.id)
+        mlflow.set_tracking_uri(tracking_uri)
+        mlflow.set_experiment(study_name)
+        mlflow.enable_system_metrics_logging()
 
-        trainer = XGBCVTrainer(
-            data_id, base_dir, n_fold,
-            params=params, seed=seed,
-            early_stopping_rounds=early_stopping_rounds
-        )
+        with mlflow.start_run(run_name=f"tr{trial.number}") as run:
+            mlflow.set_tags({
+                "optuna-trial": trial.number,
+                "data_id": data_id,
+                "fold_used": fold,
+                "seed": seed,
+                "n_fold": n_fold,
+            })
+            mlflow.log_params(
+                {"seed": 42,
+                 "data_id": "026",
+                 "fold_used": "fold0",
+                 **params})
 
-        score = trainer.fit_one_fold(fold, wandb_run=run)
+            trainer = XGBCVTrainer(
+                data_id, base_dir, n_fold,
+                params=params, seed=seed,
+                early_stopping_rounds=early_stopping_rounds
+            )
 
-        wandb.log({"fold": fold, "eval_auc": score})
-        run.summary["trial_value"] = float(score)
-        wandb.finish()
+            score = trainer.fit_one_fold(fold)
+            mlflow.log_metric("auc", score)
+
+            trial.set_user_attr("data_id", data_id)
+            trial.set_user_attr("seed", seed)
+            trial.set_user_attr("n_fold", n_fold)
+            trial.set_user_attr("fold_used", fold)
 
         return score
     return objective
