@@ -13,7 +13,7 @@ def get_trainer(model_type: str):
         CVTrainer
     """
     if model_type == "xgb":
-        from src.models.xgb.xgb_cv_trainer_mlflow import XGBCVTrainer
+        from src.models.xgb.xgb_cv_trainer import XGBCVTrainer
         return XGBCVTrainer
     elif model_type == "lgbm":
         from src.models.lgbm.lgbm_cv_trainer import LGBMCVTrainer

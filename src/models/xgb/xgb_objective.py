@@ -34,7 +34,7 @@ def create_objective(
     """
     def objective(trial):
         params = {
-            "learning_rate": trial.suggest_float("learning_rate", 0.03, 0.03),
+            "learning_rate": trial.suggest_float("learning_rate", 0.1, 0.1),
             "max_depth": trial.suggest_int("max_depth", 3, 15),
             "min_child_weight": trial.suggest_float(
                 "min_child_weight", 0, 100),
@@ -48,19 +48,26 @@ def create_objective(
                                               1e-4, 10.0, log=True),
             "n_jobs": n_jobs
         }
-        trial.set_user_attr("data_id", data_id)
-        trial.set_user_attr("seed", seed)
-        trial.set_user_attr("n_fold", n_fold)
-        trial.set_user_attr("fold_used", fold)
 
         run = wandb.init(
             project=wandb_project,
             group=study_name,                   # 同じstudyでグルーピング
             name=f"tr{trial.number}",
-            config={"data_id": data_id, "seed": seed, "n_fold": n_fold, **params},
+            config={
+                "data_id": data_id,
+                "seed": seed,
+                "n_fold": n_fold,
+                **params
+            },
+            tags=["xgb"],
             reinit=True,
         )
         wandb.config.update(params)
+
+        trial.set_user_attr("data_id", data_id)
+        trial.set_user_attr("seed", seed)
+        trial.set_user_attr("n_fold", n_fold)
+        trial.set_user_attr("fold_used", fold)
         trial.set_user_attr("wandb_run_id", run.id)
 
         trainer = XGBCVTrainer(
@@ -71,8 +78,7 @@ def create_objective(
 
         score = trainer.fit_one_fold(fold, wandb_run=run)
 
-        wandb.log({"fold": fold, "eval_auc": score})
-        run.summary["trial_value"] = float(score)
+        run.summary["auc"] = float(score)
         wandb.finish()
 
         return score

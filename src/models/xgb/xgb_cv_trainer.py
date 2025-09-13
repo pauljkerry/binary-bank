@@ -33,6 +33,19 @@ try:
 except Exception:
     _HAS_CUDF = False
 
+def cleanup_memory():
+    import gc, ctypes
+    try:
+        import cupy as cp
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)  # glibcアリーナ縮小
+    except Exception:
+        pass
 
 class ParquetIter(xgb.core.DataIter):
     def __init__(
@@ -541,13 +554,6 @@ class XGBCVTrainer:
         t_qdm_end = now()
         t_fit_start = now()
 
-        cbs = [
-            WandbCallback(
-                log_model=False,
-                log_feature_importance=True,
-                importance_type="gain"
-            )]
-
         model = xgb.train(
             self.params,
             dtrain,
@@ -556,7 +562,6 @@ class XGBCVTrainer:
             early_stopping_rounds=self.early_stopping_rounds,
             verbose_eval=100,
             evals_result=evals_result,
-            callbacks=cbs
         )
 
         t_fit_end = now()
@@ -566,12 +571,34 @@ class XGBCVTrainer:
         print_duration(t_fit_start, t_fit_end)
 
         best_iter = model.best_iteration
+
         train_score = evals_result["train"]["auc"][best_iter]
         eval_score = evals_result["eval"]["auc"][best_iter]
         print(f"\nTrain AUC: {train_score:.5f}")
         print(f"Valid AUC: {eval_score:.5f}")
 
+        # best iteration, loss, feature importanceをwandbに記録
         wandb.run.summary["best_iteration"] = model.best_iteration
+
+        wandb.define_metric("auc", step_metric="iteration")
+        for name, metrics in evals_result.items():
+            for metric, values in metrics.items():
+                for i, v in enumerate(values):
+                    wandb.log({"iteration": i, f"{name}/{metric}": v}, step=i)
+
+        importances = model.get_score(importance_type="total_gain")
+
+        total_gain = sum(importances.values())
+        importance_ratios = [
+            np.round((v/total_gain)*100, 2)
+            for k, v in importances.items()
+        ]
+        df = pd.DataFrame({
+            "Feature": [k for k in importances.keys()],
+            "ImportanceRatio": importance_ratios,
+        }).sort_values("ImportanceRatio", ascending=False)
+
+        wandb.log({"fi_table": wandb.Table(dataframe=df)})
 
         del train_it, valid_it, dtrain, dvalid, model
         gc.collect()
@@ -579,6 +606,8 @@ class XGBCVTrainer:
 
         t_total_end = now()
         print_duration(t_total_start, t_total_end, "Total Runtime")
+
+        cleanup_memory()
 
         return eval_score
 

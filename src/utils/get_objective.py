@@ -13,7 +13,7 @@ def get_objective(model_type: str):
         Optunaのobjective作成関数
     """
     if model_type == "xgb":
-        from src.models.xgb.xgb_objective_mlflow import create_objective
+        from src.models.xgb.xgb_objective import create_objective
         return create_objective
     elif model_type == "lgbm":
         from src.models.lgbm.lgbm_objective import create_objective
