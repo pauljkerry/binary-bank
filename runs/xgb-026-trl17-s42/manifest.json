@@ -1,0 +1,12 @@
+{
+    "run_id": "xgb-026-trl17-s42",
+    "created_at": "2025-09-15 08:56:56",
+    "model_name": "xgb",
+    "data_id": "026",
+    "seed": 42,
+    "n_fold": 5,
+    "feature_dir": "/home/hanse/kaggle/binary-bank/artifacts/features/base/026",
+    "phash": "cb02f042fe",
+    "param_source": "../artifacts/params/xgb-026/trl17.json",
+    "run_dir": "/home/hanse/kaggle/binary-bank/runs/xgb-026-trl17-s42"
+}
