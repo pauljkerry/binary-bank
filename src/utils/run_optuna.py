@@ -1,5 +1,5 @@
 import optuna
-from src.utils.telegram import send_telegram_message
+from src.utils.telegram import send_message
 
 
 def run_optuna_search(
@@ -73,5 +73,5 @@ def run_optuna_search(
         f"Best Value: {study.best_value:.5f}\n"
         f"Trials: {n_trials}"
     )
-    send_telegram_message(msg)
+    send_message(msg)
     return study

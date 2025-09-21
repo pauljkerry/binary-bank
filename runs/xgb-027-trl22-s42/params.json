@@ -1,0 +1,11 @@
+{
+    "learning_rate": 0.02,
+    "max_depth": 11,
+    "min_child_weight": 39.74091534498554,
+    "colsample_bytree": 0.4370063974951026,
+    "subsample": 0.6506017835749732,
+    "reg_alpha": 0.006614449240737595,
+    "reg_lambda": 0.004439572042585562,
+    "n_jobs": 1,
+    "early_stopping_rounds": 200
+}

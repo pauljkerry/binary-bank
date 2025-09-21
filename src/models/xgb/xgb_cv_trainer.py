@@ -1,6 +1,7 @@
 from __future__ import annotations
 import gc
 import os
+import math
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 from pathlib import Path
@@ -19,6 +20,7 @@ from sklearn.metrics import roc_auc_score
 from src.utils.get_cat_cols import get_cat_cols
 from src.utils.logging import CVResult, CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
+from src.utils.win_avail_gb import win_avail_gb
 
 try:
     import cudf
@@ -32,16 +34,18 @@ except Exception:
 class ParquetIter(xgb.core.DataIter):
     # === 引数（元 __init__ のシグネチャ） ===
     paths: list[str] | str | os.PathLike
-    features: Optional[list[str]] = None
+
+    features: list[str] = None
     target: str = "target"
     cat_cols: Optional[Iterable[str]] = None
     fold_col: Optional[str] = None
     include_folds: Optional[Iterable[int]] = None
     exclude_folds: Optional[Iterable[int]] = None
     weight_col: Optional[str] = None
-    batch_rows: int = 1_000_000
-    use_cudf: Optional[bool] = None
     extra_exclude_cols: Optional[Iterable[str]] = None
+
+    batch_rows: int = 200_000
+    use_cudf: Optional[bool] = None
     predict_mode: bool = False
     keep_row_ids: bool = True
 
@@ -223,6 +227,8 @@ class XGBCVTrainer:
     batch_rows: int = 1_000_000
     use_cudf: bool = True
 
+    opts: dict = field(init=True, default_factory=dict)
+
     _fi_fold_frames: list = field(init=False, default_factory=list, repr=False)
 
     def __post_init__(self):
@@ -245,26 +251,31 @@ class XGBCVTrainer:
             "seed": self.seed,
             "max_bin": 256,
             "grow_policy": "depthwise",
-            "predictor": "gpu_predictor",
-            "early_stopping_rounds": 200,
-            "num_boost_round": 20000
+            "predictor": "gpu_predictor"
         }
-        self.params = {**default_params, **(self.params or {})}
-        self.early_stopping_rounds = int(
-            self.params.pop("early_stopping_rounds")
+
+        user_params = self.params or {}
+        merged = {**default_params, **user_params}
+
+        self.early_stopping_rounds = self.opts.get(
+            "early_stopping_rounds",
+            None
         )
-        self.num_boost_round = int(
-            self.params.pop("num_boost_round")
+        self.num_boost_round = self.opts.get(
+            "num_boost_round",
+            20000
         )
 
-        self.train_path = (
-            self.feature_dir /
-            f"tr_df{self.data_id}-s{self.seed}.parquet"
-        )
-        self.test_path = (
-            self.feature_dir /
-            f"test_df{self.data_id}.parquet"
-        )
+        # ユーザー未指定なら lr に応じて自動設定（下限あり）
+        if self.early_stopping_rounds is None:
+            lr = float(merged["learning_rate"])
+            self.early_stopping_rounds = max(50, int(math.ceil(10.0 / lr)))
+
+        # train() の引数として取り出す
+        self.params = merged
+
+        self.train_path = self.feature_dir / "tr_df.parquet"
+        self.test_path = self.feature_dir / "test_df.parquet"
 
         schema = ds.dataset(self.train_path, format="parquet").schema
         all_cols = [f.name for f in schema]
@@ -312,6 +323,8 @@ class XGBCVTrainer:
             "data_id": self.data_id,
             "seed": self.seed,
             "n_fold": self.n_fold,
+            "early_stopping_rounds": self.early_stopping_rounds,
+            "batch_rows": self.batch_rows,
             **self.params
         }
         for lg in loggers:
@@ -330,6 +343,7 @@ class XGBCVTrainer:
             print("=" * 22)
             print(f"===== Fold {i + 1} / {self.n_fold} =====")
             print("=" * 22)
+            print(f"Avail Mem: {round(win_avail_gb(), 2)} GB")
 
             t_fold_start = now()
             t_qdm_start = now()
@@ -343,7 +357,7 @@ class XGBCVTrainer:
                 exclude_folds=[i],
                 batch_rows=self.batch_rows,
                 use_cudf=True,
-                keep_row_ids=True,
+                keep_row_ids=False,
             )
             valid_it = ParquetIter(
                 paths=self.train_path,
@@ -432,7 +446,7 @@ class XGBCVTrainer:
                 {
                     "Feature": list(importances.keys()),
                     "ImportanceRatio": [
-                        (v / total_gain) * 100.0 for v in importances.values()
+                        ((v/total_gain)*100.0)/self.n_fold for v in importances.values()
                     ],
                 }
             )
@@ -478,7 +492,7 @@ class XGBCVTrainer:
             all_fi
             .group_by("Feature")
             .agg([
-                (pl.sum("ImportanceRatio") / self.n_fold).alias("mean_ratio")
+                pl.sum("ImportanceRatio").alias("mean_ratio")
             ])
         ).sort("mean_ratio", descending=True)
 
@@ -496,6 +510,7 @@ class XGBCVTrainer:
 
         t_total_end = now()
         print_duration(t_total_start, t_total_end, "Total CV Runtime")
+        print(f"Avail Mem: {round(win_avail_gb(), 2)} GB")
 
         return result
 
@@ -586,12 +601,15 @@ class XGBCVTrainer:
             Score
         """
         t_total_start = now()
+        print(f"Avail Mem: {round(win_avail_gb(), 2)} GB")
 
         loggers = loggers or [NoOpLogger()]
         meta = {
             "data_id": self.data_id,
             "seed": self.seed,
             "n_fold": self.n_fold,
+            "early_stopping_rounds": self.early_stopping_rounds,
+            "batch_rows": self.batch_rows,
             **self.params
         }
         for lg in loggers:
@@ -610,7 +628,7 @@ class XGBCVTrainer:
             exclude_folds=[fold_idx],
             batch_rows=self.batch_rows,
             use_cudf=self.use_cudf,
-            keep_row_ids=True,
+            keep_row_ids=False,
         )
         valid_it = ParquetIter(
             paths=self.train_path,
@@ -655,18 +673,16 @@ class XGBCVTrainer:
 
         train_score = evals_result["train"]["auc"][best_iteration]
         eval_score = evals_result["eval"]["auc"][best_iteration]
+
         print(f"\nTrain AUC: {train_score:.5f}")
         print(f"Valid AUC: {eval_score:.5f}")
-
-        importances = model.get_score(importance_type="total_gain")
 
         for lg in loggers:
             lg.on_fold_end(
                 fold_idx,
                 eval_score,
                 evals_result,
-                best_iteration,
-                importances
+                best_iteration
             )
 
         del train_it, valid_it, dtrain, dvalid, model
@@ -675,5 +691,6 @@ class XGBCVTrainer:
 
         t_total_end = now()
         print_duration(t_total_start, t_total_end, "Total Runtime")
+        print(f"Avail Mem: {round(win_avail_gb(), 2)} GB")
 
         return eval_score

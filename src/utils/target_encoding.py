@@ -69,34 +69,38 @@ def target_encoding(
             )
 
             # validation
-            val_with_mean = val.join(means_df, on=col, how="left")
             overall_mean = means_df["mean_target"].mean()
             val_te = (
-                val_with_mean["mean_target"].fill_null(overall_mean)
-                                            .to_numpy()
+                val.join(
+                    means_df.select(["mean_target", col]),
+                    on=col,
+                    how="left"
+                )
+                .get_column("mean_target")
+                .fill_null(overall_mean)
+                .to_numpy()
+                .astype(dtype=np.float32, copy=False)
             )
-            te_tr_dict[f"{col}_te"][val_idx] = (
-                val_te.astype(np.float32, copy=False)
-            )
+            te_tr_dict[f"{col}_te"][val_idx] = val_te
 
             # test
-            test_with_mean = test_df.join(means_df, on=col, how="left")
             test_te = (
-                test_with_mean["mean_target"].fill_null(overall_mean)
-                                             .to_numpy()
+                test_df.join(
+                    means_df.select(["mean_target", col]),
+                    on=col,
+                    how="left"
+                )
+                .get_column("mean_target")
+                .fill_null(overall_mean)
+                .to_numpy()
+                .astype(dtype=np.float32, copy=False)
             )
-            te_test_dict[f"{col}_te"] += (
-                test_te.astype(np.float32, copy=False) / n_splits
-            )
+            te_test_dict[f"{col}_te"] += test_te / n_splits
 
-            del means_df, val_with_mean, test_with_mean, val_te, test_te
+            del means_df, val_te, test_te
         del train, val
 
-    te_tr = pl.DataFrame(te_tr_dict).with_columns([
-        pl.col(col).cast(pl.Float32) for col in te_tr_dict.keys()
-    ])
-    te_test = pl.DataFrame(te_test_dict).with_columns([
-        pl.col(col).cast(pl.Float32) for col in te_test_dict.keys()
-    ])
+    te_tr = pl.DataFrame(te_tr_dict)
+    te_test = pl.DataFrame(te_test_dict)
 
     return pl.concat([te_tr, te_test], how="vertical")

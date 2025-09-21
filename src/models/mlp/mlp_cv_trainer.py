@@ -1,14 +1,173 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, IterableDataset, get_worker_info
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import pyarrow.dataset as ds
+from dataclasses import dataclass, field
+from typing import Iterable, Optional
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import log_loss
 from sklearn.metrics import roc_auc_score
 import time
-import joblib
 from src.utils.print_duration import print_duration
+
+
+@dataclass(eq=False)
+class ParquetStream(IterableDataset):
+    # === 引数（元 __init__ のシグネチャ） ===
+    paths: list[str] | str | os.PathLike
+
+    features: Optional[list[str]] = None
+    target: str = "target"
+    cat_cols: Optional[Iterable[str]] = None
+    fold_col: Optional[str] = None
+    include_folds: Optional[Iterable[int]] = None
+    exclude_folds: Optional[Iterable[int]] = None
+    weight_col: Optional[str] = None
+
+    batch_size: int
+    batch_rows: int = 200_000
+    buffer_size: int = 100_000
+    rows_per_epoch: int = None
+    extra_exclude_cols: Optional[Iterable[str]] = None
+    predict_mode: bool = False
+    seed: int = 42
+
+    _epoch: int = field(init=False, default=0, repr=False)
+
+    def __post_init__(self):
+        super().__init__()
+        self.paths = [
+            str(p)
+            for p in (
+                self.paths
+                if isinstance(self.paths, (list, tuple))
+                else [self.paths]
+            )
+        ]
+        self.buffer_size = int(self.buffer_size)
+        self.cat_cols = list(self.cat_cols or [])
+        self.include_folds = (
+            None
+            if self.include_folds is None
+            else set(self.include_folds)
+        )
+        self.exclude_folds = (
+            None
+            if self.exclude_folds is None
+            else set(self.exclude_folds)
+        )
+        self.predict_mode = bool(self.predict_mode)
+
+        # --- extra exclude colsを除外 ---
+        schema = ds.dataset(self.paths, format="parquet").schema
+        all_cols = [f.name for f in schema]
+
+        if self.extra_exclude_cols:
+            excl = (
+                {self.extra_exclude_cols}
+                if isinstance(self.extra_exclude_cols, str)
+                else set(self.extra_exclude_cols)
+            )
+            self.features = [c for c in self.features if c not in excl]
+
+        # 入力列（重複除去）
+        cols = list(self.features)
+        if (not self.predict_mode) and (self.target in all_cols):
+            cols.append(self.target)
+        if (not self.predict_mode) and (self.weight_col in all_cols):
+            cols.append(self.weight_col)
+        if (not self.predict_mode) and (self.fold_col in all_cols):
+            cols.append(self.fold_col)
+        self._columns = list(dict.fromkeys(cols))
+
+        # 内部状態
+        self._reader = None
+        self._current_file_index = 0
+
+    def set_epoch(self, epoch: int):
+        self._epoch = int(epoch)
+
+    def _sharded_paths(self):
+        info = get_worker_info()
+        if info is None:
+            return self.paths
+        return self.paths[info.id::info.num_workers]
+
+    def __iter__(self):
+        rng = np.random.default_rng(
+            self.seed
+            + self._epoch
+            + (get_worker_info().id if get_worker_info() else 0))
+        bufX, bufy, bufw = [], [], []
+        emitted = 0
+
+        dataset = ds.dataset(self.paths, format="parquet")
+        fexpr = None
+        if (not self.predict_mode) and self.fold_col:
+            col = ds.field(self.fold_col)
+            if self.include_folds is not None:
+                fexpr = col.isin(sorted(self.include_folds))
+            if self.exclude_folds is not None:
+                ex = ~col.isin(sorted(self.exclude_folds))
+                fexpr = ex if fexpr is None else (fexpr & ex)
+
+        for path in self._sharded_paths():
+            reader = dataset.scanner(
+                columns=self._columns,
+                batch_size=self.batch_rows,
+                filster=fexpr
+            ).to_reader()
+            for batch in reader:
+                tbl = batch.to_pandas()  # 速さ重視なら .to_numpy() 直取りでもOK
+                X = tbl[self.features].to_numpy(dtype=np.float32, copy=False)
+                y = tbl[self.target].to_numpy(dtype=np.float32, copy=False)
+                w = tbl[self.weight_col].to_numpy(dtype=np.float32, copy=False) if self.weight_col else None
+
+                # バッファに積む
+                bufX.append(X)
+                bufy.append(y)
+                if self.weight_col:
+                    bufw.append(w)
+                # バッファが大きくなり過ぎたら1つにまとめてシャッフル
+                if sum(len(a) for a in bufy) >= self.buffer_size:
+                    Xb = np.concatenate(bufX)
+                    yb = np.concatenate(bufy)
+                    wb = np.concatenate(bufw) if self.weight_col else None
+
+                for i0 in range(0, len(yb), self.batch_size):
+                    i1 = min(i0 + self.batch_size, len(yb))
+                    if self.rows_per_epoch and emitted >= self.rows_per_epoch:
+                        return
+                    xb = torch.from_numpy(Xb[i0:i1])                # (B, F)
+                    ybt = torch.from_numpy(yb[i0:i1]).float()       # (B,)
+                    if wb is None:
+                        yield xb, ybt
+                    else:
+                        yield xb, ybt, torch.from_numpy(wb[i0:i1]).float()
+                    emitted += (i1 - i0)
+                    bufX.clear()
+                    bufy.clear()
+                    bufw.clear()
+        # 余りを吐く
+        if bufy:
+            Xb = np.concatenate(bufX)
+            yb = np.concatenate(bufy)
+            wb = np.concatenate(bufw) if self.weight_col else None
+
+            for i0 in range(0, len(yb), self.batch_size):
+                i1 = min(i0 + self.batch_size, len(yb))
+                if self.rows_per_epoch and emitted >= self.rows_per_epoch:
+                    return
+                xb = torch.from_numpy(Xb[i0:i1])                # (B, F)
+                ybt = torch.from_numpy(yb[i0:i1]).float()       # (B,)
+                if wb is None:
+                    yield xb, ybt
+                else:
+                    yield xb, ybt, torch.from_numpy(wb[i0:i1]).float()
+                emitted += (i1 - i0)
 
 
 class SimpleMLP(nn.Module):
@@ -31,8 +190,16 @@ class SimpleMLP(nn.Module):
         カテゴリ変数のユニークな値のリスト
     """
 
-    def __init__(self, input_dim, hidden_dims, dropout_rate, activation,
-                 num_idxs, cat_idxs, cat_dims):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dims,
+        dropout_rate,
+        activation,
+        num_idxs,
+        cat_idxs,
+        cat_dims
+    ):
         super().__init__()
         self.num_idxs = num_idxs
         self.cat_idxs = cat_idxs
@@ -349,13 +516,7 @@ class MLPCVTrainer:
             model.load_state_dict(
                 {k: v.to(self.params["device"]) for k, v in best_model_state.items()}
             )
-            self.fold_models.append(MLPFoldModel(
-                model,
-                X_val,
-                y_val,
-                fold,
-                best_rounds=best_epoch
-            ))
+
             self.fold_scores.append(best_log_loss)
 
             epoch_list.append(best_epoch)
@@ -552,59 +713,3 @@ class MLPCVTrainer:
         print(f"Best AUC: {best_auc:.5f}")
 
         return best_auc
-
-
-class MLPFoldModel:
-    """
-    MLPのfold単位のモデルを保持するクラス。
-
-    Attributes
-    ----------
-    model : torch.nn.Module
-        学習済みのMLPモデル。
-    X_val : pd.DataFrame
-        検証用の特徴量データ。
-    y_val : pd.Series
-        検証用のターゲットラベル。
-    fold_index : int
-        foldの番号。
-    best_rounds : int
-        最良スコア時のエポック数
-    """
-
-    def __init__(
-        self, model, X_val, y_val, fold_index, best_rounds
-    ):
-        self.model = model
-        self.X_val_num = X_val
-        self.y_val = y_val
-        self.fold_index = fold_index
-        self.best_rounds = best_rounds
-
-    def save_model(self, path="../artifacts/model/xgb_vn.pkl"):
-        """
-        学習済みモデルを指定パスに保存する。
-
-        Parameters
-        ----------
-        path : str
-            モデルを保存するパス。
-        """
-        joblib.dump(self.model, path)
-
-    def load_model(self, path):
-        """
-        指定されたパスからモデルを読み込む。
-
-        Parameters
-        ----------
-        path : str
-            モデルファイルのパス。
-
-        Returns
-        -------
-        self : XGBFoldModel
-            読み込んだモデルを保持するインスタンス自身を返す。
-        """
-        self.model = joblib.load(path)
-        return self

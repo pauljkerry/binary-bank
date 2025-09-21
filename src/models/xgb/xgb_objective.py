@@ -1,5 +1,7 @@
 import os
 import json
+from typing import Optional
+
 import wandb
 from optuna.exceptions import TrialPruned
 
@@ -15,11 +17,10 @@ def create_objective(
     seed: int = 42,
     n_fold: int = 5,
     fold_idx: int = 0,
-    early_stopping_rounds: int = 200,
-    batch_rows: int = 200_000,
-    n_jobs: int = 1,
+    batch_rows: int = 1_000_000,
     wandb_project: str = "project",
     study_name: str = "study-xgb",
+    **opts
 ):
     """
     Optunaの目的関数（objective）を生成する関数。
@@ -34,6 +35,7 @@ def create_objective(
         EarlyStoppingのラウンド数。
     n_jobs : int, default 1
         XGB並列数。
+    early_stopping_rounds: Optional[int] = None
 
     Returns
     -------
@@ -42,31 +44,63 @@ def create_objective(
     """
 
     def objective(trial):
-        run = wandb.init(
-            project=wandb_project,
-            group=study_name,
-            name=f"trl{trial.number}",
-            config={
-                "data_id": data_id,
-                "n_fold": n_fold
-            },
-            tags=["xgb", "optuna"],
-            reinit=True,
-        )
         try:
             params = {
-                "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.02),
-                "max_depth": trial.suggest_int("max_depth", 3, 10),
-                "min_child_weight": trial.suggest_float("min_child_weight", 0, 100),
-                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 0.6),
-                "subsample": trial.suggest_float("subsample", 0.5, 0.9),
-                "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 40.0, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
-                "n_jobs": n_jobs,
-                "early_stopping_rounds": early_stopping_rounds
+                "learning_rate": trial.suggest_float(
+                    "learning_rate",
+                    0.02,
+                    0.02
+                ),
+                "max_depth": trial.suggest_int(
+                    "max_depth",
+                    6,
+                    13
+                ),
+                "min_child_weight": trial.suggest_float(
+                    "min_child_weight",
+                    0,
+                    100
+                ),
+                "colsample_bytree": trial.suggest_float(
+                    "colsample_bytree",
+                    0.3,
+                    0.7
+                ),
+                "subsample": trial.suggest_float(
+                    "subsample",
+                    0.5,
+                    0.9
+                ),
+                "reg_alpha": trial.suggest_float(
+                    "reg_alpha",
+                    1e-4,
+                    40.0,
+                    log=True
+                ),
+                "reg_lambda": trial.suggest_float(
+                    "reg_lambda",
+                    1e-4,
+                    10.0,
+                    log=True
+                ),
             }
 
-            wandb.config.update(params)
+            early_stopping_rounds = opts.pop("early_stopping_rounds", None)
+
+            run = wandb.init(
+                project=wandb_project,
+                group=study_name,
+                name=f"trl{trial.number}",
+                config={
+                    "data_id": data_id,
+                    "n_fold": n_fold,
+                    "batch_rows": batch_rows,
+                    "early_stopping_rounds": early_stopping_rounds,
+                    **params
+                },
+                tags=["xgb", "optuna"],
+                reinit=True,
+            )
 
             trainer = XGBCVTrainer(
                 data_id,
@@ -74,7 +108,8 @@ def create_objective(
                 n_fold=n_fold,
                 params=params,
                 seed=seed,
-                batch_rows=batch_rows
+                batch_rows=batch_rows,
+                opts=opts
             )
 
             score = trainer.fit_one_fold(
@@ -82,12 +117,19 @@ def create_objective(
                 loggers=[WandbLogger(run=run)]
             )
 
-            wandb.finish()
-
             os.makedirs(f"../artifacts/params/{study_name}", exist_ok=True)
             path = f"../artifacts/params/{study_name}/trl{trial.number}.json"
+            manifest = {
+                "params": params,
+                "n_fold": n_fold,
+                "seed": seed,
+                "batch_rows": batch_rows,
+                "wandb_id": run.id,
+                "wandb_url": run.url,
+                "opts": opts
+            }
             with open(path, "w") as f:
-                json.dump(params, f, indent=4)
+                json.dump(manifest, f, indent=4)
 
             return score
         except RuntimeError as e:
@@ -104,14 +146,15 @@ def create_objective(
                 )
                 raise
         finally:
+            wandb.finish()
             try:
-                N = 10  # 周期
-                if trial.number % N == 0:
+                N = 10
+                if (trial.number+1) % N == 0 and trial.number != 0:
                     _ = snapshot_study(
                         study=trial.study,
                         study_name=study_name,
                         trial_num=trial.number,
-                        out_root="runs/optuna",
+                        out_root="../artifacts/optuna",
                         send_telegram=True,
                     )
             except Exception:
