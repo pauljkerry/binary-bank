@@ -1,36 +1,79 @@
+import gc
 import os
-import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset, IterableDataset, get_worker_info
-from torch.optim.lr_scheduler import CosineAnnealingLR
-import pyarrow.dataset as ds
+import time
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
-from sklearn.model_selection import StratifiedKFold
+from pathlib import Path
+from time import perf_counter as now
+
+import cudf
+import torch
+import cupy as cp
+import numpy as np
+import polars as pl
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 from sklearn.metrics import log_loss
 from sklearn.metrics import roc_auc_score
-import time
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, IterableDataset, get_worker_info
+from torch.utils.dlpack import from_dlpack
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from src.utils.loggers import CVResult, CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
+from src.utils.win_avail_gb import win_avail_gb
 
 
-@dataclass(eq=False)
+def compute_feature_stats(
+    paths: list[str],
+    features: list[str],
+    num_cols: list[str],
+    fold_col: str = None,
+    include_folds: str = None,
+    exclude_folds: str = None,
+    batch_rows: int = 1_000_000,
+):
+    lf = pl.scan_parquet(paths, low_memory=True)
+    if fold_col:
+        if include_folds is not None:
+            lf = lf.filter(pl.col(fold_col).is_in(sorted(include_folds)))
+        if exclude_folds is not None:
+            lf = lf.filter(~pl.col(fold_col).is_in(sorted(exclude_folds)))
+
+    exprs = []
+    for c in num_cols:
+        exprs += [pl.col(c).cast(pl.Float64).mean().alias(f"{c}_mean"),
+                  pl.col(c).cast(pl.Float64).std(ddof=0).alias(f"{c}_std")]
+    out = lf.select(exprs).collect(streaming=True)  # 大規模でも低メモリ
+    mean = out.select(
+        [f"{c}_mean" for c in num_cols]).to_numpy().ravel().astype(np.float32)
+    std = out.select(
+        [f"{c}_std" for c in num_cols]).to_numpy().ravel().astype(np.float32)
+    std[std == 0] = 1.0
+    return mean, std
+
+
+@dataclass
 class ParquetStream(IterableDataset):
-    # === 引数（元 __init__ のシグネチャ） ===
     paths: list[str] | str | os.PathLike
 
-    features: Optional[list[str]] = None
-    target: str = "target"
-    cat_cols: Optional[Iterable[str]] = None
+    features: list[str]
+    target: str
+    num_idxs: Iterable[int]
+
+    mean: np.ndarray
+    std: np.ndarray
+
     fold_col: Optional[str] = None
     include_folds: Optional[Iterable[int]] = None
     exclude_folds: Optional[Iterable[int]] = None
     weight_col: Optional[str] = None
 
-    batch_size: int
-    batch_rows: int = 200_000
-    buffer_size: int = 100_000
-    rows_per_epoch: int = None
+    batch_size: int = 1024
+    rows_per_epoch: int | None = None
     extra_exclude_cols: Optional[Iterable[str]] = None
     predict_mode: bool = False
     seed: int = 42
@@ -39,6 +82,8 @@ class ParquetStream(IterableDataset):
 
     def __post_init__(self):
         super().__init__()
+
+        # 形式正規化
         self.paths = [
             str(p)
             for p in (
@@ -47,8 +92,7 @@ class ParquetStream(IterableDataset):
                 else [self.paths]
             )
         ]
-        self.buffer_size = int(self.buffer_size)
-        self.cat_cols = list(self.cat_cols or [])
+        self.num_idxs = list(self.num_idxs or [])
         self.include_folds = (
             None
             if self.include_folds is None
@@ -61,9 +105,9 @@ class ParquetStream(IterableDataset):
         )
         self.predict_mode = bool(self.predict_mode)
 
-        # --- extra exclude colsを除外 ---
-        schema = ds.dataset(self.paths, format="parquet").schema
-        all_cols = [f.name for f in schema]
+        # --- スキーマ取得は ParquetFile から（dataset 不使用）---
+        pf0 = pq.ParquetFile(self.paths[0])
+        all_cols = pf0.schema_arrow.names
 
         if self.extra_exclude_cols:
             excl = (
@@ -74,18 +118,43 @@ class ParquetStream(IterableDataset):
             self.features = [c for c in self.features if c not in excl]
 
         # 入力列（重複除去）
-        cols = list(self.features)
-        if (not self.predict_mode) and (self.target in all_cols):
+        cols = list(self.features or [])
+        if (
+            (not self.predict_mode)
+            and (self.target in all_cols)
+           ):
             cols.append(self.target)
-        if (not self.predict_mode) and (self.weight_col in all_cols):
+        if (
+            (not self.predict_mode)
+            and self.weight_col
+            and (self.weight_col in all_cols)
+        ):
             cols.append(self.weight_col)
-        if (not self.predict_mode) and (self.fold_col in all_cols):
+        if (
+            (not self.predict_mode)
+            and self.fold_col
+            and (self.fold_col in all_cols)
+        ):
             cols.append(self.fold_col)
+
         self._columns = list(dict.fromkeys(cols))
 
-        # 内部状態
-        self._reader = None
-        self._current_file_index = 0
+        self._norm_idxs = cp.asarray(
+            self.num_idxs, dtype=cp.int64
+        )
+        if not (len(self.mean) == len(self.std) == len(self._norm_idxs)):
+            raise ValueError(
+                f"mean/std/num_idxs length mismatch: "
+                f"{len(self.mean)}, {len(self.std)}, {len(self._norm_idxs)}"
+            )
+        self._mean_cu = cp.asarray(
+            self.mean,
+            dtype=cp.float32
+        )
+        self._std_cu = cp.asarray(
+            self.std,
+            dtype=cp.float32
+        )
 
     def set_epoch(self, epoch: int):
         self._epoch = int(epoch)
@@ -97,77 +166,116 @@ class ParquetStream(IterableDataset):
         return self.paths[info.id::info.num_workers]
 
     def __iter__(self):
-        rng = np.random.default_rng(
-            self.seed
-            + self._epoch
-            + (get_worker_info().id if get_worker_info() else 0))
-        bufX, bufy, bufw = [], [], []
+        info = get_worker_info()
+        worker_id = info.id if info is not None else 0
         emitted = 0
 
-        dataset = ds.dataset(self.paths, format="parquet")
-        fexpr = None
-        if (not self.predict_mode) and self.fold_col:
-            col = ds.field(self.fold_col)
-            if self.include_folds is not None:
-                fexpr = col.isin(sorted(self.include_folds))
-            if self.exclude_folds is not None:
-                ex = ~col.isin(sorted(self.exclude_folds))
-                fexpr = ex if fexpr is None else (fexpr & ex)
-
         for path in self._sharded_paths():
-            reader = dataset.scanner(
-                columns=self._columns,
-                batch_size=self.batch_rows,
-                filster=fexpr
-            ).to_reader()
-            for batch in reader:
-                tbl = batch.to_pandas()  # 速さ重視なら .to_numpy() 直取りでもOK
-                X = tbl[self.features].to_numpy(dtype=np.float32, copy=False)
-                y = tbl[self.target].to_numpy(dtype=np.float32, copy=False)
-                w = tbl[self.weight_col].to_numpy(dtype=np.float32, copy=False) if self.weight_col else None
+            pf = pq.ParquetFile(path)
+            seed = self.seed + self._epoch + worker_id
+            rg_order = cp.asnumpy(
+                cp.random.RandomState(seed).permutation(pf.num_row_groups)
+            )
 
-                # バッファに積む
-                bufX.append(X)
-                bufy.append(y)
-                if self.weight_col:
-                    bufw.append(w)
-                # バッファが大きくなり過ぎたら1つにまとめてシャッフル
-                if sum(len(a) for a in bufy) >= self.buffer_size:
-                    Xb = np.concatenate(bufX)
-                    yb = np.concatenate(bufy)
-                    wb = np.concatenate(bufw) if self.weight_col else None
+            carry_X = carry_y = carry_w = None
 
-                for i0 in range(0, len(yb), self.batch_size):
-                    i1 = min(i0 + self.batch_size, len(yb))
+            for rg in rg_order:
+                gdf = cudf.read_parquet(
+                    path,
+                    columns=self._columns,
+                    row_groups=[int(rg)]
+                )
+                if len(gdf) == 0:
+                    continue
+
+                # fold フィルタ（GPU）
+                if (not self.predict_mode) and self.fold_col and (self.fold_col in gdf.columns):
+                    if self.include_folds is not None:
+                        gdf = gdf[gdf[self.fold_col].isin(sorted(self.include_folds))]
+                    if self.exclude_folds is not None:
+                        gdf = gdf[~gdf[self.fold_col].isin(sorted(self.exclude_folds))]
+                    if len(gdf) == 0:
+                        continue
+
+                # GPU 内シャッフル
+                perm = cp.random.RandomState(seed).permutation(len(gdf))
+                gdf = gdf.take(cudf.Series(perm))
+
+                # CuPy へ（ゼロコピー）
+                X_cu = gdf[self.features].to_cupy()
+                y_cu = gdf[self.target].values if not self.predict_mode else None
+                w_cu = (
+                    gdf[self.weight_col].values
+                    if (self.weight_col and self.weight_col in gdf.columns)
+                    else None
+                )
+
+                # 標準化（GPU, in-place）
+                if self._norm_idxs.size > 0:
+                    ni = self._norm_idxs
+                    X_cu[:, ni] -= self._mean_cu
+                    X_cu[:, ni] /= (self._std_cu + 1e-8)
+
+                # 端数 carry を前段に連結（必要最小限）
+                if carry_X is not None:
+                    X_cu = cp.concatenate([carry_X, X_cu], axis=0)
+                    if y_cu is not None:
+                        y_cu = cp.concatenate([carry_y, y_cu], axis=0)
+                    if w_cu is not None:
+                        w_cu = cp.concatenate([carry_w, w_cu], axis=0)
+                    carry_X = carry_y = carry_w = None
+
+                m = X_cu.shape[0]
+                full = (m // self.batch_size) * self.batch_size
+
+                # バッチ生成
+                for i in range(0, full, self.batch_size):
+                    xb = X_cu[i:i+self.batch_size]
+                    if self.predict_mode:
+                        yield from_dlpack(xb.toDlpack())
+                    else:
+                        yb = y_cu[i:i+self.batch_size]
+                        if w_cu is not None:
+                            wb = w_cu[i:i+self.batch_size]
+                            yield (from_dlpack(xb.toDlpack()),
+                                   from_dlpack(yb.toDlpack()).float(),
+                                   from_dlpack(wb.toDlpack()).float())
+                        else:
+                            yield (from_dlpack(xb.toDlpack()),
+                                   from_dlpack(yb.toDlpack()).float())
+                    emitted += xb.shape[0]
                     if self.rows_per_epoch and emitted >= self.rows_per_epoch:
                         return
-                    xb = torch.from_numpy(Xb[i0:i1])                # (B, F)
-                    ybt = torch.from_numpy(yb[i0:i1]).float()       # (B,)
-                    if wb is None:
-                        yield xb, ybt
-                    else:
-                        yield xb, ybt, torch.from_numpy(wb[i0:i1]).float()
-                    emitted += (i1 - i0)
-                    bufX.clear()
-                    bufy.clear()
-                    bufw.clear()
-        # 余りを吐く
-        if bufy:
-            Xb = np.concatenate(bufX)
-            yb = np.concatenate(bufy)
-            wb = np.concatenate(bufw) if self.weight_col else None
 
-            for i0 in range(0, len(yb), self.batch_size):
-                i1 = min(i0 + self.batch_size, len(yb))
+                # 端数 carry
+                rem = m - full
+                if rem:
+                    carry_X = X_cu[full:]
+                    carry_y = y_cu[full:] if y_cu is not None else None
+                    carry_w = w_cu[full:] if w_cu is not None else None
+
+                # 後始末
+                del gdf, X_cu
+                if y_cu is not None:
+                    del y_cu
+                if w_cu is not None:
+                    del w_cu
+                gc.collect()
+
+            # 最後の端数
+            if carry_X is not None:
                 if self.rows_per_epoch and emitted >= self.rows_per_epoch:
                     return
-                xb = torch.from_numpy(Xb[i0:i1])                # (B, F)
-                ybt = torch.from_numpy(yb[i0:i1]).float()       # (B,)
-                if wb is None:
-                    yield xb, ybt
+                if self.predict_mode:
+                    yield from_dlpack(carry_X.toDlpack())
                 else:
-                    yield xb, ybt, torch.from_numpy(wb[i0:i1]).float()
-                emitted += (i1 - i0)
+                    if carry_w is not None:
+                        yield (from_dlpack(carry_X.toDlpack()),
+                               from_dlpack(carry_y.toDlpack()).float(),
+                               from_dlpack(carry_w.toDlpack()).float())
+                    else:
+                        yield (from_dlpack(carry_X.toDlpack()),
+                               from_dlpack(carry_y.toDlpack()).float())
 
 
 class SimpleMLP(nn.Module):
@@ -257,40 +365,49 @@ class SimpleMLP(nn.Module):
         return self.net(x).squeeze(-1)
 
 
+@dataclass
 class MLPCVTrainer:
     """
     MLPを使ったCVトレーナー。
 
     Attributes
     ----------
-    tr_df : pd.DataFrame
-        学習用データ
-    test_df : pd.DataFrame, default None
-        ラベルなしデータ
-    params : dict, default None
-        Parameters
-    n_splits : int, default 5
-        KFoldの分割数
+    data_id : int
+        ID for dataset version
+    train_paths : str or list[str]
+        Path(s) to training parquet files.
+    test_paths : str or list[str]
+        Path(s) to test parquet files.
+    features : Optional[list[str]], default None
+        name of column for training
+    target : str, default "target"
+        name of column for target.
     seed : int, default 42
         乱数シード
     """
+    data_id: int
+    train_paths: str | list[str]
+    test_paths: str | list[str] | None = None
 
-    def __init__(
-        self,
-        tr_df,
-        test_df=None,
-        params=None,
-        n_splits=5,
-        seed=42
-    ):
-        self.params = params or {}
-        self.n_splits = n_splits
-        self.seed = seed
-        self.fold_models = []
-        self.fold_scores = []
-        self.oof_score = None
+    features: Optional[list[str]] = None
 
-        self.default_params = {
+    target: str = "target"
+    fold_col: Optional[str] = None
+    weight_col: Optional[str] = None
+    cat_cols: Optional[list[str]] = None
+
+    params: dict = field(default_factory=dict)
+
+    n_fold: int = 5
+    seed: int = 42
+    gpu: bool = True
+
+    opts: dict = field(init=True, default_factory=dict)
+
+    def __post_init__(self):
+        self.feature_dir = Path(self.feature_dir)
+
+        default_params = {
             "lr": 1e-3,
             "batch_size": 256,
             "dropout_rate": 0.2,
@@ -318,7 +435,7 @@ class MLPCVTrainer:
             "Sigmoid": nn.Sigmoid,
         }
 
-        self.params = {**self.default_params, **self.params}
+        self.params = {**default_params, **self.params}
 
         self.params["activation"] = ACTIVATION_MAPPING[self.params["activation"]]
 
@@ -333,37 +450,57 @@ class MLPCVTrainer:
 
         self.params["hidden_dims"] = hidden_dims
 
-        if "weight" in tr_df.columns:
-            self.weights = tr_df["weight"].to_numpy(dtype=np.float32)
-            tr_df = tr_df.drop("weight", axis=1)
+        hdr = pl.read_parquet(self.train_paths, n_rows=0)
+        all_cols = hdr.columns
+
+        if self.fold_col is None:
+            self.fold_col = f"{self.n_fold}fold-s{self.seed}"
+
+        if self.cat_cols is None:
+            self.cat_cols = [
+                c for c, dt in zip(hdr.columns, hdr.dtypes)
+                if dt == pl.Categorical
+            ]
+
+        if self.fold_col not in all_cols:
+            raise ValueError(f"fold_col not found in dataset: {self.fold_col}")
         else:
-            self.weights = np.ones(len(tr_df), dtype=np.float32)
+            print(f"Fold Col: {self.fold_col}")
 
-        self.cat_cols = tr_df.select_dtypes(
-            include=["object", "category"]).columns.tolist()
-        self.num_cols = [col for col in tr_df.columns
-                         if col not in self.cat_cols + ["target"]]
+        if self.features is None:
+            meta = {"row_id"}
+            if self.target in all_cols:
+                meta.add(self.target)
+            if self.weight_col in all_cols:
+                meta.add(self.weight_col)
+            if self.fold_col:
+                meta.add(self.fold_col)
 
-        self.cat_idxs = [tr_df.columns.get_loc(col) for col in self.cat_cols]
-        self.num_idxs = [tr_df.columns.get_loc(col) for col in self.num_cols]
-        self.cat_dims = [tr_df[col].nunique() for col in self.cat_cols]
+            self.features = [
+                c for c in all_cols
+                if c not in meta and "fold" not in c
+            ]
 
-        self.X = tr_df.drop("target", axis=1).to_numpy(dtype=np.float32)
-        self.y = tr_df["target"].to_numpy(dtype=np.float32)
+        self.num_cols = [
+            col for col in self.features
+            if col not in self.cat_cols
+        ]
 
-        if test_df is not None:
-            self.test = test_df.to_numpy(dtype=np.float32)
-        else:
-            self.test = None
+        self.cat_idxs = [self.features.index(c) for c in self.cat_cols]
+        self.num_idxs = [self.features.index(c) for c in self.num_cols]
 
-        skf = StratifiedKFold(
-            n_splits=n_splits, shuffle=True, random_state=self.seed
-        )
-        self.fold_indices = list(skf.split(self.X, self.y))
+        scan = pl.scan_parquet(self.train_paths, columns=self.cat_cols)
+        exprs = [pl.col(c).n_unique().alias(c) for c in self.cat_cols]
+        df1 = scan.select(exprs).collect()
+        self.cat_dims = list(df1.row(0))
 
         torch.cuda.manual_seed(self.seed)
 
-    def fit(self):
+    def fit(
+        self,
+        extra_exclude_cols=None,
+        loggers: list[CVLogger] | None = None
+    ):
         """
         CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
 
@@ -375,54 +512,128 @@ class MLPCVTrainer:
             test_dfに対する予測配列
         """
         if self.test is None:
-            raise ValueError("test_df not provided for MLPCVTrainer.")
+            raise ValueError("Please provide test_paths (got None).")
 
-        oof_preds = np.zeros(len(self.X))
-        test_preds = np.zeros(len(self.test))
+        t_total_start = now()
+
+        loggers = loggers or [NoOpLogger()]
+        meta = {
+            "data_id": self.data_id,
+            "seed": self.seed,
+            "n_fold": self.n_fold,
+            "batch_rows": self.batch_rows,
+            **self.params
+        }
+        for lg in loggers:
+            lg.on_start(meta)
+
+        train_rows = pq.ParquetFile(self.train_path).metadata.num_rows
+        test_rows = pq.ParquetFile(self.test_path).metadata.num_rows
+
+        oof = np.zeros(train_rows, dtype=np.float32)
+        test_pred = np.zeros(test_rows, dtype=np.float32)
 
         epoch_list = []
+        fold_scores = []
 
-        for fold, (tr_idx, val_idx) in enumerate(self.fold_indices):
-            print(f"\nFold {fold + 1}")
-            start = time.time()
+        for i in range(self.n_fold):
+            print("=" * 22)
+            print(f"===== Fold {i + 1} / {self.n_fold} =====")
+            print("=" * 22)
+            print(f"Avail Mem: {round(win_avail_gb(), 2)} GB")
 
-            X_tr, y_tr, w_tr = (
-                self.X[tr_idx],
-                self.y[tr_idx],
-                self.weights[tr_idx])
-            X_val, y_val = (
-                self.X[val_idx],
-                self.y[val_idx])
+            t_fold_start = now()
 
-            # Dataloaders
-            train_dataset = TensorDataset(
-                torch.tensor(X_tr),
-                torch.tensor(y_tr),
-                torch.tensor(w_tr)
+            mean, std = compute_feature_stats(
+                self.train_patahs,
+                self.features,
+                self.num_cols,
+                self.fold_col,
+                exclude_folds=i
             )
-            val_dataset = TensorDataset(
-                torch.tensor(X_val),
-                torch.tensor(y_val)
+
+            train_ds = ParquetStream(
+                self.train_paths,
+                self.features,
+                self.target,
+                mean,
+                std,
+                self.fold_col,
+                exclude_folds=i,
+                weight_col=self.weight_col,
+                batch_seize=self.batch_size,
+                buffer_size=self.buffer_size,
+                extra_exclude=extra_exclude_cols,
+                predict_mode=False,
+                seed=self.seed
             )
-            test_dataset = TensorDataset(
-                torch.tensor(self.test).float()
+            valid_ds = ParquetStream(
+                self.train_paths,
+                self.features,
+                self.target,
+                mean,
+                std,
+                self.cat_cols,
+                self.fold_col,
+                include_folds=i,
+                batch_seize=self.batch_size,
+                buffer_size=self.buffer_size,
+                extra_exclude=extra_exclude_cols,
+                predict_mode=False,
+                seed=self.seed
+            )
+            test_ds = ParquetStream(
+                self.train_paths,
+                self.features,
+                self.target,
+                mean,
+                std,
+                self.cat_cols,
+                batch_seize=self.batch_size,
+                buffer_size=self.buffer_size,
+                extra_exclude=extra_exclude_cols,
+                predict_mode=True,
+                seed=self.seed,
             )
 
             train_loader = DataLoader(
-                train_dataset,
-                batch_size=self.params["batch_size"],
-                shuffle=True
+                train_ds,
+                batch_size=None,
+                shuffle=False
             )
             val_loader = DataLoader(
-                val_dataset,
-                batch_size=self.params["batch_size"],
+                valid_ds,
+                batch_size=None,
                 shuffle=False
             )
             test_loader = DataLoader(
-                test_dataset,
-                batch_size=self.params["batch_size"],
+                test_ds,
+                batch_size=None,
                 shuffle=False
             )
+
+            lf = pl.scan_parquet(
+                self.train_paths, columns=["row_id", self.target]
+            )
+            y_val = (
+                lf.filter(pl.col(self.fold_col) == i)
+                .select(self.target)
+                .collect(streaming=True)
+                .to_series()
+                .to_numpy()
+                .astype("float32")
+                    )
+
+            val_idx = (
+                lf.filter(pl.col(self.fold_col) == i)
+                  .select("row_id")
+                  .collect(engine="streaming")
+                  .to_series()
+                  .to_numpy()
+                  .astype(np.int32, copy=False)
+            )
+
+            evals_result = {}
 
             model = SimpleMLP(
                 input_dim=self.X.shape[1],
@@ -433,13 +644,13 @@ class MLPCVTrainer:
                 cat_idxs=self.cat_idxs,
                 cat_dims=self.cat_dims
             ).to(self.params["device"])
+
             optimizer = torch.optim.Adam(model.parameters(), lr=self.params["lr"])
             scheduler = CosineAnnealingLR(
                 optimizer,
                 T_max=self.params["t_max"],
                 eta_min=self.params["eta_min"]
             )
-            criterion = nn.BCEWithLogitsLoss()
 
             best_log_loss = float("inf")
             best_model_state = None
@@ -447,14 +658,23 @@ class MLPCVTrainer:
 
             for epoch in range(self.params["max_epochs"]):
                 model.train()
-                for xb, yb, wb in train_loader:
-                    xb = xb.to(self.params["device"])
-                    yb = yb.to(self.params["device"])
-                    wb = wb.to(self.params["device"])
+                for batch in train_loader:
+                    if len(batch) == 3:
+                        xb, yb, wb = batch
+                    else:
+                        xb, yb = batch
+                        wb = None
 
                     preds = model(xb)
-                    loss = criterion(preds, yb)
-                    loss = (loss * wb).mean()
+
+                    if wb is None:
+                        loss = F.binary_cross_entropy_with_logits(
+                            preds, yb, reduction="mean"
+                        )
+                    else:
+                        loss = F.binary_cross_entropy_with_logits(
+                            preds, yb, weight=wb, reduction="mean"
+                        )
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
@@ -464,7 +684,6 @@ class MLPCVTrainer:
                 preds = []
                 with torch.no_grad():
                     for xb, yb in val_loader:
-                        xb = xb.to(self.params["device"])
                         pred_logits = model(xb)
                         pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
                         preds.append(pred_probs)
@@ -494,6 +713,9 @@ class MLPCVTrainer:
                         f"Val Logloss = {val_log_loss:.5f}"
                     )
 
+                train_logloss_list.append(train_log_loss)
+                evals_logloss_list.append(val_log_loss)
+
                 if val_log_loss < best_log_loss:
                     best_log_loss = val_log_loss
                     best_model_state = {
@@ -505,8 +727,8 @@ class MLPCVTrainer:
                         f"New best model saved at epoch {epoch+1}, "
                         f"Logloss: {val_log_loss:.5f}")
                 elif (
-                    (epoch - best_epoch >= self.params["early_stopping_rounds"]) and
-                    (epoch + 1 >= self.params["min_epochs"])
+                    (epoch - best_epoch >= self.params["early_stopping_rounds"])
+                    and (epoch + 1 >= self.params["min_epochs"])
                 ):
                     print(f"Early stopping at epoch {epoch+1}")
                     print(f"Loading best model from epoch {best_epoch} "
@@ -517,7 +739,7 @@ class MLPCVTrainer:
                 {k: v.to(self.params["device"]) for k, v in best_model_state.items()}
             )
 
-            self.fold_scores.append(best_log_loss)
+            fold_scores.append(best_log_loss)
 
             epoch_list.append(best_epoch)
 
@@ -529,7 +751,7 @@ class MLPCVTrainer:
                     val_logits = model(xb)
                     val_probs = torch.sigmoid(val_logits).cpu().numpy()
                     val_preds.append(val_probs)
-            oof_preds[val_idx] = np.concatenate(val_preds).ravel()
+            oof[val_idx] = np.concatenate(val_preds).ravel()
 
             with torch.no_grad():
                 fold_test_preds = []
@@ -538,25 +760,28 @@ class MLPCVTrainer:
                     test_logits = model(xb)
                     test_probs = torch.sigmoid(test_logits).cpu().numpy()
                     fold_test_preds.append(test_probs)
-                test_preds += np.concatenate(fold_test_preds).ravel()
+                test_pred += np.concatenate(fold_test_preds).ravel()
 
             end = time.time()
             print(f"Best Logloss: {best_log_loss:.5f}")
             print_duration(start, end)
 
-        self.oof_score = roc_auc_score(self.y, oof_preds)
+            evals_result["train"] = {"logloss": logloss_list, "eta": eta_list}
+            evals_result["eval"] = {"logloss": logloss_list, "eta": eta_list}
+
+        self.oof_score = roc_auc_score(self.y, oof)
         print("\n=== CV Results ===")
-        print(f"Fold scores: {self.fold_scores}")
+        print(f"Fold scores: {fold_scores}")
         print(
-            f"Mean: {np.mean(self.fold_scores):.5f}, "
-            f"Std: {np.std(self.fold_scores):.5f}"
+            f"Mean: {np.mean(fold_scores):.5f}, "
+            f"Std: {np.std(fold_scores):.5f}"
         )
         print(f"OOF score: {self.oof_score:.5f}")
         print(f"Avg best epoch: {np.mean(epoch_list)}")
         print(f"Best epochs: \n{epoch_list}")
 
-        test_preds /= self.n_splits
-        return oof_preds, test_preds
+        test_pred /= self.n_splits
+        return oof, test_pred
 
     def fit_one_fold(self, fold=0):
         """

@@ -1,6 +1,5 @@
 import os
 import json
-from typing import Optional
 
 import wandb
 from optuna.exceptions import TrialPruned
@@ -8,16 +7,14 @@ from optuna.exceptions import TrialPruned
 from src.models.xgb.xgb_cv_trainer import XGBCVTrainer
 from src.utils.snapshot_study import snapshot_study
 from src.utils.telegram import send_message
-from src.utils.logging import WandbLogger
+from src.utils.loggers import WandbLogger
 
 
 def create_objective(
     data_id: int,
-    feature_dir: str,
     seed: int = 42,
     n_fold: int = 5,
     fold_idx: int = 0,
-    batch_rows: int = 1_000_000,
     wandb_project: str = "project",
     study_name: str = "study-xgb",
     **opts
@@ -87,28 +84,33 @@ def create_objective(
 
             early_stopping_rounds = opts.pop("early_stopping_rounds", None)
 
+            with open(f"../../artifacts/features/{data_id}/meta.json")as f:
+                m = json.load(f)
+
+            train_paths = m["train_paths"]
+            level = m["level"]
+
             run = wandb.init(
                 project=wandb_project,
                 group=study_name,
                 name=f"trl{trial.number}",
+                job_type="optuna-search",
                 config={
                     "data_id": data_id,
                     "n_fold": n_fold,
-                    "batch_rows": batch_rows,
                     "early_stopping_rounds": early_stopping_rounds,
                     **params
                 },
-                tags=["xgb", "optuna"],
+                tags=["xgb", level],
                 reinit=True,
             )
 
             trainer = XGBCVTrainer(
                 data_id,
-                feature_dir,
+                train_paths,
                 n_fold=n_fold,
                 params=params,
                 seed=seed,
-                batch_rows=batch_rows,
                 opts=opts
             )
 
@@ -117,16 +119,17 @@ def create_objective(
                 loggers=[WandbLogger(run=run)]
             )
 
-            os.makedirs(f"../artifacts/params/{study_name}", exist_ok=True)
-            path = f"../artifacts/params/{study_name}/trl{trial.number}.json"
+            os.makedirs(f"../../artifacts/params/{study_name}", exist_ok=True)
+            path = f"../../artifacts/params/{study_name}/trl{trial.number}.json"
             manifest = {
                 "params": params,
                 "n_fold": n_fold,
                 "seed": seed,
-                "batch_rows": batch_rows,
+                "fold_idx": fold_idx,
                 "wandb_id": run.id,
                 "wandb_url": run.url,
-                "opts": opts
+                "opts": opts,
+                "score": score
             }
             with open(path, "w") as f:
                 json.dump(manifest, f, indent=4)

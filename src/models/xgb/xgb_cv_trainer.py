@@ -3,24 +3,23 @@ import gc
 import os
 import math
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional
-from pathlib import Path
+from typing import Any, Iterable, Optional, List
 from time import perf_counter as now
 
 import cudf
+import rmm
 import cupy as cp
 import numpy as np
 import polars as pl
-import pyarrow as pa
-import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+import rmm.mr as mr
+from rmm.allocators.cupy import rmm_cupy_allocator
 import xgboost as xgb
 from sklearn.metrics import roc_auc_score
 
-from src.utils.get_cat_cols import get_cat_cols
-from src.utils.logging import CVResult, CVLogger, NoOpLogger
+from src.utils.loggers import CVResult, CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
-from src.utils.win_avail_gb import win_avail_gb
+from src.utils.mem_info import free_ram_gib, free_vram_gib
 
 try:
     import cudf
@@ -29,11 +28,17 @@ try:
 except Exception:
     _HAS_CUDF = False
 
+rmm.reinitialize(
+    pool_allocator=True,          # プール有効
+    initial_pool_size=None,       # 必要なら"8GB"等に固定
+    managed_memory=False          # Unified/Managed Memoryを無効
+)
+
 
 @dataclass(eq=False)
 class ParquetIter(xgb.core.DataIter):
     # === 引数（元 __init__ のシグネチャ） ===
-    paths: list[str] | str | os.PathLike
+    paths: list[str]
 
     features: list[str] = None
     target: str = "target"
@@ -44,28 +49,24 @@ class ParquetIter(xgb.core.DataIter):
     weight_col: Optional[str] = None
     extra_exclude_cols: Optional[Iterable[str]] = None
 
-    batch_rows: int = 200_000
-    use_cudf: Optional[bool] = None
+    rowgroup_batch: int = 1
+    gpu: Optional[bool] = None
     predict_mode: bool = False
-    keep_row_ids: bool = True
 
     # === 内部状態（initの引数にしないもの） ===
     _temporary_data: Any = field(init=False, default=None, repr=False)
-    _row_id_chunks: list[Any] = field(init=False, default_factory=list, repr=False)
     _pass_count: int = field(init=False, default=0, repr=False)
+
+    _files: List[dict] = field(init=False, default_factory=list, repr=False)
+    _file_idx: int = field(init=False, default=0, repr=False)
+    _rg_idx: int = field(init=False, default=0, repr=False)
+    _columns: List[str] = field(init=False, default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         # 親の DataIter 初期化はここで
         super().__init__()
 
-        # paths を正規化（文字列/PathLike -> list[str]）
-        if isinstance(self.paths, (str, os.PathLike)):
-            self.paths = [str(self.paths)]
-        else:
-            self.paths = [str(p) for p in self.paths]
-
         # 型・既定値の正規化
-        self.batch_rows = int(self.batch_rows)
         self.cat_cols = list(self.cat_cols or [])
         self.include_folds = (
             None
@@ -77,18 +78,17 @@ class ParquetIter(xgb.core.DataIter):
             if self.exclude_folds is None
             else set(self.exclude_folds)
         )
-        self.use_cudf = (
+        self.gpu = (
             _HAS_CUDF
-            if self.use_cudf is None
-            else bool(self.use_cudf)
+            if self.gpu is None
+            else bool(self.gpu)
         )
         self.predict_mode = bool(self.predict_mode)
-        self.keep_row_ids = bool(self.keep_row_ids)
+        self.rowgroup_batch = int(self.rowgroup_batch)
 
         # --- extra exclude colsを除外 ---
-        schema = ds.dataset(self.paths, format="parquet").schema
-        all_cols = [f.name for f in schema]
-
+        hdr = pl.read_parquet(self.paths, n_rows=0)
+        all_cols = hdr.columns
         if self.extra_exclude_cols:
             excl = (
                 {self.extra_exclude_cols}
@@ -105,91 +105,79 @@ class ParquetIter(xgb.core.DataIter):
             cols.append(self.weight_col)
         if (not self.predict_mode) and (self.fold_col in all_cols):
             cols.append(self.fold_col)
-        cols.append("row_id")
         self._columns = list(dict.fromkeys(cols))
 
         # 内部状態
         self._reader = None
         self._current_file_index = 0
 
-    # row_id を取り出すためのヘルパ
-    def collected_row_ids(self):
-        if not self._row_id_chunks:
-            return None
-        return np.concatenate(self._row_id_chunks).flatten()
+        # 各ファイルの row group 数を先に調べておく
+        self._files = []
+        for p in self.paths:
+            pf = pq.ParquetFile(p)
+            self._files.append({"path": p, "nrg": pf.num_row_groups})
+
+        self._file_idx = 0
+        self._rg_idx = 0
 
     def reset(self):
-        self._current_file_index = 0
-        self._reader = None
+        self._file_idx = 0
+        self._rg_idx = 0
         self._pass_count += 1
 
     def next(self, input_data):
+        """
+        1 回呼ばれるごとに row group の束 (rowgroup_batch) を 1 塊だけ返す。
+        """
         while True:
-            if self._reader is None:
-                if not self._prepare_next_file():
-                    return 0
-            try:
-                batch = next(self._reader)
-            except StopIteration:
-                self._reader = None
+            if self._file_idx >= len(self._files):
+                return 0  # 終了
+
+            rec = self._files[self._file_idx]
+            path, nrg = rec["path"], rec["nrg"]
+
+            if self._rg_idx >= nrg:
+                # 次のファイルへ
+                self._file_idx += 1
+                self._rg_idx = 0
                 continue
 
-            if self.use_cudf:
-                # RecordBatch -> Table -> cuDF
-                if isinstance(batch, pa.RecordBatch):
-                    batch = pa.Table.from_batches([batch])
-                df = cudf.DataFrame.from_arrow(batch)
-            else:
-                df = batch.to_pandas()
+            # このバッチで読む row groups
+            start = self._rg_idx
+            end = min(self._rg_idx + self.rowgroup_batch, nrg)
+            bundle = list(range(start, end))
+            self._rg_idx = end  # 次に備える
 
+            # === ここがコア：cuDF で row group を直接読む ===
+            # ※ cudf.read_parquet は単一ファイル向け。複数パスは「ループで回す」方針。
+            gdf = cudf.read_parquet(path, columns=self._columns, row_groups=bundle)
+
+            # fold フィルタは読み込み後に cuDF 側で適用
+            if (not self.predict_mode) and self.fold_col and (self.fold_col in gdf.columns):
+                if self.include_folds is not None:
+                    gdf = gdf[gdf[self.fold_col].isin(sorted(self.include_folds))]
+                if self.exclude_folds is not None:
+                    gdf = gdf[~gdf[self.fold_col].isin(sorted(self.exclude_folds))]
+
+            # カテゴリ化（必要な列のみ）
             if self.cat_cols:
                 for c in self.cat_cols:
-                    if c in df.columns:
-                        df[c] = df[c].astype("category")
+                    if c in gdf.columns:
+                        gdf[c] = gdf[c].astype("category")
 
-            if (
-                self.keep_row_ids
-                and self._pass_count == 1
-                and "row_id" in df.columns
-            ):
-                self._row_id_chunks.append(df["row_id"].to_numpy())
-
+            # 出力
             if self.predict_mode:
-                input_data(data=df[self.features])
+                input_data(data=gdf[self.features])
             else:
-                # 学習/評価: data, label, (任意で weight)
-                kwargs = dict(data=df[self.features], label=df[self.target])
-                if self.weight_col and self.weight_col in df.columns:
-                    kwargs["weight"] = df[self.weight_col]
+                kwargs = dict(data=gdf[self.features], label=gdf[self.target])
+                if self.weight_col and self.weight_col in gdf.columns:
+                    kwargs["weight"] = gdf[self.weight_col]
                 input_data(**kwargs)
 
-            del batch, df
+            # 後始末（参照を断つ→GC）
+            del gdf
+            gc.collect()
             return 1
-
-    def _prepare_next_file(self):
-        while self._current_file_index < len(self.paths):
-            path = self.paths[self._current_file_index]
-            self._current_file_index += 1
-            dataset = ds.dataset(path, format="parquet")
-
-            # fold フィルタ（predict_mode では原則無視）
-            fexpr = None
-            if (not self.predict_mode) and self.fold_col:
-                col = ds.field(self.fold_col)
-                if self.include_folds is not None:
-                    fexpr = col.isin(sorted(self.include_folds))
-                if self.exclude_folds is not None:
-                    ex = ~col.isin(sorted(self.exclude_folds))
-                    fexpr = ex if fexpr is None else (fexpr & ex)
-
-            self._reader = dataset.scanner(
-                columns=self._columns,
-                batch_size=self.batch_rows,
-                filter=fexpr,
-            ).to_reader()
-            return True
-        self._reader = None
-        return False
 
 
 @dataclass
@@ -211,7 +199,8 @@ class XGBCVTrainer:
         乱数シード。
     """
     data_id: int
-    feature_dir: str
+    train_paths: str | list[str]
+    test_paths: str | list[str] | None = None
 
     features: Optional[list[str]] = None
 
@@ -224,15 +213,23 @@ class XGBCVTrainer:
 
     n_fold: int = 5
     seed: int = 42
-    batch_rows: int = 1_000_000
-    use_cudf: bool = True
+    gpu: bool = True
 
     opts: dict = field(init=True, default_factory=dict)
 
     _fi_fold_frames: list = field(init=False, default_factory=list, repr=False)
 
     def __post_init__(self):
-        self.feature_dir = Path(self.feature_dir)
+        if isinstance(self.train_paths, (str, os.PathLike)):
+            self.train_paths = [str(self.train_paths)]
+        else:
+            self.train_paths = [str(p) for p in self.train_paths]
+
+        if self.test_paths:
+            if isinstance(self.test_paths, (str, os.PathLike)):
+                self.test_paths = [str(self.test_paths)]
+            else:
+                self.test_paths = [str(p) for p in self.test_paths]
 
         default_params = {
             "objective": "binary:logistic",
@@ -274,17 +271,17 @@ class XGBCVTrainer:
         # train() の引数として取り出す
         self.params = merged
 
-        self.train_path = self.feature_dir / "tr_df.parquet"
-        self.test_path = self.feature_dir / "test_df.parquet"
-
-        schema = ds.dataset(self.train_path, format="parquet").schema
-        all_cols = [f.name for f in schema]
+        hdr = pl.read_parquet(self.train_paths, n_rows=0)
+        all_cols = hdr.columns
 
         if self.fold_col is None:
             self.fold_col = f"{self.n_fold}fold-s{self.seed}"
 
         if self.cat_cols is None:
-            self.cat_cols = get_cat_cols(self.train_path)
+            self.cat_cols = [
+                c for c, dt in zip(hdr.columns, hdr.dtypes)
+                if dt == pl.Categorical
+            ]
 
         if self.fold_col not in all_cols:
             raise ValueError(f"fold_col not found in dataset: {self.fold_col}")
@@ -299,11 +296,27 @@ class XGBCVTrainer:
                 meta.add(self.weight_col)
             if self.fold_col:
                 meta.add(self.fold_col)
-            self.features = [c for c in all_cols if c not in meta]
+
+            self.features = [
+                c for c in all_cols
+                if c not in meta and "fold" not in c
+            ]
+
+            dev_mr = mr.CudaAsyncMemoryResource()
+            mr.set_current_device_resource(dev_mr)
+            rmm.reinitialize(
+                managed_memory=False,
+                initial_pool_size=None,
+            )
+            cp.cuda.set_allocator(rmm_cupy_allocator)
+
+            cp.get_default_memory_pool().set_limit(4 * 1024**3)
+            self.pmp = cp.cuda.PinnedMemoryPool()
+            cp.cuda.set_pinned_memory_allocator(self.pmp.malloc)
 
     def fit(
         self,
-        extra_exclue_cols=None,
+        extra_exclude_cols=None,
         loggers: list[CVLogger] | None = None
     ):
         """
@@ -316,6 +329,9 @@ class XGBCVTrainer:
         test_pred : ndarray
             test_dfに対する予測配列
         """
+        if self.test_paths is None:
+            raise ValueError("Please provide test_paths (got None).")
+
         t_total_start = now()
 
         loggers = loggers or [NoOpLogger()]
@@ -324,14 +340,23 @@ class XGBCVTrainer:
             "seed": self.seed,
             "n_fold": self.n_fold,
             "early_stopping_rounds": self.early_stopping_rounds,
-            "batch_rows": self.batch_rows,
             **self.params
         }
         for lg in loggers:
             lg.on_start(meta)
 
-        train_rows = pq.ParquetFile(self.train_path).metadata.num_rows
-        test_rows = pq.ParquetFile(self.test_path).metadata.num_rows
+        train_rows = (
+            pl.scan_parquet(self.train_paths)
+              .select(pl.len())
+              .collect()
+              .item()
+        )
+        test_rows = (
+            pl.scan_parquet(self.test_paths)
+              .select(pl.len())
+              .collect()
+              .item()
+        )
 
         oof = np.zeros(train_rows, dtype=np.float32)
         test_pred = np.zeros(test_rows, dtype=np.float32)
@@ -343,43 +368,42 @@ class XGBCVTrainer:
             print("=" * 22)
             print(f"===== Fold {i + 1} / {self.n_fold} =====")
             print("=" * 22)
-            print(f"Avail Mem: {round(win_avail_gb(), 2)} GB")
+            print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+            print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
             t_fold_start = now()
             t_qdm_start = now()
 
             train_it = ParquetIter(
-                paths=self.train_path,
+                paths=self.train_paths,
                 features=self.features,
                 target=self.target,
                 cat_cols=self.cat_cols,
                 fold_col=self.fold_col,
                 exclude_folds=[i],
-                batch_rows=self.batch_rows,
-                use_cudf=True,
-                keep_row_ids=False,
+                weight_col=self.weight_col,
+                extra_exclude_cols=extra_exclude_cols,
+                gpu=True
             )
             valid_it = ParquetIter(
-                paths=self.train_path,
+                paths=self.train_paths,
                 features=self.features,
                 target=self.target,
                 cat_cols=self.cat_cols,
                 fold_col=self.fold_col,
                 include_folds=[i],
-                batch_rows=self.batch_rows,
-                use_cudf=self.use_cudf,
-                keep_row_ids=True,
+                weight_col=self.weight_col,
+                extra_exclude_cols=extra_exclude_cols,
+                gpu=self.gpu
             )
             test_it = ParquetIter(
-                paths=self.test_path,
+                paths=self.test_paths,
                 features=self.features,
                 target=self.target,
                 cat_cols=self.cat_cols,
-                fold_col=None,
-                batch_rows=self.batch_rows,
+                extra_exclude_cols=extra_exclude_cols,
                 predict_mode=True,
-                use_cudf=self.use_cudf,
-                keep_row_ids=False,
+                gpu=self.gpu
             )
 
             dtrain = xgb.QuantileDMatrix(
@@ -397,7 +421,16 @@ class XGBCVTrainer:
                 ref=dtrain
             )
 
-            val_idx = valid_it.collected_row_ids()
+            val_idx = (
+                pl.scan_parquet(self.train_paths)
+                  .select(["row_id", self.fold_col])
+                  .filter(pl.col(self.fold_col) == i)
+                  .select("row_id")
+                  .collect()
+                  .get_column("row_id")
+                  .to_numpy()
+                  .astype(np.int32, copy=False)
+            )
 
             evals_result = {}
 
@@ -428,7 +461,7 @@ class XGBCVTrainer:
 
             print_duration(t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time")
             print_duration(t_fit_start, t_fit_end)
-            print_duration(t_fold_start, t_fold_end, f"Fold {i} Runtime")
+            runtime = print_duration(t_fold_start, t_fold_end, f"Fold {i} Runtime")
 
             best_iteration = model.best_iteration
             train_score = evals_result["train"]["auc"][best_iteration]
@@ -450,40 +483,45 @@ class XGBCVTrainer:
                     ],
                 }
             )
+            fold_summary = {
+                "auc": eval_score,
+                "best_iter": best_iteration,
+                "runtime": runtime
+            }
 
             self._fi_fold_frames.append(df)
             for lg in loggers:
                 lg.on_fold_end(
                     i,
-                    eval_score,
+                    "iter",
                     evals_result,
-                    best_iteration
+                    summary=fold_summary
                 )
 
-            del train_it, valid_it, test_it, dtrain, dvalid, dtest, model
+            del train_it, valid_it, test_it, dtrain, dvalid, dtest, model, val_idx
             gc.collect()
             cp.get_default_memory_pool().free_all_blocks()
+            self.pmp.free_all_blocks()
 
         print("=" * 32)
         print("========== CV Results ==========")
         print("=" * 32)
-        print(
-            "Fold scores: [" + ", ".join(f"{x:.5f}" for x in fold_scores) + "]"
+        y = (
+            pl.read_parquet(self.train_paths, columns=self.target)
+              .get_column(self.target)
+              .cast(pl.Float32)
+              .to_numpy()
         )
+
+        oof_score = roc_auc_score(y, oof)
+        print(f"OOF score: {oof_score:.5f}")
         mean = np.mean(fold_scores)
         std = np.std(fold_scores)
         print(
             f"Mean: {mean:.5f}, "
             f"Std: {std:.5f}"
         )
-        dataset = ds.dataset(self.train_path, format="parquet")
-        table = dataset.scanner(columns=[self.target]).to_table()
-        y = table[self.target].combine_chunks().to_numpy().astype(np.float32, copy=False)
-
-        oof_score = roc_auc_score(y, oof)
-        print(f"OOF score: {oof_score:.5f}")
         print(f"Avg best iteration: {np.mean(iteration_list)}")
-        print(f"Best iterations: \n{iteration_list}")
 
         test_pred /= self.n_fold
 
@@ -496,25 +534,34 @@ class XGBCVTrainer:
             ])
         ).sort("mean_ratio", descending=True)
 
+        t_total_end = now()
+        total_runtime = print_duration(t_total_start, t_total_end, "Total CV Runtime")
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
+
         result = CVResult(
             oof,
             test_pred,
-            oof_score,
-            mean,
-            std,
-            iteration_list,
             fi_mean
         )
-        for lg in loggers:
-            lg.on_end(result)
+        overall_summary = {
+            "auc_oof": oof_score,
+            "auc_std": mean,
+            "auc_mean": std,
+            "iter_mean": np.mean(iteration_list),
+            "total_runtime": total_runtime
+        }
 
-        t_total_end = now()
-        print_duration(t_total_start, t_total_end, "Total CV Runtime")
-        print(f"Avail Mem: {round(win_avail_gb(), 2)} GB")
+        for lg in loggers:
+            lg.on_end(overall_summary)
 
         return result
 
-    def full_train(self):
+    def full_train(
+        self,
+        extra_exclude_cols=None,
+        loggers: list[CVLogger] | None = None
+    ):
         """
         訓練データ全体でモデルを学習し、test_dfに対する予測結果をnpy形式で返す
 
@@ -540,26 +587,25 @@ class XGBCVTrainer:
         t_qdm_start = now()
 
         train_it = ParquetIter(
-            paths=self.train_path,
+            paths=self.train_paths,
             features=self.features,
             target=self.target,
             cat_cols=self.cat_cols,
             fold_col=self.fold_col,
-            batch_rows=self.batch_rows,
-            use_cudf=self.use_cudf,
-            keep_row_ids=True,
+            weight_col=self.weight_col,
+            extra_exclude_cols=extra_exclude_cols,
+            gpu=self.gpu
         )
 
         test_it = ParquetIter(
-            paths=self.test_path,
+            paths=self.test_paths,
             features=self.features,
             target=self.target,
             cat_cols=self.cat_cols,
-            fold_col=None,
-            batch_rows=self.batch_rows,
+            weight_col=self.weight_col,
+            extra_exclude_cols=extra_exclude_cols,
             predict_mode=True,
-            use_cudf=self.use_cudf,
-            keep_row_ids=False,
+            gpu=self.gpu
         )
 
         dtrain = xgb.QuantileDMatrix(train_it, enable_categorical=True)
@@ -585,7 +631,12 @@ class XGBCVTrainer:
 
         return test_pred
 
-    def fit_one_fold(self, fold_idx=0, loggers=None):
+    def fit_one_fold(
+        self,
+        fold_idx=0,
+        extra_exclude_cols=None,
+        loggers=None
+    ):
         """
         指定した1つのfoldのみを用いてモデルを学習する。
         主にOptunaによるハイパーパラメータ探索時に使用。
@@ -601,7 +652,8 @@ class XGBCVTrainer:
             Score
         """
         t_total_start = now()
-        print(f"Avail Mem: {round(win_avail_gb(), 2)} GB")
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
         loggers = loggers or [NoOpLogger()]
         meta = {
@@ -609,7 +661,6 @@ class XGBCVTrainer:
             "seed": self.seed,
             "n_fold": self.n_fold,
             "early_stopping_rounds": self.early_stopping_rounds,
-            "batch_rows": self.batch_rows,
             **self.params
         }
         for lg in loggers:
@@ -620,26 +671,26 @@ class XGBCVTrainer:
         t_qdm_start = now()
 
         train_it = ParquetIter(
-            paths=self.train_path,
+            paths=self.train_paths,
             features=self.features,
             target=self.target,
             cat_cols=self.cat_cols,
             fold_col=self.fold_col,
             exclude_folds=[fold_idx],
-            batch_rows=self.batch_rows,
-            use_cudf=self.use_cudf,
-            keep_row_ids=False,
+            weight_col=self.weight_col,
+            extra_exclude_cols=extra_exclude_cols,
+            gpu=self.gpu
         )
         valid_it = ParquetIter(
-            paths=self.train_path,
+            paths=self.train_paths,
             features=self.features,
             target=self.target,
             cat_cols=self.cat_cols,
             fold_col=self.fold_col,
             include_folds=[fold_idx],
-            batch_rows=self.batch_rows,
-            use_cudf=self.use_cudf,
-            keep_row_ids=True,
+            weight_col=self.weight_col,
+            extra_exclude_cols=extra_exclude_cols,
+            gpu=self.gpu
         )
 
         dtrain = xgb.QuantileDMatrix(
@@ -677,20 +728,28 @@ class XGBCVTrainer:
         print(f"\nTrain AUC: {train_score:.5f}")
         print(f"Valid AUC: {eval_score:.5f}")
 
+        t_total_end = now()
+        runtime = print_duration(t_total_start, t_total_end, "Total Runtime")
+
+        fold_summary = {
+            "auc": eval_score,
+            "best_iter": best_iteration,
+            "runtime": runtime
+        }
         for lg in loggers:
             lg.on_fold_end(
                 fold_idx,
-                eval_score,
+                "iter",
                 evals_result,
-                best_iteration
+                summary=fold_summary
             )
 
         del train_it, valid_it, dtrain, dvalid, model
         gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
+        self.pmp.free_all_blocks()
 
-        t_total_end = now()
-        print_duration(t_total_start, t_total_end, "Total Runtime")
-        print(f"Avail Mem: {round(win_avail_gb(), 2)} GB")
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
         return eval_score

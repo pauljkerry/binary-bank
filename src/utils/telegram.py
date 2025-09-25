@@ -1,10 +1,8 @@
-from pathlib import Path
 from dotenv import load_dotenv
 import os
 import requests
 
-env_path = Path.cwd().parent / ".env"
-load_dotenv(dotenv_path=env_path)
+load_dotenv(dotenv_path="../../.env")
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")

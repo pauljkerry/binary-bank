@@ -20,3 +20,4 @@ def print_duration(start, end, label="Training Time"):
         f"{int(minutes):02d}:"
         f"{int(seconds):02d}"
     )
+    return duration/60

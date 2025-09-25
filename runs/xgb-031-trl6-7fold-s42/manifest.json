@@ -1,0 +1,33 @@
+{
+    "run_id": "xgb-031-trl6-7fold-s42",
+    "wandb_id": "oyy307c5",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/oyy307c5",
+    "created_at": "2025-09-21 23:01:02",
+    "model_name": "xgb",
+    "data_id": "031",
+    "n_fold": 7,
+    "seed": 42,
+    "batch_rows": 1000000,
+    "feature_dir": "/home/hanse/kaggle/binary-bank/artifacts/features/base/031",
+    "phash": "072b23c1bd",
+    "param_source": "../artifacts/params/xgb-031/trl6.json",
+    "params": {
+        "learning_rate": 0.02,
+        "max_depth": 8,
+        "min_child_weight": 9.767211400638388,
+        "colsample_bytree": 0.5736932106048627,
+        "subsample": 0.6760609974958405,
+        "reg_alpha": 0.0004826869005553143,
+        "reg_lambda": 0.029914693021302164
+    },
+    "run_dir": "/home/hanse/kaggle/binary-bank/runs/xgb-031-trl6-7fold-s42",
+    "cv_score": 0.9756677125419372,
+    "submission": {
+        "competition": "playground-series-s5e8",
+        "ref": 46957181,
+        "file": "../output/xgb-031-trl6-7fold-s42.csv",
+        "public_score": "0.97663",
+        "private_score": "0.97622",
+        "submitted_at": "2025-09-21 23:37:48"
+    }
+}
