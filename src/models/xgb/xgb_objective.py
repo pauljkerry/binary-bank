@@ -1,5 +1,6 @@
 import os
 import json
+from pathlib import Path
 
 import wandb
 from optuna.exceptions import TrialPruned
@@ -17,7 +18,7 @@ def create_objective(
     fold_idx: int = 0,
     wandb_project: str = "project",
     study_name: str = "study-xgb",
-    **opts
+    opts: dict | None = None
 ):
     """
     Optunaの目的関数（objective）を生成する関数。
@@ -41,6 +42,7 @@ def create_objective(
     """
 
     def objective(trial):
+        optuna_dir = Path("../../artifacts/optuna")
         try:
             params = {
                 "learning_rate": trial.suggest_float(
@@ -82,8 +84,6 @@ def create_objective(
                 ),
             }
 
-            early_stopping_rounds = opts.pop("early_stopping_rounds", None)
-
             with open(f"../../artifacts/features/{data_id}/meta.json")as f:
                 m = json.load(f)
 
@@ -98,11 +98,12 @@ def create_objective(
                 config={
                     "data_id": data_id,
                     "n_fold": n_fold,
-                    "early_stopping_rounds": early_stopping_rounds,
-                    **params
+                    **params,
+                    **opts
                 },
                 tags=["xgb", level],
                 reinit=True,
+                dir="../../artifacts"
             )
 
             trainer = XGBCVTrainer(
@@ -119,8 +120,8 @@ def create_objective(
                 loggers=[WandbLogger(run=run)]
             )
 
-            os.makedirs(f"../../artifacts/params/{study_name}", exist_ok=True)
-            path = f"../../artifacts/params/{study_name}/trl{trial.number}.json"
+            os.makedirs(optuna_dir / f"{study_name}", exist_ok=True)
+            path = optuna_dir / f"{study_name}/trl{trial.number}.json"
             manifest = {
                 "params": params,
                 "n_fold": n_fold,
@@ -136,7 +137,6 @@ def create_objective(
 
             return score
         except RuntimeError as e:
-            wandb.finish()
             msg = str(e)
             if "CUDA out of memory" in msg:
                 send_message(
@@ -157,7 +157,7 @@ def create_objective(
                         study=trial.study,
                         study_name=study_name,
                         trial_num=trial.number,
-                        out_root="../artifacts/optuna",
+                        out_root=optuna_dir,
                         send_telegram=True,
                     )
             except Exception:

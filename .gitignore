@@ -12,3 +12,4 @@ todo.txt
 .virtual_documents/
 notebooks/wandb/
 notebooks/fe/AutogluonModels/
+artifacts/wandb/

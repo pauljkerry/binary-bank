@@ -1,18 +1,17 @@
+import gc
 import numpy as np
 import cupy as cp
 import pandas as pd
-import gc
+import polars as pl
 from sklearn.metrics import roc_auc_score
 from src.utils.multiple_auc_scores import multiple_auc_scores
 import matplotlib.pyplot as plt
-from matplotlib.ticker import ScalarFormatter
 
 
 def hill_climbing_auc(
-    oof_array,
-    y_true,
-    test_array=None,
-    files=None,
+    data_id,
+    train_paths,
+    test_paths,
     TOL=1e-5,
     USE_NEGATIVE_WGT=True
 ):
@@ -40,9 +39,12 @@ def hill_climbing_auc(
         ensembleの予測値
         test_arrayがNoneのときは返り値なし
     """
+    oof_array = pl.read_parquet(train_paths)
+    test_array = pl.read_parquet(test_paths)
+
+    features = [c for c in oof_array.columns if c not in ["target", "row_id"] and "fold" not in c]
+
     n_samples, n_models = oof_array.shape
-    if files is None:
-        files = list(range(n_models))
 
     # 1. 各モデル単体のAUCを計算
     aucs = [roc_auc_score(y_true, oof_array[:, i]) for i in range(n_models)]

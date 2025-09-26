@@ -8,7 +8,8 @@ import polars as pl
 class CVResult:
     oof: Any
     test_pred: Optional[Any]
-    fi_mean: Optional[pl.DataFrame]
+    oof_score: float
+    fi_mean: Optional[pl.DataFrame] = None
 
 
 # ===== Logger Protocol =====
@@ -90,7 +91,7 @@ class WandbLogger:
         L = min(lengths) if lengths else 0
 
         for t in range(L):
-            payload = {self._k(f"t_f{fno}"): t}   # ← fold専用のx軸
+            payload = {self._k(f"{axis_name}_f{fno}"): t}   # ← fold専用のx軸
             for split, md in evals_result.items():
                 for mname, arr in md.items():
                     payload[self._k(f"{split}/f{fno}/{mname}")] = float(arr[t])

@@ -21,19 +21,6 @@ from src.utils.loggers import CVResult, CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
 from src.utils.mem_info import free_ram_gib, free_vram_gib
 
-try:
-    import cudf
-
-    _HAS_CUDF = True
-except Exception:
-    _HAS_CUDF = False
-
-rmm.reinitialize(
-    pool_allocator=True,          # プール有効
-    initial_pool_size=None,       # 必要なら"8GB"等に固定
-    managed_memory=False          # Unified/Managed Memoryを無効
-)
-
 
 @dataclass(eq=False)
 class ParquetIter(xgb.core.DataIter):
@@ -78,11 +65,8 @@ class ParquetIter(xgb.core.DataIter):
             if self.exclude_folds is None
             else set(self.exclude_folds)
         )
-        self.gpu = (
-            _HAS_CUDF
-            if self.gpu is None
-            else bool(self.gpu)
-        )
+        self.gpu = bool(self.gpu)
+
         self.predict_mode = bool(self.predict_mode)
         self.rowgroup_batch = int(self.rowgroup_batch)
 
@@ -302,17 +286,17 @@ class XGBCVTrainer:
                 if c not in meta and "fold" not in c
             ]
 
-            dev_mr = mr.CudaAsyncMemoryResource()
-            mr.set_current_device_resource(dev_mr)
-            rmm.reinitialize(
-                managed_memory=False,
-                initial_pool_size=None,
-            )
-            cp.cuda.set_allocator(rmm_cupy_allocator)
+        dev_mr = mr.CudaAsyncMemoryResource()
+        mr.set_current_device_resource(dev_mr)
+        rmm.reinitialize(
+            managed_memory=False,
+            initial_pool_size=None,
+        )
+        cp.cuda.set_allocator(rmm_cupy_allocator)
 
-            cp.get_default_memory_pool().set_limit(4 * 1024**3)
-            self.pmp = cp.cuda.PinnedMemoryPool()
-            cp.cuda.set_pinned_memory_allocator(self.pmp.malloc)
+        cp.get_default_memory_pool().set_limit(4 * 1024**3)
+        self.pmp = cp.cuda.PinnedMemoryPool()
+        cp.cuda.set_pinned_memory_allocator(self.pmp.malloc)
 
     def fit(
         self,
@@ -461,7 +445,9 @@ class XGBCVTrainer:
 
             print_duration(t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time")
             print_duration(t_fit_start, t_fit_end)
-            runtime = print_duration(t_fold_start, t_fold_end, f"Fold {i} Runtime")
+            runtime = print_duration(
+                t_fold_start, t_fold_end, f"Fold {i+1} Runtime"
+            )
 
             best_iteration = model.best_iteration
             train_score = evals_result["train"]["auc"][best_iteration]
@@ -542,12 +528,13 @@ class XGBCVTrainer:
         result = CVResult(
             oof,
             test_pred,
+            oof_score,
             fi_mean
         )
         overall_summary = {
             "auc_oof": oof_score,
-            "auc_std": mean,
-            "auc_mean": std,
+            "auc_mean": mean,
+            "auc_std": std,
             "iter_mean": np.mean(iteration_list),
             "total_runtime": total_runtime
         }

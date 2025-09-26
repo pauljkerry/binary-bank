@@ -1,13 +1,24 @@
+import os
+import json
+from pathlib import Path
+
+import wandb
+from optuna.exceptions import TrialPruned
+
 from src.models.mlp.mlp_cv_trainer import MLPCVTrainer
+from src.utils.snapshot_study import snapshot_study
+from src.utils.telegram import send_message
+from src.utils.loggers import WandbLogger
 
 
 def create_objective(
-    tr_df,
-    n_splits=5,
-    max_epochs=30,
-    early_stopping_rounds=5,
-    min_epochs=10,
-    use_gpu=True,
+    data_id: int,
+    seed: int = 42,
+    n_fold: int = 5,
+    fold_idx: int = 0,
+    wandb_project: str = "project",
+    study_name: str = "study-mlp",
+    opts: dict | None = None
 ):
     """
     Optunaの目的関数（objective）を生成する関数。
@@ -18,72 +29,176 @@ def create_objective(
         訓練データ。
     n_splits : int, default 5
         CV分割数。
-    max_epochs : int, default 100
-        エポック数。
-    early_stopping_rounds : int, default 20
-        早期停止ラウンド数。
-    min_epochs : int, default 10
-        最低限学習するエポック数
-    use_gpu : bool, default True
-        Trueの場合はGPUが使用可能であれば使用する。
+    early_stopping_rounds : int, default 200
+        EarlyStoppingのラウンド数。
+    n_jobs : int, default 1
+        XGB並列数。
+    early_stopping_rounds: Optional[int] = None
 
     Returns
     -------
     function
         Optunaで使用する目的関数。
     """
+
     def objective(trial):
-        num_layers = trial.suggest_int("num_layers", 1, 4)
+        optuna_dir = Path("../../artifacts/optuna")
+        try:
+            num_layers = trial.suggest_int("num_layers", 1, 4)
 
-        hidden_dim1 = trial.suggest_int("hidden_dim1", 256, 1024, step=32)
+            hidden_dim1 = trial.suggest_int(
+                "hidden_dim1", 256, 1024, step=32
+            )
 
-        if num_layers >= 2:
-            hidden_dim2 = trial.suggest_int("hidden_dim2", 128, hidden_dim1, step=32)
-        else:
-            hidden_dim2 = -1
-            trial.suggest_int("hidden_dim2", -1, -1)
+            if num_layers >= 2:
+                hidden_dim2 = trial.suggest_int(
+                    "hidden_dim2", 128, hidden_dim1, step=32
+                )
+            else:
+                hidden_dim2 = -1
+                trial.suggest_int(
+                    "hidden_dim2", -1, -1
+                )
 
-        if num_layers >= 3:
-            hidden_dim3 = trial.suggest_int("hidden_dim3", 64, hidden_dim2, step=32)
-        else:
-            hidden_dim3 = -1
-            trial.suggest_int("hidden_dim3", -1, -1)
+            if num_layers >= 3:
+                hidden_dim3 = trial.suggest_int(
+                    "hidden_dim3", 64, hidden_dim2, step=32
+                )
+            else:
+                hidden_dim3 = -1
+                trial.suggest_int(
+                    "hidden_dim3", -1, -1
+                )
 
-        if num_layers >= 4:
-            hidden_dim4 = trial.suggest_int("hidden_dim4", 32, hidden_dim3, step=32)
-        else:
-            hidden_dim4 = -1
-            trial.suggest_int("hidden_dim4", -1, -1)
+            if num_layers >= 4:
+                hidden_dim4 = trial.suggest_int(
+                    "hidden_dim4", 32, hidden_dim3, step=32
+                )
+            else:
+                hidden_dim4 = -1
+                trial.suggest_int("hidden_dim4", -1, -1)
 
-        params = {
-            "hidden_dim1": hidden_dim1,
-            "hidden_dim2": hidden_dim2,
-            "hidden_dim3": hidden_dim3,
-            "hidden_dim4": hidden_dim4,
-            "n_splits": n_splits,
-            "max_epochs": max_epochs,
-            "early_stopping_rounds": early_stopping_rounds,
-            "min_epochs": min_epochs,
-            "use_gpu": use_gpu,
-            "batch_size": trial.suggest_int(
-                "batch_size", 512, 1120, step=32
-            ),
-            "lr": trial.suggest_float("lr", 1e-3, 1e-1, log=True),
-            "lr_min": trial.suggest_float("lr_min", 1e-4, 1e-3, log=True),
-            "dropout_rate": round(trial.suggest_float(
-                "dropout_rate", 0.1, 0.6, step=0.05), 2),
-            "activation": trial.suggest_categorical("activation", [
-                "ReLU",
-                "LeakyReLU",
-                "GELU",
-                "SiLU",
-                # "Tanh",
-                # "ELU",
-                # "Sigmoid"
-            ]),
-        }
-        trainer = MLPCVTrainer(tr_df, params=params, n_splits=n_splits)
-        score = trainer.fit_one_fold(fold=0)
+            params = {
+                "hidden_dim1": hidden_dim1,
+                "hidden_dim2": hidden_dim2,
+                "hidden_dim3": hidden_dim3,
+                "hidden_dim4": hidden_dim4,
+                "batch_size": trial.suggest_int(
+                    "batch_size", 512, 1120, step=32
+                ),
+                "lr": trial.suggest_float(
+                    "lr", 1e-3, 1e-1, log=True
+                ),
+                "eta_min": trial.suggest_float(
+                    "eta_min", 1e-4, 1e-3, log=True
+                ),
+                "dropout_rate": round(trial.suggest_float(
+                    "dropout_rate", 0.1, 0.6, step=0.05), 2),
+                "activation": trial.suggest_categorical(
+                    "activation", [
+                        "ReLU",
+                        "LeakyReLU",
+                        "GELU",
+                        "SiLU"
+                    ]
+                ),
+            }
+            params = {**params, **opts}
 
-        return score
+            with open(f"../../artifacts/features/{data_id}/meta.json")as f:
+                m = json.load(f)
+
+            train_paths = m["train_paths"]
+            level = m["level"]
+
+            run = wandb.init(
+                project=wandb_project,
+                group=study_name,
+                name=f"trl{trial.number}",
+                job_type="optuna-search",
+                config={
+                    "data_id": data_id,
+                    "n_fold": n_fold,
+                    **params,
+                    **opts
+                },
+                tags=["mlp", level],
+                reinit=True,
+                dir="../../artifacts"
+            )
+
+            trainer = MLPCVTrainer(
+                data_id,
+                train_paths,
+                n_fold=n_fold,
+                params=params,
+                seed=seed,
+                opts=opts
+            )
+
+            score = trainer.fit_one_fold(
+                fold_idx,
+                loggers=[WandbLogger(run=run)]
+            )
+
+            os.makedirs(optuna_dir / f"{study_name}", exist_ok=True)
+            path = optuna_dir / f"{study_name}/trl{trial.number}.json"
+            manifest = {
+                "params": params,
+                "n_fold": n_fold,
+                "seed": seed,
+                "fold_idx": fold_idx,
+                "wandb_id": run.id,
+                "wandb_url": run.url,
+                "opts": opts,
+                "score": score
+            }
+            with open(path, "w") as f:
+                json.dump(manifest, f, indent=4)
+
+            return score
+
+        except RuntimeError as e:
+            msg = str(e)
+            if "CUDA out of memory" in msg:
+                send_message(
+                    f"[OOM] study={study_name} tr={trial.number} params={trial.params}"
+                )
+                raise TrialPruned("OOM -> pruned")
+            else:
+                send_message(
+                    f"[ERROR] study={study_name} tr={trial.number} "
+                    f"{type(e).__name__}: {msg}"
+                )
+                raise
+        finally:
+            wandb.finish()
+            try:
+                N = 10
+                if (trial.number+1) % N == 0 and trial.number != 0:
+                    _ = snapshot_study(
+                        study=trial.study,
+                        study_name=study_name,
+                        trial_num=trial.number,
+                        out_root=optuna_dir,
+                        send_telegram=True,
+                    )
+            except Exception:
+                pass
+            try:
+                import cupy as cp
+
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+            import ctypes
+            import gc
+
+            gc.collect()
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+
     return objective
