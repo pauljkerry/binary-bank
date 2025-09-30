@@ -1,0 +1,15 @@
+{
+  "os":  "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "python":  "CPython 3.10.18",
+  "startedAt":  "2025-09-27T02:24:30.505142Z",
+  "program":  "notebooks/others/submission.ipynb",
+  "git":  {
+    "remote":  "git@github.com:pauljkerry/binary-bank.git",
+    "commit":  "490f84f67e6b596479cbe99a8e8516b217da2717"
+  },
+  "email":  "hanseikai2019@gmail.com",
+  "root":  "/home/hanse/kaggle/binary-bank/notebooks/others",
+  "host":  "Lucille",
+  "executable":  "/home/hanse/miniconda3/envs/rapids-23.12/bin/python",
+  "writerId":  "258voelv4tbs5i1kk51bqeifgwls8cjm"
+}

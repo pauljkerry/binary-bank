@@ -1,0 +1,37 @@
+{
+  "os":  "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "python":  "CPython 3.10.18",
+  "startedAt":  "2025-09-27T02:24:26.341257Z",
+  "program":  "notebooks/others/submission.ipynb",
+  "git":  {
+    "remote":  "git@github.com:pauljkerry/binary-bank.git",
+    "commit":  "490f84f67e6b596479cbe99a8e8516b217da2717"
+  },
+  "email":  "hanseikai2019@gmail.com",
+  "root":  "/home/hanse/kaggle/binary-bank/notebooks/others",
+  "host":  "Lucille",
+  "executable":  "/home/hanse/miniconda3/envs/rapids-23.12/bin/python",
+  "cpu_count":  12,
+  "cpu_count_logical":  24,
+  "gpu":  "NVIDIA GeForce RTX 4060 Ti",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "1081101176832",
+      "used":  "201272893440"
+    }
+  },
+  "memory":  {
+    "total":  "25197420544"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 4060 Ti",
+      "memoryTotal":  "8585740288",
+      "architecture":  "Ada",
+      "uuid":  "GPU-e94e0c3c-f612-672f-2387-60ce8d438714"
+    }
+  ],
+  "cudaVersion":  "12.9",
+  "writerId":  "8wxqwsrid2mc2r26e78dhly8b0pd4kv7"
+}

@@ -1,0 +1,37 @@
+{
+    "run_id": "mlp-041-trl7-5fold-s42",
+    "wandb_id": "vj1zybu5",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/vj1zybu5",
+    "created_at": "2025-09-30 13:14:17",
+    "model_name": "mlp",
+    "data_id": "041",
+    "n_fold": 5,
+    "seed": 42,
+    "feature_dir": "/home/hanse/kaggle/binary-bank/artifacts/features/041",
+    "phash": "10b1011134",
+    "param_source": "../../artifacts/optuna/mlp-041/trl7.json",
+    "params": {
+        "hidden_dim1": 512,
+        "hidden_dim2": 128,
+        "hidden_dim3": 64,
+        "hidden_dim4": -1,
+        "batch_size": 704,
+        "lr": 0.02878805718308924,
+        "eta_min": 0.00043406770118894003,
+        "dropout_rate": 0.55,
+        "activation": "SiLU",
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 20,
+        "min_epochs": 4
+    },
+    "run_dir": "/home/hanse/kaggle/binary-bank/runs/mlp-041-trl7-5fold-s42",
+    "cv_score": 0.9742153455810175,
+    "submission": {
+        "competition": null,
+        "ref": null,
+        "file": null,
+        "public_score": null,
+        "private_score": null,
+        "submitted_at": null
+    }
+}

@@ -1,0 +1,40 @@
+_wandb:
+    value:
+        cli_version: 0.21.1
+        e:
+            258voelv4tbs5i1kk51bqeifgwls8cjm:
+                email: hanseikai2019@gmail.com
+                executable: /home/hanse/miniconda3/envs/rapids-23.12/bin/python
+                git:
+                    commit: 490f84f67e6b596479cbe99a8e8516b217da2717
+                    remote: git@github.com:pauljkerry/binary-bank.git
+                host: Lucille
+                os: Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39
+                program: notebooks/others/submission.ipynb
+                python: CPython 3.10.18
+                root: /home/hanse/kaggle/binary-bank/notebooks/others
+                startedAt: "2025-09-27T02:24:30.505142Z"
+                writerId: 258voelv4tbs5i1kk51bqeifgwls8cjm
+        m: []
+        python_version: 3.10.18
+        t:
+            "1":
+                - 105
+            "2":
+                - 105
+            "3":
+                - 2
+                - 5
+                - 14
+                - 62
+            "4": 3.10.18
+            "5": 0.21.1
+            "8":
+                - 1
+                - 2
+            "12": 0.21.1
+            "13": linux-x86_64
+data_id:
+    value: "034"
+ref:
+    value: 47053148

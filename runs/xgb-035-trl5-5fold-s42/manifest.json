@@ -1,0 +1,32 @@
+{
+    "run_id": "xgb-035-trl5-5fold-s42",
+    "wandb_id": "c09mwhpn",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/c09mwhpn",
+    "created_at": "2025-09-29 08:58:45",
+    "model_name": "xgb",
+    "data_id": "035",
+    "n_fold": 5,
+    "seed": 42,
+    "feature_dir": "/home/hanse/kaggle/binary-bank/artifacts/features/035",
+    "phash": "b5e4d22f9c",
+    "param_source": "../../artifacts/optuna/xgb-035/trl5.json",
+    "params": {
+        "learning_rate": 0.02,
+        "max_depth": 10,
+        "min_child_weight": 17.052412368729154,
+        "colsample_bytree": 0.3260206371941118,
+        "subsample": 0.8795542149013333,
+        "reg_alpha": 25.676071644288232,
+        "reg_lambda": 1.1015056790269626
+    },
+    "run_dir": "/home/hanse/kaggle/binary-bank/runs/xgb-035-trl5-5fold-s42",
+    "cv_score": 0.9701384734324352,
+    "submission": {
+        "competition": null,
+        "ref": null,
+        "file": null,
+        "public_score": null,
+        "private_score": null,
+        "submitted_at": null
+    }
+}
