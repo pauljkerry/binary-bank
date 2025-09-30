@@ -14,7 +14,7 @@ from src.utils.loggers import WandbLogger
 def create_objective(
     data_id: int,
     seed: int = 42,
-    n_fold: int = 5,
+    n_folds: int = 5,
     fold_idx: int = 0,
     wandb_project: str = "project",
     study_name: str = "study-mlp",
@@ -118,19 +118,19 @@ def create_objective(
                 job_type="optuna-search",
                 config={
                     "data_id": data_id,
-                    "n_fold": n_fold,
+                    "n_folds": n_folds,
                     **params,
                     **opts
                 },
                 tags=["mlp", level],
-                reinit=True,
+                reinit="finish_previous",
                 dir="../../artifacts"
             )
 
             trainer = MLPCVTrainer(
                 data_id,
                 train_paths,
-                n_fold=n_fold,
+                n_folds=n_folds,
                 params=params,
                 seed=seed,
                 opts=opts
@@ -145,7 +145,7 @@ def create_objective(
             path = optuna_dir / f"{study_name}/trl{trial.number}.json"
             manifest = {
                 "params": params,
-                "n_fold": n_fold,
+                "n_folds": n_folds,
                 "seed": seed,
                 "fold_idx": fold_idx,
                 "wandb_id": run.id,
@@ -183,21 +183,6 @@ def create_objective(
                         out_root=optuna_dir,
                         send_telegram=True,
                     )
-            except Exception:
-                pass
-            try:
-                import cupy as cp
-
-                cp.get_default_memory_pool().free_all_blocks()
-                cp.get_default_pinned_memory_pool().free_all_blocks()
-            except Exception:
-                pass
-            import ctypes
-            import gc
-
-            gc.collect()
-            try:
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
             except Exception:
                 pass
 

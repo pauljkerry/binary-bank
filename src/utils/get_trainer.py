@@ -30,6 +30,9 @@ def get_trainer(model_type: str):
     elif model_type == "mlp":
         from src.models.mlp.mlp_cv_trainer import MLPCVTrainer
         return MLPCVTrainer
+    elif model_type == "tabnet":
+        from src.models.tabnet.tabnet_cv_trainer import TabNetCVTrainer
+        return TabNetCVTrainer
     elif model_type == "logreg":
         from src.models.logreg.logreg_cv_trainer import LogRegCVTrainer
         return LogRegCVTrainer

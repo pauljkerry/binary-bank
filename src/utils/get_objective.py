@@ -30,6 +30,9 @@ def get_objective(model_type: str):
     elif model_type == "mlp":
         from src.models.mlp.mlp_objective import create_objective
         return create_objective
+    elif model_type == "tabnet":
+        from src.models.tabnet.tabnet_objective import create_objective
+        return create_objective
     elif model_type == "logreg":
         from src.models.logreg.logreg_objective import create_objective
         return create_objective

@@ -1,78 +1,66 @@
+import gc
+import math
+import os
+from dataclasses import dataclass, field
+from time import perf_counter as now
+from typing import Optional
+
 import lightgbm as lgb
 import numpy as np
-import pandas as pd
-from sklearn.model_selection import StratifiedKFold
+import polars as pl
+
 from sklearn.metrics import roc_auc_score
-import shap
-import matplotlib.pyplot as plt
-import seaborn as sns
-import joblib
-import time
+
+from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
+from src.utils.mem_info import free_ram_gib, free_vram_gib
 
 
+@dataclass(eq=False)
 class LGBMCVTrainer:
     """
     LGBMを使ったCVトレーナー。
 
     Attributes
     ----------
-    tr_df : pd.DataFrame
-        label付データ
-    test_df : pd.DataFrame, default None
-        labelなしデータ。CV学習とFull Trainはtest_df必須。
-    params : dict
-        LGBMのパラメータ。
-    n_splits : int, default 5
-        StratifiedKFoldの分割数。
-    early_stopping_rounds : int, default 200
-        早期停止ラウンド数。
-    num_boost_round : int, default 20000
-        iterationの最大値。
-    seed : int, default 42
-        乱数シード。
     """
+    data_id: str
+    train_paths: str | list[str]
+    test_paths: str | list[str] | None = None
 
-    def __init__(self, tr_df, test_df=None, params=None, n_splits=5,
-                 early_stopping_rounds=200, num_boost_round=20000, seed=42):
-        self.params = params or {}
-        self.n_splits = n_splits
-        self.early_stopping_rounds = early_stopping_rounds
-        self.num_boost_round = num_boost_round
-        self.fold_models = []
-        self.fold_scores = []
-        self.seed = seed
-        self.oof_score = None
+    features: Optional[list[str]] = None
 
-        self.cat_cols = tr_df.select_dtypes(include="object").columns.to_list() or []
+    target: str = "target"
+    fold_col: Optional[str] = None
+    weight_col: Optional[str] = None
+    cat_cols: Optional[list[str]] = None
 
-        if self.cat_cols:
-            tr_df[self.cat_cols] = tr_df[self.cat_cols].astype("category")
-            test_df[self.cat_cols] = test_df[self.cat_cols].astype("category")
+    params: dict = field(default_factory=dict)
 
-        if "weight" in tr_df.columns:
-            self.weights = tr_df["weight"].astype("float32")
-            tr_df = tr_df.drop("weight", axis=1)
+    n_folds: int = 5
+    seed: int = 42
+    gpu: bool = True
+
+    opts: dict = field(init=True, default_factory=dict)
+
+    def __post_init__(self):
+        if isinstance(self.train_paths, (str, os.PathLike)):
+            self.train_paths = [str(self.train_paths)]
         else:
-            self.weights = np.ones(len(tr_df), dtype="float32")
+            self.train_paths = [str(p) for p in self.train_paths]
 
-        self.X = tr_df.drop("target", axis=1)
-        self.y = tr_df["target"].to_numpy()
+        if self.test_paths:
+            if isinstance(self.test_paths, (str, os.PathLike)):
+                self.test_paths = [str(self.test_paths)]
+            else:
+                self.test_paths = [str(p) for p in self.test_paths]
 
-        # test
-        if test_df is not None:
-            test_df[self.cat_cols] = test_df[self.cat_cols].astype("category")
-            self.test = test_df
-        else:
-            self.test = None
-
-        # fold indices
-        skf = StratifiedKFold(
-            n_splits=n_splits, shuffle=True, random_state=self.seed
+        self.lf_train = pl.scan_parquet(self.train_paths)
+        self.lf_test = (
+            pl.scan_parquet(self.test_paths) if self.test_paths else None
         )
-        self.fold_indices = list(skf.split(self.X, self.y))
 
-        self.default_params = {
+        default_params = {
             "objective": "binary",
             "metric": "auc",
             "learning_rate": 0.1,
@@ -89,9 +77,62 @@ class LGBMCVTrainer:
             "verbosity": -1,
             "random_state": self.seed
         }
-        self.params = {**self.default_params, **(self.params or {})}
 
-    def fit(self):
+        user_params = self.params or {}
+        merged = {**default_params, **user_params}
+
+        self.early_stopping_rounds = self.opts.get(
+            "early_stopping_rounds",
+            None
+        )
+        self.num_boost_round = self.opts.get(
+            "num_boost_round",
+            20000
+        )
+
+        # ユーザー未指定なら lr に応じて自動設定（下限あり）
+        if self.early_stopping_rounds is None:
+            lr = float(merged["learning_rate"])
+            self.early_stopping_rounds = max(50, int(math.ceil(10.0 / lr)))
+
+        # train() の引数として取り出す
+        self.params = merged
+
+        hdr = pl.read_parquet(self.train_paths, n_rows=0)
+        all_cols = hdr.columns
+
+        if self.fold_col is None:
+            self.fold_col = f"{self.n_folds}fold-s{self.seed}"
+
+        if self.cat_cols is None:
+            self.cat_cols = [
+                c for c, dt in zip(hdr.columns, hdr.dtypes)
+                if dt == pl.Categorical
+            ]
+
+        if self.fold_col not in all_cols:
+            raise ValueError(f"fold_col not found in dataset: {self.fold_col}")
+        else:
+            print(f"Fold Col: {self.fold_col}")
+
+        if self.features is None:
+            meta = {"row_id"}
+            if self.target in all_cols:
+                meta.add(self.target)
+            if self.weight_col in all_cols:
+                meta.add(self.weight_col)
+            if self.fold_col:
+                meta.add(self.fold_col)
+
+            self.features = [
+                c for c in all_cols
+                if c not in meta and "fold" not in c
+            ]
+
+    def fit(
+        self,
+        loggers: list[CVLogger] | None = None
+    ):
         """
         CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
 
@@ -102,31 +143,119 @@ class LGBMCVTrainer:
         test_preds : ndarray
             test_dfに対する予測配列
         """
-        if self.test is None:
-            raise ValueError("test_df not provided for LGBMCVTrainer.")
+        if self.test_paths is None:
+            raise ValueError("Please provide test_paths (got None).")
 
-        oof_preds = np.zeros(len(self.X))
-        test_preds = np.zeros(len(self.test))
+        t_total_start = now()
+
+        loggers = loggers or [NoOpLogger()]
+        meta = {
+            "data_id": self.data_id,
+            "seed": self.seed,
+            "n_folds": self.n_folds,
+            "early_stopping_rounds": self.early_stopping_rounds,
+            **self.params
+        }
+        for lg in loggers:
+            lg.on_start(meta)
+
+        train_rows = (
+            pl.scan_parquet(self.train_paths)
+              .select(pl.len())
+              .collect()
+              .item()
+        )
+        test_rows = (
+            pl.scan_parquet(self.test_paths)
+              .select(pl.len())
+              .collect()
+              .item()
+        )
+
+        oof = np.zeros(train_rows, dtype=np.float32)
+        test_pred = np.zeros(test_rows, dtype=np.float32)
 
         iteration_list = []
+        auc_scores = []
+        fi_fold_frames = []
 
-        for fold, (tr_idx, val_idx) in enumerate(self.fold_indices):
-            print(f"\nFold {fold + 1}")
-            start = time.time()
+        for i in range(self.n_folds):
+            title = f" Fold {i + 1} / {self.n_folds} "
+            print("=" * 48)
+            print(f"{title:=^48}")
+            print("=" * 48)
+            print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+            print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-            X_tr, y_tr, w_tr = (
-                self.X.iloc[tr_idx],
-                self.y[tr_idx],
-                self.weights[tr_idx]
+            t_fold_start = now()
+
+            need_cols = self.features + [self.target, "row_id"]
+            train = (
+                self.lf_train
+                .filter(pl.col(self.fold_col) != i)
+                .select(need_cols)
+                .collect(engine="streaming")
             )
-            X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
+            valid = (
+                self.lf_train
+                .filter(pl.col(self.fold_col) == i)
+                .select(need_cols)
+                .collect(engine="streaming")
+            )
+            X_train = (
+                train
+                .select(self.features)
+                .to_numpy()
+                .astype(np.float32)
+            )
+            y_train = (
+                train
+                .select(self.target)
+                .to_numpy()
+                .astype(np.int32)
+                .ravel()
+            )
+            X_valid = (
+                valid
+                .select(self.features)
+                .to_numpy()
+                .astype(np.float32)
+            )
+            y_valid = (
+                valid
+                .select(self.target)
+                .to_numpy()
+                .astype(np.int32)
+                .ravel()
+            )
+            val_idx = (
+                valid
+                .select("row_id")
+                .to_series()
+                .to_numpy()
+                .astype(np.int32, copy=False)
+            )
+            test = (
+                self.lf_test
+                .select(self.features)
+                .collect(engine="streaming")
+                .to_numpy()
+                .astype(np.float32)
+            )
 
             dtrain = lgb.Dataset(
-                X_tr, label=y_tr,
+                X_train,
+                label=y_train,
+                feature_name=self.features,
                 categorical_feature=self.cat_cols,
-                weight=w_tr)
+            )
 
-            dvalid = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+            dvalid = lgb.Dataset(
+                X_valid,
+                label=y_valid,
+                feature_name=self.features,
+                reference=dtrain
+            )
 
             evals_result = {}
 
@@ -143,14 +272,8 @@ class LGBMCVTrainer:
                 ]
             )
 
-            # oof
-            val = self.X.iloc[val_idx]
-            oof_preds[val_idx] = model.predict(val)
-
-            test_preds += model.predict(self.test)
-
-            end = time.time()
-            print_duration(start, end)
+            oof[val_idx] = model.predict(X_valid)
+            test_pred += model.predict(test)
 
             best_iter = model.best_iteration
             train_score = evals_result["train"]["auc"][best_iter-1]
@@ -158,69 +281,208 @@ class LGBMCVTrainer:
             print(f"Train AUC: {train_score:.5f}")
             print(f"Valid AUC: {eval_score:.5f}")
 
-            self.fold_models.append(LGBMFoldModel(
-                model, X_val, y_val, fold))
-            self.fold_scores.append(eval_score)
-
+            auc_scores.append(eval_score)
             iteration_list.append(best_iter)
 
+            importances = model.feature_importance(importance_type="gain")
+            total_gain = importances.sum()
+            df = pl.DataFrame(
+                {
+                    "Feature": model.feature_name(),
+                    "ImportanceRatio": [
+                        ((v/total_gain)*100.0)/self.n_folds for v in importances
+                    ],
+                }
+            )
+            fi_fold_frames.append(df)
+
+            t_fold_end = now()
+            runtime = print_duration(
+                t_fold_start, t_fold_end, f"Fold {i+1} Runtime"
+            )
+            fold_summary = {
+                "auc": eval_score,
+                "runtime": runtime
+            }
+
+            for lg in loggers:
+                lg.on_fold_end(
+                    i,
+                    axis_name="iter",
+                    evals_result=evals_result,
+                    summary=fold_summary
+                )
+            del model, X_train, y_train, X_valid, y_valid, test
+            gc.collect()
+
         print("\n=== CV Results ===")
-        print(f"Fold scores: {self.fold_scores}")
-        print(
-            f"Mean: {np.mean(self.fold_scores):.5f}, "
-            f"Std: {np.std(self.fold_scores):.5f}"
+        y = (
+            self.lf_train
+            .select(self.target)
+            .cast(pl.Float32)
+            .collect(engine="streaming")
+            .to_numpy()
+            .ravel()
         )
+        test_pred /= self.n_folds
 
-        self.oof_score = roc_auc_score(self.y, oof_preds)
-        print(f"OOF score: {self.oof_score:.5f}")
-        print(f"Avg best iteration: {np.mean(iteration_list)}")
-        print(f"Best iterations: \n{iteration_list}")
+        all_fi = pl.concat(fi_fold_frames, how="vertical_relaxed")
+        fi_mean = (
+            all_fi
+            .group_by("Feature")
+            .agg([
+                pl.sum("ImportanceRatio").alias("mean_ratio")
+            ])
+        ).sort("mean_ratio", descending=True)
 
-        test_preds /= self.n_splits
+        oof_score = roc_auc_score(y, oof)
 
-        return oof_preds, test_preds
+        auc_mean = np.mean(auc_scores)
+        auc_std = np.std(auc_scores)
+        iter_mean = np.mean(iteration_list)
 
-    def full_train(self, iterations):
+        print(f"OOF score: {oof_score:.5f}")
+        print(
+            f"Mean: {auc_mean:.5f}, "
+            f"Std: {auc_std:.5f}"
+        )
+        print(f"Avg best iteration: {iter_mean}")
+
+        t_total_end = now()
+        total_runtime = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
+
+        result = {
+            "oof": oof,
+            "test_pred": test_pred,
+            "oof_score": oof_score,
+            "fi_mean": fi_mean
+        }
+        overall_summary = {
+            "auc_oof": oof_score,
+            "auc_mean": auc_mean,
+            "auc_std": auc_std,
+            "iter_mean": iter_mean,
+            "total_runtime": total_runtime
+        }
+        for lg in loggers:
+            lg.on_end(overall_summary)
+
+        return result
+
+    def full_train(
+        self,
+        loggers: list[CVLogger] | None = None
+    ):
         """
         訓練データ全体でモデルを学習し、test_dfに対する予測結果をnpy形式で保存する。
 
         Parameters
         ----------
-        iterations : int
-            学習の繰り返し回数。
-
         Returns
         -------
         test_preds : np.ndarray
             test dataの予測値
         """
-        if self.test is None:
-            raise ValueError("test_df not provided for LGBMCVTrainer.")
+        if self.test_paths is None:
+            raise ValueError("Please provide test_paths (got None).")
 
-        start = time.time()
+        t_total_start = now()
+
+        loggers = loggers or [NoOpLogger()]
+        meta = {
+            "data_id": self.data_id,
+            "seed": self.seed,
+            "n_folds": self.n_folds,
+            "early_stopping_rounds": self.early_stopping_rounds,
+            **self.params
+        }
+        for lg in loggers:
+            lg.on_start(meta)
+
+        test_rows = (
+            pl.scan_parquet(self.test_paths)
+              .select(pl.len())
+              .collect()
+              .item()
+        )
+
+        test_pred = np.zeros(test_rows, dtype=np.float32)
+
+        need_cols = self.features + [self.target]
+        train = (
+            self.lf_train
+            .select(need_cols)
+            .collect(engine="streaming")
+        )
+        X_train = (
+            train
+            .select(self.features)
+            .to_numpy()
+            .astype(np.float32)
+        )
+        y_train = (
+            train
+            .select(self.target)
+            .to_numpy()
+            .astype(np.int32)
+            .ravel()
+        )
+        test = (
+            self.lf_test
+            .select(self.features)
+            .collect(engine="streaming")
+            .to_numpy()
+            .astype(np.float32)
+        )
 
         dtrain = lgb.Dataset(
-            self.X, label=self.y,
+            X_train,
+            label=y_train,
+            feature_name=self.features,
             categorical_feature=self.cat_cols,
-            weight=self.weights)
+        )
 
         model = lgb.train(
             self.params,
             dtrain,
-            num_boost_round=int(iterations*1.25),
+            num_boost_round=self.num_boost_round,
             valid_sets=[dtrain],
-            valid_names=["train"],
+            valid_names=["train"]
         )
 
-        end = time.time()
-        print_duration(start, end)
+        test_pred += model.predict(test)
 
-        # test_dfの予測値
-        test_preds = model.predict(self.test)
+        test_pred /= self.n_folds
 
-        return test_preds
+        t_total_end = now()
+        total_runtime = print_duration(
+            t_total_start, t_total_end, "Total Runtime"
+        )
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-    def fit_one_fold(self, fold=0):
+        result = {
+            "oof": None,
+            "test_pred": test_pred,
+            "oof_score": None
+        }
+        overall_summary = {
+            "total_runtime": total_runtime
+        }
+        for lg in loggers:
+            lg.on_end(overall_summary)
+
+        return result
+
+    def fit_one_fold(
+        self,
+        fold_idx=0,
+        loggers: list[CVLogger] | None = None
+    ):
         """
         指定した1つのfoldのみを用いてモデルを学習する。
         主にOptunaによるハイパーパラメータ探索時に使用。
@@ -235,18 +497,75 @@ class LGBMCVTrainer:
         eval_score : float
             Score
         """
-        tr_idx, val_idx = self.fold_indices[fold]
-        start = time.time()
+        t_total_start = now()
 
-        X_tr, y_tr, w_tr = self.X.iloc[tr_idx], self.y[tr_idx], self.weights[tr_idx]
-        X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
+        loggers = loggers or [NoOpLogger()]
+        meta = {
+            "data_id": self.data_id,
+            "seed": self.seed,
+            "n_folds": self.n_folds,
+            "early_stopping_rounds": self.early_stopping_rounds,
+            **self.params
+        }
+        for lg in loggers:
+            lg.on_start(meta)
+
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
+
+        need_cols = self.features + [self.target, "row_id"]
+        train = (
+            self.lf_train
+            .filter(pl.col(self.fold_col) != fold_idx)
+            .select(need_cols)
+            .collect(engine="streaming")
+        )
+        valid = (
+            self.lf_train
+            .filter(pl.col(self.fold_col) == fold_idx)
+            .select(need_cols)
+            .collect(engine="streaming")
+        )
+        X_train = (
+            train
+            .select(self.features)
+            .to_numpy()
+            .astype(np.float32)
+        )
+        y_train = (
+            train
+            .select(self.target)
+            .to_numpy()
+            .astype(np.int32)
+            .ravel()
+        )
+        X_valid = (
+            valid
+            .select(self.features)
+            .to_numpy()
+            .astype(np.float32)
+        )
+        y_valid = (
+            valid
+            .select(self.target)
+            .to_numpy()
+            .astype(np.int32)
+            .ravel()
+        )
 
         dtrain = lgb.Dataset(
-            X_tr, label=y_tr,
+            X_train,
+            label=y_train,
+            feature_name=self.features,
             categorical_feature=self.cat_cols,
-            weight=w_tr)
+        )
 
-        dvalid = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+        dvalid = lgb.Dataset(
+            X_valid,
+            label=y_valid,
+            feature_name=self.features,
+            reference=dtrain
+        )
 
         evals_result = {}
 
@@ -255,7 +574,7 @@ class LGBMCVTrainer:
             dtrain,
             num_boost_round=self.num_boost_round,
             valid_sets=[dtrain, dvalid],
-            valid_names=["train", "eval"],
+            valid_names=["train", "valid"],
             callbacks=[
                 lgb.early_stopping(stopping_rounds=self.early_stopping_rounds),
                 lgb.record_evaluation(evals_result),
@@ -263,116 +582,33 @@ class LGBMCVTrainer:
             ]
         )
 
-        end = time.time()
-        print_duration(start, end)
-
         best_iter = model.best_iteration
         train_score = evals_result["train"]["auc"][best_iter-1]
-        eval_score = evals_result["eval"]["auc"][best_iter-1]
+        eval_score = evals_result["valid"]["auc"][best_iter-1]
         print(f"Train AUC: {train_score:.5f}")
         print(f"Valid AUC: {eval_score:.5f}")
 
+        del model, X_train, y_train, X_valid, y_valid
+        gc.collect()
+
+        t_total_end = now()
+        total_runtime = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
+
+        fold_summary = {
+            "auc": eval_score,
+            "runtime": total_runtime
+        }
+
+        for lg in loggers:
+            lg.on_fold_end(
+                fold_idx,
+                axis_name="iter",
+                evals_result=evals_result,
+                summary=fold_summary
+            )
+
         return eval_score
-
-
-class LGBMFoldModel:
-    """
-    LGBMoostのfold単位のモデルを保持するクラス。
-
-    Attributes
-    ----------
-    model : lgb.Booster
-        学習済みのLGBMoostモデル。
-    X_val : pd.DataFrame
-        検証用の特徴量データ。
-    y_val : pd.Series
-        検証用のターゲットラベル。
-    fold_index : int
-        foldの番号。
-    """
-
-    def __init__(self, model, X_val, y_val, fold_index):
-        self.model = model
-        self.X_val = X_val
-        self.y_val = y_val
-        self.fold_index = fold_index
-
-    def shap_plot(self, sample=1000):
-        """
-        SHAPを用いた特徴量の重要度の可視化を行う。
-
-        Parameters
-        ----------
-        sample : int, default 1000
-            可視化に使用するサンプル数。
-        """
-        explainer = shap.TreeExplainer(self.model)
-        shap_values = explainer(self.X_val[:sample])
-        shap.summary_plot(shap_values, self.X_val[:sample], max_display=100)
-
-    def plot_gain_importance(self):
-        """
-        特徴量のGainに基づく重要度を棒グラフで可視化する。
-        """
-        importances = self.model.feature_importance(importance_type="gain")
-
-        total_gain = importances.sum()
-        importance_ratios = np.round(
-            (importances / total_gain)*100, 2
-        )
-        df = pd.DataFrame({
-            "Feature": self.model.feature_name(),
-            "ImportanceRatio": importance_ratios
-        }).sort_values("ImportanceRatio", ascending=False)
-
-        fig, ax = plt.subplots(figsize=(12, max(4, len(df)*0.4)))
-
-        sns.barplot(
-            data=df,
-            y="Feature",
-            x="ImportanceRatio",
-            orient="h",
-            palette="viridis",
-            hue="Feature",
-            ax=ax
-        )
-        for container in ax.containers:
-            labels = ax.bar_label(container)
-            for label in labels:
-                label.set_fontsize(20)
-
-        plt.title("Feature Importance", fontsize=32)
-        plt.xlabel("Importance", fontsize=28)
-        plt.ylabel("Feature", fontsize=28)
-        ax.tick_params(axis="x", labelsize=20)
-        ax.tick_params(axis="y", labelsize=20)
-
-        plt.tight_layout()
-
-    def save_model(self, path="../artifacts/model/lgbm_vn.pkl"):
-        """
-        学習済みモデルを指定パスに保存する。
-
-        Parameters
-        ----------
-        path : str
-            モデルを保存するパス。
-        """
-        joblib.dump(self.model, path)
-
-    def load_model(self, path):
-        """
-        指定されたパスからモデルを読み込む。
-
-        Parameters
-        ----------
-        path : str
-            モデルファイルのパス。
-
-        Returns
-        -------
-        self : LGBMFoldModel
-            読み込んだモデルを保持するインスタンス自身を返す。
-        """
-        self.model = joblib.load(path)
-        return self

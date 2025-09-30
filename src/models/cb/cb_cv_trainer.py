@@ -1,72 +1,64 @@
-from catboost import CatBoostClassifier, Pool
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score
-import numpy as np
-import shap
 import gc
-import joblib
-import time
+import os
+from dataclasses import dataclass, field
+from time import perf_counter as now
+from typing import Optional
+
+import numpy as np
+import polars as pl
+from catboost import CatBoostClassifier, Pool
+from sklearn.metrics import roc_auc_score
+
+from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
+from src.utils.mem_info import free_ram_gib, free_vram_gib
 
 
+@dataclass(eq=False)
 class CBCVTrainer:
     """
     CBを使ったCVトレーナー。
 
     Attributes
     ----------
-    tr_df : pd.DataFrame
-        label付データ
-    test_df : pd.DataFrame, default None
-        labelなしデータ。CV学習とFull Trainはtest_df必須。
-    params : dict
-        CBのパラメータ。
-    n_splits : int, default 5
-        StratifiedKFoldの分割数。
-    early_stopping_rounds : int, default 100
-        早期停止ラウンド数。
-    seed : int, default 42
-        乱数シード。
     """
+    data_id: str
+    train_paths: str | list[str]
+    test_paths: str | list[str] | None = None
 
-    def __init__(self, tr_df, test_df=None, params=None, n_splits=5,
-                 early_stopping_rounds=200, num_boost_round=20000, seed=42):
-        self.params = params or {}
-        self.n_splits = n_splits
-        self.early_stopping_rounds = early_stopping_rounds
-        self.num_boost_round = num_boost_round
-        self.fold_models = []
-        self.fold_scores = []
-        self.seed = seed
-        self.oof_score = None
+    features: Optional[list[str]] = None
 
-        # object → category
-        self.cat_cols = tr_df.select_dtypes(include="object").columns.to_list() or []
+    target: str = "target"
+    fold_col: Optional[str] = None
+    weight_col: Optional[str] = None
+    cat_cols: Optional[list[str]] = None
 
-        # 重み
-        if "weight" in tr_df.columns:
-            self.weights = tr_df["weight"].astype("float32").to_numpy()
-            tr_df = tr_df.drop("weight", axis=1)
+    params: dict = field(default_factory=dict)
+
+    n_folds: int = 5
+    seed: int = 42
+    gpu: bool = True
+
+    opts: dict = field(init=True, default_factory=dict)
+
+    def __post_init__(self):
+        if isinstance(self.train_paths, (str, os.PathLike)):
+            self.train_paths = [str(self.train_paths)]
         else:
-            self.weights = np.ones(len(tr_df), dtype="float32")
+            self.train_paths = [str(p) for p in self.train_paths]
 
-        # target
-        self.X = tr_df.drop("target", axis=1)
-        self.y = tr_df["target"].to_numpy()
+        if self.test_paths:
+            if isinstance(self.test_paths, (str, os.PathLike)):
+                self.test_paths = [str(self.test_paths)]
+            else:
+                self.test_paths = [str(p) for p in self.test_paths]
 
-        # test
-        if test_df is not None:
-            self.test = test_df
-        else:
-            self.test = None
-
-        # fold indices
-        skf = StratifiedKFold(
-            n_splits=n_splits, shuffle=True, random_state=self.seed
+        self.lf_train = pl.scan_parquet(self.train_paths)
+        self.lf_test = (
+            pl.scan_parquet(self.test_paths) if self.test_paths else None
         )
-        self.fold_indices = list(skf.split(self.X, self.y))
 
-        self.default_params = {
+        default_params = {
             "loss_function": "Logloss",
             "eval_metric": "Logloss",
             "learning_rate": 0.1,
@@ -84,111 +76,316 @@ class CBCVTrainer:
             "allow_writing_files": False,
             "verbose": 100
         }
-        self.params = {**self.default_params, **(self.params or {})}
+        self.params = {**default_params, **self.params}
 
-    def fit(self):
+        hdr = pl.read_parquet(self.train_paths, n_rows=0)
+        all_cols = hdr.columns
+
+        if self.fold_col is None:
+            self.fold_col = f"{self.n_folds}fold-s{self.seed}"
+
+        if self.cat_cols is None:
+            self.cat_cols = [
+                c for c, dt in zip(hdr.columns, hdr.dtypes)
+                if dt == pl.Categorical
+            ]
+
+        if self.fold_col not in all_cols:
+            raise ValueError(f"fold_col not found in dataset: {self.fold_col}")
+        else:
+            print(f"Fold Col: {self.fold_col}")
+
+        if self.features is None:
+            meta = {"row_id"}
+            if self.target in all_cols:
+                meta.add(self.target)
+            if self.weight_col in all_cols:
+                meta.add(self.weight_col)
+            if self.fold_col:
+                meta.add(self.fold_col)
+
+            self.features = [
+                c for c in all_cols
+                if c not in meta and "fold" not in c
+            ]
+
+    def fit(
+        self,
+        loggers: list[CVLogger] | None = None
+    ):
         """
         CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
 
         Returns
         -------
-        oof_preds : ndarray
-            OOF予測配列
-        test_preds : ndarray
-            test_dfに対する予測配列
         """
-        if self.test is None:
-            raise ValueError("test_df not provided for CBCVTrainer.")
+        if self.test_paths is None:
+            raise ValueError("Please provide test_paths (got None).")
 
-        oof_preds = np.zeros(len(self.X))
-        test_preds = np.zeros(len(self.test))
+        t_total_start = now()
+
+        loggers = loggers or [NoOpLogger()]
+        meta = {
+            "data_id": self.data_id,
+            "seed": self.seed,
+            "n_folds": self.n_folds,
+            "early_stopping_rounds": self.early_stopping_rounds,
+            **self.params
+        }
+        for lg in loggers:
+            lg.on_start(meta)
+
+        train_rows = (
+            pl.scan_parquet(self.train_paths)
+              .select(pl.len())
+              .collect()
+              .item()
+        )
+        test_rows = (
+            pl.scan_parquet(self.test_paths)
+              .select(pl.len())
+              .collect()
+              .item()
+        )
+
+        oof = np.zeros(train_rows, dtype=np.float32)
+        test_pred = np.zeros(test_rows, dtype=np.float32)
 
         iteration_list = []
+        auc_scores = []
 
-        for fold, (tr_idx, val_idx) in enumerate(self.fold_indices):
-            print(f"\nFold {fold + 1}")
-            start = time.time()
+        for i in range(self.n_folds):
+            title = f" Fold {i + 1} / {self.n_folds} "
+            print("=" * 48)
+            print(f"{title:=^48}")
+            print("=" * 48)
+            print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+            print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-            X_tr, y_tr, w_tr = (
-                self.X.iloc[tr_idx],
-                self.y[tr_idx],
-                self.weights[tr_idx]
+            t_fold_start = now()
+
+            need_cols = self.features + [self.target, "row_id"]
+            train = (
+                self.lf_train
+                .filter(pl.col(self.fold_col) != i)
+                .select(need_cols)
+                .collect(engine="streaming")
             )
-            X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
+            valid = (
+                self.lf_train
+                .filter(pl.col(self.fold_col) == i)
+                .select(need_cols)
+                .collect(engine="streaming")
+            )
+            X_train = (
+                train
+                .select(self.features)
+                .to_numpy()
+                .astype(np.float32)
+            )
+            y_train = (
+                train
+                .select(self.target)
+                .to_numpy()
+                .astype(np.int32)
+                .ravel()
+            )
+            X_valid = (
+                valid
+                .select(self.features)
+                .to_numpy()
+                .astype(np.float32)
+            )
+            y_valid = (
+                valid
+                .select(self.target)
+                .to_numpy()
+                .astype(np.int32)
+                .ravel()
+            )
+            val_idx = (
+                valid
+                .select("row_id")
+                .to_series()
+                .to_numpy()
+                .astype(np.int32, copy=False)
+            )
+            test = (
+                self.lf_test
+                .select(self.features)
+                .collect(engine="streaming")
+                .to_numpy()
+                .astype(np.float32)
+            )
 
             train_pool = Pool(
-                X_tr, y_tr,
-                cat_features=self.cat_cols,
-                weight=w_tr
+                X_train,
+                y_train,
+                cat_features=self.cat_cols
             )
-            val_pool = Pool(
-                X_val, y_val,
+            valid_pool = Pool(
+                X_valid,
+                y_valid,
                 cat_features=self.cat_cols
             )
 
             model = CatBoostClassifier(**self.params)
 
             model.fit(
-                train_pool, eval_set=val_pool, use_best_model=True
+                train_pool,
+                eval_set=valid_pool,
+                use_best_model=True
             )
 
             best_iter = model.best_iteration_
-            val_preds = model.predict_proba(X_val, ntree_end=best_iter)[:, 1]
-            oof_preds[val_idx] = val_preds
 
-            test_preds += model.predict_proba(self.test)[:, 1]
+            val_pred = model.predict_proba(X_valid, ntree_end=best_iter)[:, 1]
+            oof[val_idx] = val_pred
 
-            val_auc = roc_auc_score(y_val, val_preds)
-            print(f"Valid AUC: {val_auc:.5f}")
+            test_pred += model.predict_proba(test)[:, 1]
 
-            end = time.time()
-            print_duration(start, end)
+            valid_auc = roc_auc_score(y_valid, val_pred)
+            print(f"AUC Valid: {valid_auc:.5f}")
 
-            self.fold_models.append(
-                CBFoldModel(
-                    model, X_val, y_val, fold
-                ))
-            self.fold_scores.append(val_auc)
-
+            auc_scores.append(valid_auc)
             iteration_list.append(best_iter)
 
-        print("\n=== CV Results ===")
-        print(f"Fold scores: {self.fold_scores}")
-        print(
-            f"Mean: {np.mean(self.fold_scores):.5f}, "
-            f"Std: {np.std(self.fold_scores):.5f}"
+            t_fold_end = now()
+            runtime = print_duration(
+                t_fold_start, t_fold_end, f"Fold {i+1} Runtime"
+            )
+            fold_summary = {
+                "auc": valid_auc,
+                "runtime": runtime
+            }
+
+            for lg in loggers:
+                lg.on_fold_end(
+                    i,
+                    axis_name="iter",
+                    summary=fold_summary
+                )
+            del model, X_train, y_train, X_valid, y_valid, test
+            gc.collect()
+
+        y = (
+            self.lf_train
+            .select(self.target)
+            .cast(pl.Float32)
+            .collect(engine="streaming")
+            .to_numpy()
+            .ravel()
         )
+        test_pred /= self.n_folds
+        auc_oof = roc_auc_score(y, oof)
 
-        self.oof_score = roc_auc_score(self.y, oof_preds)
-        print(f" OOF score: {self.oof_score:.5f}")
+        auc_mean = np.mean(auc_scores)
+        auc_std = np.std(auc_scores)
+        iter_mean = np.mean(iteration_list)
+
+        print(f"\n{' CV Results ':*^48}")
+        print("─" * 48)
+        print(f" {'Metric':^9}  {'OOF':>10}  {'Mean':>10} ± {'Std':<10} ")
+        print("-" * 48)
+        print(f" {'AUC':^9} "
+              f" {auc_oof:>10.5f} "
+              f" {auc_mean:>10.5f} ± {auc_std:<10.5f} ")
+        print("─" * 48)
+
         print(f"Avg best iteration: {np.mean(iteration_list)}")
-        print(f"Best iterations: \n{iteration_list}")
 
-        test_preds /= self.n_splits
+        t_total_end = now()
+        total_runtime = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-        return oof_preds, test_preds
+        result = {
+            "oof": oof,
+            "test_pred": test_pred,
+            "oof_score": auc_oof
+        }
+        overall_summary = {
+            "auc_oof": auc_oof,
+            "auc_mean": auc_mean,
+            "auc_std": auc_std,
+            "iter_mean": iter_mean,
+            "total_runtime": total_runtime
+        }
+        for lg in loggers:
+            lg.on_end(overall_summary)
 
-    def full_train(self, iterations, ID, level="l1"):
+        return result
+
+    def full_train(
+        self,
+        loggers: list[CVLogger] | None = None
+    ):
         """
         訓練データ全体でモデルを学習し、test_dfに対する予測結果をnpy形式で保存する。
 
         Parameters
         ----------
-        ID : str
-            保存ファイル名に付加する識別子。
-        level : str, default "l1"
-            保存先のフォルダ名。
         """
-        if self.test is None:
-            raise ValueError("test_df not provided for CBCVTrainer.")
+        if self.test_paths is None:
+            raise ValueError("Please provide test_paths (got None).")
 
-        iterations = iterations * self.n_splits/(self.n_splits-1)
-        self.params["iterations"] = iterations
+        t_total_start = now()
+
+        loggers = loggers or [NoOpLogger()]
+        meta = {
+            "data_id": self.data_id,
+            "seed": self.seed,
+            "n_folds": self.n_folds,
+            "early_stopping_rounds": self.early_stopping_rounds,
+            **self.params
+        }
+        for lg in loggers:
+            lg.on_start(meta)
+
+        test_rows = (
+            pl.scan_parquet(self.test_paths)
+              .select(pl.len())
+              .collect()
+              .item()
+        )
+
+        test_pred = np.zeros(test_rows, dtype=np.float32)
+
+        need_cols = self.features + [self.target]
+        train = (
+            self.lf_train
+            .select(need_cols)
+            .collect(engine="streaming")
+        )
+        X_train = (
+            train
+            .select(self.features)
+            .to_numpy()
+            .astype(np.float32)
+        )
+        y_train = (
+            train
+            .select(self.target)
+            .to_numpy()
+            .astype(np.int32)
+            .ravel()
+        )
+        test = (
+            self.lf_test
+            .select(self.features)
+            .collect(engine="streaming")
+            .to_numpy()
+            .astype(np.float32)
+        )
 
         train_pool = Pool(
-            self.X, self.y, cat_features=self.cat_cols, weight=self.weights)
-
-        start = time.time()
+            X_train,
+            y_train,
+            cat_features=self.cat_cols,
+            weight=self.weights
+        )
 
         model = CatBoostClassifier(**self.params)
 
@@ -197,132 +394,144 @@ class CBCVTrainer:
             use_best_model=True
         )
 
-        end = time.time()
-        print_duration(start, end)
+        test_pred += model.predict(test)
 
-        self.fold_models.append(
-            CBFoldModel(
-                model, None, None, None
-            ))
+        test_pred /= self.n_folds
 
-        test_preds = model.predict_proba(self.test)[:, 1]
+        t_total_end = now()
+        total_runtime = print_duration(
+            t_total_start, t_total_end, "Total Runtime"
+        )
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-        path = f"../artifacts/preds/{level}/test_full_{ID}.npy"
-        np.save(path, test_preds)
-        print(f"Successfully saved test predictions to {path}")
+        result = {
+            "oof": None,
+            "test_pred": test_pred,
+            "oof_score": None
+        }
+        overall_summary = {
+            "total_runtime": total_runtime
+        }
+        for lg in loggers:
+            lg.on_end(overall_summary)
 
-    def fit_one_fold(self, fold=0):
+        return result
+
+    def fit_one_fold(
+        self,
+        fold_idx=0,
+        loggers: list[CVLogger] | None = None
+    ):
         """
         指定した1つのfoldのみを用いてモデルを学習する。
         主にOptunaによるハイパーパラメータ探索時に使用。
 
         Parameters
         ----------
-        fold : int
-            学習に使うfold番号。
 
         Return
         ------
         auc : float
             Score
         """
-        tr_idx, val_idx = list(self.fold_indices)[fold]
-        start = time.time()
+        t_total_start = now()
 
-        X_tr, y_tr, w_tr = (
-            self.X.iloc[tr_idx],
-            self.y[tr_idx],
-            self.weights[tr_idx]
+        loggers = loggers or [NoOpLogger()]
+        meta = {
+            "data_id": self.data_id,
+            "seed": self.seed,
+            "n_folds": self.n_folds,
+            "early_stopping_rounds": self.early_stopping_rounds,
+            **self.params
+        }
+        for lg in loggers:
+            lg.on_start(meta)
+
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
+
+        need_cols = self.features + [self.target, "row_id"]
+        train = (
+            self.lf_train
+            .filter(pl.col(self.fold_col) != fold_idx)
+            .select(need_cols)
+            .collect(engine="streaming")
         )
-        X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
+        valid = (
+            self.lf_train
+            .filter(pl.col(self.fold_col) == fold_idx)
+            .select(need_cols)
+            .collect(engine="streaming")
+        )
+        X_train = (
+            train
+            .select(self.features)
+            .to_numpy()
+            .astype(np.float32)
+        )
+        y_train = (
+            train
+            .select(self.target)
+            .to_numpy()
+            .astype(np.int32)
+            .ravel()
+        )
+        X_valid = (
+            valid
+            .select(self.features)
+            .to_numpy()
+            .astype(np.float32)
+        )
+        y_valid = (
+            valid
+            .select(self.target)
+            .to_numpy()
+            .astype(np.int32)
+            .ravel()
+        )
 
         train_pool = Pool(
-            X_tr, y_tr,
-            cat_features=self.cat_cols,
-            weight=w_tr
+            X_train,
+            y_train,
+            cat_features=self.cat_cols
         )
-        val_pool = Pool(
-            X_val, y_val,
+        valid_pool = Pool(
+            X_valid,
+            y_valid,
             cat_features=self.cat_cols
         )
 
         model = CatBoostClassifier(**self.params)
 
         model.fit(
-            train_pool, eval_set=val_pool, use_best_model=True,
+            train_pool, eval_set=valid_pool, use_best_model=True,
         )
 
-        preds = model.predict_proba(X_val)[:, 1]
-        auc = roc_auc_score(y_val, preds)
-        print(f"Valid AUC: {auc:.5f}")
+        val_pred = model.predict_proba(X_valid)[:, 1]
+        auc_valid = roc_auc_score(y_valid, val_pred)
+        print(f"Valid AUC: {auc_valid:.5f}")
 
-        end = time.time()
-        print_duration(start, end)
-
-        del model, train_pool, val_pool
+        del model, X_train, y_train, X_valid, y_valid
         gc.collect()
-        return auc
 
+        t_total_end = now()
+        total_runtime = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-class CBFoldModel:
-    """
-    CatBoostのfold単位のモデルを保持するクラス。
+        fold_summary = {
+            "auc": auc_valid,
+            "runtime": total_runtime
+        }
 
-    Attributes
-    ----------
-    model : catboost.CatBoostRegressor
-        学習済みのCatBoostモデル。
-    X_val : pd.DataFrame
-        検証用の特徴量データ。
-    y_val : pd.Series
-        検証用のターゲットラベル。
-    fold_index : int
-        Foldの番号。
-    """
+        for lg in loggers:
+            lg.on_fold_end(
+                fold_idx,
+                axis_name="iter",
+                summary=fold_summary
+            )
 
-    def __init__(self, model, X_val, y_val, fold_index):
-        self.model = model
-        self.X_val = X_val
-        self.y_val = y_val
-        self.fold_index = fold_index
-
-    def shap_plot(self, sample=1000):
-        """
-        SHAPを用いた特徴量の重要度の可視化を行う。
-
-        Parameters
-        ----------
-        sample : int, default 1000
-            可視化に使用するサンプル数。
-        """
-        explainer = shap.TreeExplainer(self.model)
-        shap_values = explainer(self.X_val[:sample])
-        shap.summary_plot(shap_values, self.X_val[:sample], max_display=100)
-
-    def save_model(self, path="../artifacts/model/cb_vn.pkl"):
-        """
-        学習済みモデルを指定パスに保存する。
-
-        Parameters
-        ----------
-        path : str
-            モデルを保存するパス。
-        """
-        joblib.dump(self.model, path)
-
-    def load_model(self, path):
-        """
-        指定されたパスからモデルを読み込む。
-
-        Parameters
-        ----------
-        path : str
-            モデルファイルのパス。
-
-        Returns
-        -------
-        self : CBFoldModel
-            読み込んだモデルを保持するインスタンス自身を返す。
-        """
-        self.model = joblib.load(path)
-        return self
+        return auc_valid

@@ -8,13 +8,13 @@ import cudf
 import rmm
 import torch
 import cupy as cp
+import rmm.mr as mr
 import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
 import torch.nn as nn
 import torch.nn.functional as F
 
-import rmm.mr as mr
 from rmm.allocators.cupy import rmm_cupy_allocator
 from sklearn.metrics import log_loss
 from sklearn.metrics import roc_auc_score
@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from torch.utils.dlpack import from_dlpack as torch_from_dlpack
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from src.utils.loggers import CVResult, CVLogger, NoOpLogger
+from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
 from src.utils.mem_info import free_ram_gib, free_vram_gib
 
@@ -32,26 +32,26 @@ def compute_feature_stats(
     features: list[str],
     num_cols: list[str],
     fold_col: str = None,
-    include_folds: Optional[Iterable[int]] = None,
-    exclude_folds: Optional[Iterable[int]] = None
+    include_fold: int = None,
+    exclude_fold: int = None
 ):
     lf = pl.scan_parquet(paths, low_memory=True)
     if fold_col:
-        if include_folds is not None:
-            lf = lf.filter(pl.col(fold_col).is_in(sorted(include_folds)))
-        if exclude_folds is not None:
-            lf = lf.filter(~pl.col(fold_col).is_in(sorted(exclude_folds)))
+        if include_fold is not None:
+            lf = lf.filter(pl.col(fold_col) == include_fold)
+        if exclude_fold is not None:
+            lf = lf.filter(~pl.col(fold_col) != exclude_fold)
 
     exprs = []
     for c in num_cols:
         exprs += [pl.col(c).cast(pl.Float64).mean().alias(f"{c}_mean"),
                   pl.col(c).cast(pl.Float64).std(ddof=0).alias(f"{c}_std")]
-    out = lf.select(exprs).collect(streaming=True)  # 大規模でも低メモリ
+    out = lf.select(exprs).collect(engine="streaming")
     mean = out.select(
         [f"{c}_mean" for c in num_cols]).to_numpy().ravel().astype(np.float32)
     std = out.select(
         [f"{c}_std" for c in num_cols]).to_numpy().ravel().astype(np.float32)
-    std[std == 0] = 1.0
+    std[std < 1e-4] = 1.0
     return mean, std
 
 
@@ -67,13 +67,12 @@ class ParquetStream(IterableDataset):
     std: np.ndarray
 
     fold_col: Optional[str] = None
-    include_folds: Optional[Iterable[int]] = None
-    exclude_folds: Optional[Iterable[int]] = None
+    include_fold: int = None
+    exclude_fold: int = None
     weight_col: Optional[str] = None
 
     batch_size: int = 1024
     rows_per_epoch: int | None = None
-    extra_exclude_cols: Optional[Iterable[str]] = None
     predict_mode: bool = False
     seed: int = 42
     shuffle: bool = True
@@ -92,30 +91,10 @@ class ParquetStream(IterableDataset):
                 else [self.paths]
             )
         ]
-        self.num_idxs = list(self.num_idxs or [])
-        self.include_folds = (
-            None
-            if self.include_folds is None
-            else set(self.include_folds)
-        )
-        self.exclude_folds = (
-            None
-            if self.exclude_folds is None
-            else set(self.exclude_folds)
-        )
-        self.predict_mode = bool(self.predict_mode)
 
         # --- スキーマ取得は ParquetFile から（dataset 不使用）---
         pf0 = pq.ParquetFile(self.paths[0])
         all_cols = pf0.schema_arrow.names
-
-        if self.extra_exclude_cols:
-            excl = (
-                {self.extra_exclude_cols}
-                if isinstance(self.extra_exclude_cols, str)
-                else set(self.extra_exclude_cols)
-            )
-            self.features = [c for c in self.features if c not in excl]
 
         # 入力列（重複除去）
         cols = list(self.features or [])
@@ -187,18 +166,14 @@ class ParquetStream(IterableDataset):
                     path,
                     columns=self._columns,
                     row_groups=[int(rg)]
-                )
+                ).astype("float32")
                 if len(gdf) == 0:
                     continue
 
-                # fold フィルタ（GPU）
-                if (not self.predict_mode) and self.fold_col and (self.fold_col in gdf.columns):
-                    if self.include_folds is not None:
-                        gdf = gdf[gdf[self.fold_col].isin(sorted(self.include_folds))]
-                    if self.exclude_folds is not None:
-                        gdf = gdf[~gdf[self.fold_col].isin(sorted(self.exclude_folds))]
-                    if len(gdf) == 0:
-                        continue
+                if self.include_fold is not None:
+                    gdf = gdf[gdf[self.fold_col] == self.include_fold]
+                if self.exclude_fold is not None:
+                    gdf = gdf[~gdf[self.fold_col] != self.exclude_fold]
 
                 # GPU 内シャッフル
                 if self.shuffle:
@@ -405,7 +380,7 @@ class MLPCVTrainer:
 
     params: dict = field(default_factory=dict)
 
-    n_fold: int = 5
+    n_folds: int = 5
     seed: int = 42
     gpu: bool = True
 
@@ -469,7 +444,7 @@ class MLPCVTrainer:
         all_cols = hdr.columns
 
         if self.fold_col is None:
-            self.fold_col = f"{self.n_fold}fold-s{self.seed}"
+            self.fold_col = f"{self.n_folds}fold-s{self.seed}"
 
         if self.cat_cols is None:
             self.cat_cols = [
@@ -505,7 +480,13 @@ class MLPCVTrainer:
         self.num_idxs = [self.features.index(c) for c in self.num_cols]
 
         scan = pl.scan_parquet(self.train_paths)
-        exprs = [pl.col(c).n_unique().alias(c) for c in self.cat_cols]
+        exprs = [
+            pl.col(c)
+            .rank("dense")
+            .cast(pl.Int32)
+            .n_unique()
+            .alias(c) for c in self.cat_cols
+        ]
         df1 = scan.select(exprs).collect()
 
         if df1.width == 0 or df1.height == 0:
@@ -529,7 +510,6 @@ class MLPCVTrainer:
 
     def fit(
         self,
-        extra_exclude_cols=None,
         loggers: list[CVLogger] | None = None
     ):
         """
@@ -551,7 +531,7 @@ class MLPCVTrainer:
         meta = {
             "data_id": self.data_id,
             "seed": self.seed,
-            "n_fold": self.n_fold,
+            "n_folds": self.n_folds,
             **self.params
         }
         for lg in loggers:
@@ -564,13 +544,14 @@ class MLPCVTrainer:
         test_pred = np.zeros(test_rows, dtype=np.float32)
 
         epoch_list = []
-        loss_scores = []
+        logloss_scores = []
         auc_scores = []
 
-        for i in range(self.n_fold):
-            print("=" * 22)
-            print(f"===== Fold {i + 1} / {self.n_fold} =====")
-            print("=" * 22)
+        for i in range(self.n_folds):
+            title = f" Fold {i + 1} / {self.n_folds} "
+            print("=" * 48)
+            print(f"{title:=^48}")
+            print("=" * 48)
             print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
             print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
@@ -581,7 +562,7 @@ class MLPCVTrainer:
                 self.features,
                 self.num_cols,
                 self.fold_col,
-                exclude_folds=[i]
+                exclude_fold=i
             )
 
             train_ds = ParquetStream(
@@ -592,10 +573,9 @@ class MLPCVTrainer:
                 mean,
                 std,
                 fold_col=self.fold_col,
-                exclude_folds=[i],
+                exclude_fold=i,
                 weight_col=self.weight_col,
                 batch_size=self.params["batch_size"],
-                extra_exclude_cols=extra_exclude_cols,
                 predict_mode=False,
                 seed=self.seed,
                 shuffle=True
@@ -610,7 +590,6 @@ class MLPCVTrainer:
                 fold_col=self.fold_col,
                 include_folds=[i],
                 batch_size=self.params["batch_size"],
-                extra_exclude_cols=extra_exclude_cols,
                 predict_mode=False,
                 seed=self.seed,
                 shuffle=False
@@ -624,7 +603,6 @@ class MLPCVTrainer:
                 std,
                 fold_col=self.fold_col,
                 batch_size=self.params["batch_size"],
-                extra_exclude_cols=extra_exclude_cols,
                 predict_mode=True,
                 seed=self.seed,
                 shuffle=False
@@ -650,10 +628,10 @@ class MLPCVTrainer:
             )
 
             lf = pl.scan_parquet(self.train_paths)
-            val_y = (
+            y_val = (
                 lf.filter(pl.col(self.fold_col) == i)
                 .select(self.target)
-                .collect(streaming=True)
+                .collect(engine="streaming")
                 .to_series()
                 .to_numpy()
                 .astype("float32")
@@ -684,13 +662,13 @@ class MLPCVTrainer:
                 eta_min=self.params["eta_min"]
             )
 
-            best_log_loss = float("inf")
+            best_logloss = float("inf")
             best_model_state = None
             best_epoch = 0
 
             history = {
-                "train": {"loss": [], "auc": []},
-                "valid": {"loss": [], "auc": []}
+                "train": {"logloss": [], "auc": []},
+                "valid": {"logloss": [], "auc": []}
             }
             extra_hist = {"lr": []}
 
@@ -726,12 +704,19 @@ class MLPCVTrainer:
                         pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
                         preds.append(pred_probs)
                 val_pred = np.concatenate(preds)
-                val_log_loss = log_loss(val_y, val_pred)
-                scheduler.step()
+                logloss_val = log_loss(y_val, val_pred)
+                auc_val = roc_auc_score(y_val, val_pred)
                 lr = scheduler.get_last_lr()[0]
 
+                history["valid"]["logloss"].append(logloss_val)
+                history["valid"]["auc"].append(auc_val)
+
+                extra_hist["lr"].append(lr)
+
+                scheduler.step()
+
                 train_pred = []
-                train_y = []
+                y_train = []
                 with torch.no_grad():
                     for batch in train_loader:
                         if len(batch) == 3:
@@ -744,30 +729,24 @@ class MLPCVTrainer:
                         pred_probs = torch.sigmoid(
                             pred_logits).cpu().numpy()
                         train_pred.append(pred_probs)
-                        train_y.append(yb.cpu().numpy())
+                        y_train.append(yb.cpu().numpy())
                 train_pred = np.concatenate(train_pred)
-                train_y = np.concatenate(train_y)
+                y_train = np.concatenate(y_train)
 
-                train_log_loss = log_loss(train_y, train_pred)
-                train_auc = roc_auc_score(train_y, train_pred)
+                logloss_train = log_loss(y_train, train_pred)
+                auc_train = roc_auc_score(y_train, train_pred)
 
-                history["train"]["loss"].append(train_log_loss)
-                history["train"]["auc"].append(train_auc)
-
-                val_auc = roc_auc_score(val_y, val_pred)
-                history["valid"]["loss"].append(val_log_loss)
-                history["valid"]["auc"].append(val_auc)
-
-                extra_hist["lr"].append(lr)
+                history["train"]["logloss"].append(logloss_train)
+                history["train"]["auc"].append(auc_train)
 
                 print(
                     f"Epoch {epoch+1}: "
-                    f"Train Logloss = {train_log_loss:.5f}, "
-                    f"Val Logloss = {val_log_loss:.5f}"
+                    f"Train Logloss = {logloss_train:.5f}, "
+                    f"Val Logloss = {logloss_val:.5f}"
                 )
 
-                if val_log_loss < best_log_loss:
-                    best_log_loss = val_log_loss
+                if logloss_val < best_logloss:
+                    best_logloss = logloss_val
                     best_model_state = {
                         k: v.cpu().clone() for k, v
                         in model.state_dict().items()
@@ -775,14 +754,14 @@ class MLPCVTrainer:
                     best_epoch = epoch + 1
                     print(
                         f"New best model saved at epoch {epoch+1}, "
-                        f"Logloss: {val_log_loss:.5f}")
+                        f"Logloss: {logloss_val:.5f}")
                 elif (
                     (epoch - best_epoch >= self.params["early_stopping_rounds"])
                     and (epoch + 1 >= self.params["min_epochs"])
                 ):
                     print(f"Early stopping at epoch {epoch+1}")
                     print(f"Loading best model from epoch {best_epoch} "
-                          f"with Logloss {best_log_loss:.5f}")
+                          f"with Logloss {logloss_val:.5f}")
                     break
 
             model.load_state_dict(
@@ -804,11 +783,14 @@ class MLPCVTrainer:
             val_preds = np.concatenate(val_preds).ravel()
             oof[val_idx] = val_preds
 
-            best_auc = roc_auc_score(val_y, val_preds)
+            best_auc = roc_auc_score(y_val, val_preds)
 
-            loss_scores.append(best_log_loss)
+            logloss_scores.append(best_logloss)
             auc_scores.append(best_auc)
             epoch_list.append(best_epoch)
+
+            print(f"Best Logloss: {best_logloss:.5f}")
+            print(f"Best AUC: {best_auc}")
 
             with torch.no_grad():
                 fold_test_preds = []
@@ -819,14 +801,12 @@ class MLPCVTrainer:
                     fold_test_preds.append(test_probs)
                 test_pred += np.concatenate(fold_test_preds).ravel()
 
-            print(f"Best Logloss: {best_log_loss:.5f}")
-
             t_fold_end = now()
             runtime = print_duration(
-                t_fold_start, t_fold_end, f"Fold {i+1} Runtime"
+                t_fold_start, t_fold_end, f"\nFold {i+1} Runtime"
             )
             fold_summary = {
-                "loss": best_log_loss,
+                "loss": best_logloss,
                 "auc": best_auc,
                 "runtime": runtime
             }
@@ -844,31 +824,36 @@ class MLPCVTrainer:
             cp.get_default_memory_pool().free_all_blocks()
             self.pmp.free_all_blocks()
 
-        print("\n=== CV Results ===")
         y = (
             pl.read_parquet(self.train_paths, columns=self.target)
               .get_column(self.target)
               .cast(pl.Float32)
               .to_numpy()
         )
-        oof_score_auc = roc_auc_score(y, oof)
-        oof_score_loss = log_loss(y, oof)
+        test_pred /= self.n_folds
 
+        auc_oof = roc_auc_score(y, oof)
         auc_mean = np.mean(auc_scores)
         auc_std = np.std(auc_scores)
 
-        loss_mean = np.mean(loss_scores)
-        loss_std = np.std(loss_scores)
+        logloss_oof = log_loss(y, oof)
+        logloss_mean = np.mean(logloss_scores)
+        logloss_std = np.std(logloss_scores)
 
         epoch_mean = np.mean(epoch_list)
 
-        test_pred /= self.n_fold
+        print(f"\n{' CV Results ':*^48}")
+        print("─" * 48)
+        print(f" {'Metric':^9}  {'OOF':>10}  {'Mean':>10} ± {'Std':<10} ")
+        print("-" * 48)
+        print(f" {'Logloss':^9} "
+              f" {logloss_oof:>10.5f} "
+              f" {logloss_mean:>10.5f} ± {logloss_std:<10.5f} ")
+        print(f" {'AUC':^9} "
+              f" {auc_oof:>10.5f} "
+              f" {auc_mean:>10.5f} ± {auc_std:<10.5f} ")
+        print("─" * 48)
 
-        print(f"OOF AUC score: {oof_score_auc:.5f}")
-        print(
-            f"Mean: {auc_mean:.5f}, "
-            f"Std: {auc_std:.5f}"
-        )
         print(f"Avg best epoch: {epoch_mean}")
 
         t_total_end = now()
@@ -878,18 +863,18 @@ class MLPCVTrainer:
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-        result = CVResult(
-            oof,
-            test_pred,
-            oof_score_auc
-        )
+        result = {
+            "oof": oof,
+            "test_pred": test_pred,
+            "oof_score": auc_oof
+        }
         overall_summary = {
-            "auc_oof": oof_score_auc,
+            "auc_oof": auc_oof,
             "auc_mean": auc_mean,
             "auc_std": auc_std,
-            "loss_oof": oof_score_loss,
-            "loss_mean": loss_mean,
-            "loss_std": loss_std,
+            "loss_oof": logloss_oof,
+            "loss_mean": logloss_mean,
+            "loss_std": logloss_std,
             "epoch_mean": epoch_mean,
             "total_runtime": total_runtime
         }
@@ -901,7 +886,6 @@ class MLPCVTrainer:
     def fit_one_fold(
         self,
         fold_idx=0,
-        extra_exclude_cols=None,
         loggers=None
     ):
         """
@@ -924,7 +908,7 @@ class MLPCVTrainer:
         meta = {
             "data_id": self.data_id,
             "seed": self.seed,
-            "n_fold": self.n_fold,
+            "n_folds": self.n_folds,
             **self.params
         }
         for lg in loggers:
@@ -938,7 +922,7 @@ class MLPCVTrainer:
             self.features,
             self.num_cols,
             self.fold_col,
-            exclude_folds=[fold_idx]
+            exclude_fold=fold_idx
         )
 
         train_ds = ParquetStream(
@@ -949,10 +933,9 @@ class MLPCVTrainer:
             mean,
             std,
             fold_col=self.fold_col,
-            exclude_folds=[fold_idx],
+            exclude_fold=fold_idx,
             weight_col=self.weight_col,
             batch_size=self.params["batch_size"],
-            extra_exclude_cols=extra_exclude_cols,
             predict_mode=False,
             seed=self.seed,
             shuffle=True
@@ -967,7 +950,6 @@ class MLPCVTrainer:
             fold_col=self.fold_col,
             include_folds=[fold_idx],
             batch_size=self.params["batch_size"],
-            extra_exclude_cols=extra_exclude_cols,
             predict_mode=False,
             seed=self.seed,
             shuffle=False
@@ -990,11 +972,11 @@ class MLPCVTrainer:
         val_y = (
             lf.filter(pl.col(self.fold_col) == fold_idx)
             .select(self.target)
-            .collect(streaming=True)
+            .collect(engine="streaming")
             .to_series()
             .to_numpy()
             .astype("float32")
-                )
+        )
 
         model = SimpleMLP(
             input_dim=len(self.features),

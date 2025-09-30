@@ -3,8 +3,8 @@ import gc
 import os
 import math
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional, List
 from time import perf_counter as now
+from typing import Any, Iterable, Optional, List
 
 import cudf
 import rmm
@@ -17,7 +17,7 @@ from rmm.allocators.cupy import rmm_cupy_allocator
 import xgboost as xgb
 from sklearn.metrics import roc_auc_score
 
-from src.utils.loggers import CVResult, CVLogger, NoOpLogger
+from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
 from src.utils.mem_info import free_ram_gib, free_vram_gib
 
@@ -31,10 +31,9 @@ class ParquetIter(xgb.core.DataIter):
     target: str = "target"
     cat_cols: Optional[Iterable[str]] = None
     fold_col: Optional[str] = None
-    include_folds: Optional[Iterable[int]] = None
-    exclude_folds: Optional[Iterable[int]] = None
+    include_fold: str = None
+    exclude_fold: str = None
     weight_col: Optional[str] = None
-    extra_exclude_cols: Optional[Iterable[str]] = None
 
     rowgroup_batch: int = 1
     gpu: Optional[bool] = None
@@ -50,36 +49,9 @@ class ParquetIter(xgb.core.DataIter):
     _columns: List[str] = field(init=False, default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
-        # 親の DataIter 初期化はここで
         super().__init__()
-
-        # 型・既定値の正規化
-        self.cat_cols = list(self.cat_cols or [])
-        self.include_folds = (
-            None
-            if self.include_folds is None
-            else set(self.include_folds)
-        )
-        self.exclude_folds = (
-            None
-            if self.exclude_folds is None
-            else set(self.exclude_folds)
-        )
-        self.gpu = bool(self.gpu)
-
-        self.predict_mode = bool(self.predict_mode)
-        self.rowgroup_batch = int(self.rowgroup_batch)
-
-        # --- extra exclude colsを除外 ---
         hdr = pl.read_parquet(self.paths, n_rows=0)
         all_cols = hdr.columns
-        if self.extra_exclude_cols:
-            excl = (
-                {self.extra_exclude_cols}
-                if isinstance(self.extra_exclude_cols, str)
-                else set(self.extra_exclude_cols)
-            )
-            self.features = [c for c in self.features if c not in excl]
 
         # 入力列（重複除去）
         cols = list(self.features)
@@ -136,18 +108,15 @@ class ParquetIter(xgb.core.DataIter):
             # ※ cudf.read_parquet は単一ファイル向け。複数パスは「ループで回す」方針。
             gdf = cudf.read_parquet(path, columns=self._columns, row_groups=bundle)
 
-            # fold フィルタは読み込み後に cuDF 側で適用
-            if (not self.predict_mode) and self.fold_col and (self.fold_col in gdf.columns):
-                if self.include_folds is not None:
-                    gdf = gdf[gdf[self.fold_col].isin(sorted(self.include_folds))]
-                if self.exclude_folds is not None:
-                    gdf = gdf[~gdf[self.fold_col].isin(sorted(self.exclude_folds))]
+            if self.include_fold is not None:
+                gdf = gdf[gdf[self.fold_col] == self.include_fold]
+            if self.exclude_fold is not None:
+                gdf = gdf[~gdf[self.fold_col] != self.exclude_folds]
 
             # カテゴリ化（必要な列のみ）
             if self.cat_cols:
                 for c in self.cat_cols:
-                    if c in gdf.columns:
-                        gdf[c] = gdf[c].astype("category")
+                    gdf[c] = gdf[c].astype("category")
 
             # 出力
             if self.predict_mode:
@@ -171,7 +140,7 @@ class XGBCVTrainer:
 
     Attributes
     ----------
-    data_id: int
+    data_id: str
         使用するdata
     params : dict
         XGBのパラメータ。
@@ -182,7 +151,7 @@ class XGBCVTrainer:
     seed : int, default 42
         乱数シード。
     """
-    data_id: int
+    data_id: str
     train_paths: str | list[str]
     test_paths: str | list[str] | None = None
 
@@ -195,13 +164,11 @@ class XGBCVTrainer:
 
     params: dict = field(default_factory=dict)
 
-    n_fold: int = 5
+    n_folds: int = 5
     seed: int = 42
     gpu: bool = True
 
     opts: dict = field(init=True, default_factory=dict)
-
-    _fi_fold_frames: list = field(init=False, default_factory=list, repr=False)
 
     def __post_init__(self):
         if isinstance(self.train_paths, (str, os.PathLike)):
@@ -259,7 +226,7 @@ class XGBCVTrainer:
         all_cols = hdr.columns
 
         if self.fold_col is None:
-            self.fold_col = f"{self.n_fold}fold-s{self.seed}"
+            self.fold_col = f"{self.n_folds}fold-s{self.seed}"
 
         if self.cat_cols is None:
             self.cat_cols = [
@@ -300,7 +267,6 @@ class XGBCVTrainer:
 
     def fit(
         self,
-        extra_exclude_cols=None,
         loggers: list[CVLogger] | None = None
     ):
         """
@@ -322,7 +288,7 @@ class XGBCVTrainer:
         meta = {
             "data_id": self.data_id,
             "seed": self.seed,
-            "n_fold": self.n_fold,
+            "n_folds": self.n_folds,
             "early_stopping_rounds": self.early_stopping_rounds,
             **self.params
         }
@@ -346,12 +312,14 @@ class XGBCVTrainer:
         test_pred = np.zeros(test_rows, dtype=np.float32)
 
         iteration_list = []
-        fold_scores = []
+        auc_scores = []
+        fi_fold_frames = []
 
-        for i in range(self.n_fold):
-            print("=" * 22)
-            print(f"===== Fold {i + 1} / {self.n_fold} =====")
-            print("=" * 22)
+        for i in range(self.n_folds):
+            title = f" Fold {i + 1} / {self.n_folds} "
+            print("=" * 48)
+            print(f"{title:=^48}")
+            print("=" * 48)
             print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
             print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
@@ -364,9 +332,8 @@ class XGBCVTrainer:
                 target=self.target,
                 cat_cols=self.cat_cols,
                 fold_col=self.fold_col,
-                exclude_folds=[i],
+                exclude_fold=i,
                 weight_col=self.weight_col,
-                extra_exclude_cols=extra_exclude_cols,
                 gpu=True
             )
             valid_it = ParquetIter(
@@ -375,9 +342,8 @@ class XGBCVTrainer:
                 target=self.target,
                 cat_cols=self.cat_cols,
                 fold_col=self.fold_col,
-                include_folds=[i],
+                include_fold=i,
                 weight_col=self.weight_col,
-                extra_exclude_cols=extra_exclude_cols,
                 gpu=self.gpu
             )
             test_it = ParquetIter(
@@ -385,7 +351,6 @@ class XGBCVTrainer:
                 features=self.features,
                 target=self.target,
                 cat_cols=self.cat_cols,
-                extra_exclude_cols=extra_exclude_cols,
                 predict_mode=True,
                 gpu=self.gpu
             )
@@ -425,13 +390,12 @@ class XGBCVTrainer:
                 self.params,
                 dtrain,
                 num_boost_round=self.num_boost_round,
-                evals=[(dtrain, "train"), (dvalid, "eval")],
+                evals=[(dtrain, "train"), (dvalid, "valid")],
                 early_stopping_rounds=self.early_stopping_rounds,
                 verbose_eval=100,
                 evals_result=evals_result,
             )
 
-            # oof
             oof[val_idx] = model.predict(
                 dvalid, iteration_range=(0, model.best_iteration + 1)
             )
@@ -450,14 +414,14 @@ class XGBCVTrainer:
             )
 
             best_iteration = model.best_iteration
-            train_score = evals_result["train"]["auc"][best_iteration]
-            eval_score = evals_result["eval"]["auc"][best_iteration]
+            auc_train = evals_result["train"]["auc"][best_iteration]
+            auc_valid = evals_result["valid"]["auc"][best_iteration]
 
-            print(f"\nTrain AUC: {train_score:.5f}")
-            print(f"Valid AUC: {eval_score:.5f}\n")
+            print(f"\nAUC Train: {auc_train:.5f}")
+            print(f"AUC Valid: {auc_valid:.5f}\n")
 
             iteration_list.append(best_iteration)
-            fold_scores.append(eval_score)
+            auc_scores.append(auc_valid)
 
             importances = model.get_score(importance_type="total_gain")
             total_gain = float(sum(importances.values()))
@@ -465,17 +429,19 @@ class XGBCVTrainer:
                 {
                     "Feature": list(importances.keys()),
                     "ImportanceRatio": [
-                        ((v/total_gain)*100.0)/self.n_fold for v in importances.values()
+                        ((v/total_gain)*100.0)/self.n_folds
+                        for v in importances.values()
                     ],
                 }
             )
+            fi_fold_frames.append(df)
+
             fold_summary = {
-                "auc": eval_score,
+                "auc": auc_valid,
                 "best_iter": best_iteration,
                 "runtime": runtime
             }
 
-            self._fi_fold_frames.append(df)
             for lg in loggers:
                 lg.on_fold_end(
                     i,
@@ -489,9 +455,6 @@ class XGBCVTrainer:
             cp.get_default_memory_pool().free_all_blocks()
             self.pmp.free_all_blocks()
 
-        print("=" * 32)
-        print("========== CV Results ==========")
-        print("=" * 32)
         y = (
             pl.read_parquet(self.train_paths, columns=self.target)
               .get_column(self.target)
@@ -499,19 +462,9 @@ class XGBCVTrainer:
               .to_numpy()
         )
 
-        oof_score = roc_auc_score(y, oof)
-        print(f"OOF score: {oof_score:.5f}")
-        mean = np.mean(fold_scores)
-        std = np.std(fold_scores)
-        print(
-            f"Mean: {mean:.5f}, "
-            f"Std: {std:.5f}"
-        )
-        print(f"Avg best iteration: {np.mean(iteration_list)}")
+        test_pred /= self.n_folds
 
-        test_pred /= self.n_fold
-
-        all_fi = pl.concat(self._fi_fold_frames, how="vertical_relaxed")
+        all_fi = pl.concat(fi_fold_frames, how="vertical_relaxed")
         fi_mean = (
             all_fi
             .group_by("Feature")
@@ -520,21 +473,38 @@ class XGBCVTrainer:
             ])
         ).sort("mean_ratio", descending=True)
 
+        auc_oof = roc_auc_score(y, oof)
+        auc_mean = np.mean(auc_scores)
+        auc_std = np.std(auc_scores)
+
+        print(f"\n{' CV Results ':*^48}")
+        print("─" * 48)
+        print(f" {'Metric':^9}  {'OOF':>10}  {'Mean':>10} ± {'Std':<10} ")
+        print("-" * 48)
+        print(f" {'AUC':^9} "
+              f" {auc_oof:>10.5f} "
+              f" {auc_mean:>10.5f} ± {auc_std:<10.5f} ")
+        print("─" * 48)
+
+        print(f"Avg best iteration: {np.mean(iteration_list)}")
+
         t_total_end = now()
-        total_runtime = print_duration(t_total_start, t_total_end, "Total CV Runtime")
+        total_runtime = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-        result = CVResult(
-            oof,
-            test_pred,
-            oof_score,
-            fi_mean
-        )
+        result = {
+            "oof": oof,
+            "test_pred": test_pred,
+            "oof_score": auc_oof,
+            "fi_mean": fi_mean
+        }
         overall_summary = {
-            "auc_oof": oof_score,
-            "auc_mean": mean,
-            "auc_std": std,
+            "auc_oof": auc_oof,
+            "auc_mean": auc_mean,
+            "auc_std": auc_std,
             "iter_mean": np.mean(iteration_list),
             "total_runtime": total_runtime
         }
@@ -546,7 +516,6 @@ class XGBCVTrainer:
 
     def full_train(
         self,
-        extra_exclude_cols=None,
         loggers: list[CVLogger] | None = None
     ):
         """
@@ -568,7 +537,7 @@ class XGBCVTrainer:
         test_pred = np.zeros(test_rows, dtype=np.float32)
 
         self.num_boost_round = (
-            self.num_boost_round * (self.n_fold/(self.n_fold-1))
+            self.num_boost_round * (self.n_folds/(self.n_folds-1))
         )
 
         t_qdm_start = now()
@@ -580,7 +549,6 @@ class XGBCVTrainer:
             cat_cols=self.cat_cols,
             fold_col=self.fold_col,
             weight_col=self.weight_col,
-            extra_exclude_cols=extra_exclude_cols,
             gpu=self.gpu
         )
 
@@ -590,7 +558,6 @@ class XGBCVTrainer:
             target=self.target,
             cat_cols=self.cat_cols,
             weight_col=self.weight_col,
-            extra_exclude_cols=extra_exclude_cols,
             predict_mode=True,
             gpu=self.gpu
         )
@@ -621,7 +588,6 @@ class XGBCVTrainer:
     def fit_one_fold(
         self,
         fold_idx=0,
-        extra_exclude_cols=None,
         loggers=None
     ):
         """
@@ -646,7 +612,7 @@ class XGBCVTrainer:
         meta = {
             "data_id": self.data_id,
             "seed": self.seed,
-            "n_fold": self.n_fold,
+            "n_folds": self.n_folds,
             "early_stopping_rounds": self.early_stopping_rounds,
             **self.params
         }
@@ -663,9 +629,8 @@ class XGBCVTrainer:
             target=self.target,
             cat_cols=self.cat_cols,
             fold_col=self.fold_col,
-            exclude_folds=[fold_idx],
+            exclude_fold=fold_idx,
             weight_col=self.weight_col,
-            extra_exclude_cols=extra_exclude_cols,
             gpu=self.gpu
         )
         valid_it = ParquetIter(
@@ -674,9 +639,8 @@ class XGBCVTrainer:
             target=self.target,
             cat_cols=self.cat_cols,
             fold_col=self.fold_col,
-            include_folds=[fold_idx],
+            include_fold=fold_idx,
             weight_col=self.weight_col,
-            extra_exclude_cols=extra_exclude_cols,
             gpu=self.gpu
         )
 
@@ -697,7 +661,7 @@ class XGBCVTrainer:
             self.params,
             dtrain,
             num_boost_round=self.num_boost_round,
-            evals=[(dtrain, "train"), (dvalid, "eval")],
+            evals=[(dtrain, "train"), (dvalid, "valid")],
             early_stopping_rounds=self.early_stopping_rounds,
             verbose_eval=100,
             evals_result=evals_result,
@@ -709,17 +673,17 @@ class XGBCVTrainer:
 
         best_iteration = model.best_iteration
 
-        train_score = evals_result["train"]["auc"][best_iteration]
-        eval_score = evals_result["eval"]["auc"][best_iteration]
+        auc_train = evals_result["train"]["auc"][best_iteration]
+        auc_valid = evals_result["valid"]["auc"][best_iteration]
 
-        print(f"\nTrain AUC: {train_score:.5f}")
-        print(f"Valid AUC: {eval_score:.5f}")
+        print(f"\nAUC Train: {auc_train:.5f}")
+        print(f"AUC Valid: {auc_valid:.5f}")
 
         t_total_end = now()
         runtime = print_duration(t_total_start, t_total_end, "Total Runtime")
 
         fold_summary = {
-            "auc": eval_score,
+            "auc": auc_valid,
             "best_iter": best_iteration,
             "runtime": runtime
         }
@@ -739,4 +703,4 @@ class XGBCVTrainer:
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-        return eval_score
+        return auc_valid

@@ -8,8 +8,9 @@ from tqdm.notebook import tqdm
 def target_encoding(
     tr_df: pl.DataFrame,
     test_df: pl.DataFrame,
+    key_cols: list[str],
     target: str = "target",
-    cat_cols: Optional[list[str]] = None,
+    stats: tuple[str, ...] = ("mean", "std", "min", "max", "median", "count"),
     n_splits: int = 5,
     seed: int = 42
 ):
@@ -39,21 +40,30 @@ def target_encoding(
     y = tr_df.get_column(target).to_numpy()
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
-    if cat_cols is None:
-        cat_cols = [
-            c
-            for c, t in tr_df.schema.items()
-            if t == pl.Utf8 and c != target
-        ]
+    def stat_names(col: str) -> list[str]:
+        names = []
+        if "mean" in stats:
+            names.append(f"{target}_mean_by_{col}")
+        if "std" in stats:
+            names.append(f"{target}_std_by_{col}")
+        if "min" in stats:
+            names.append(f"{target}_min_by_{col}")
+        if "max" in stats:
+            names.append(f"{target}_max_by_{col}")
+        if "median" in stats:
+            names.append(f"{target}_median_by_{col}")
+        if "count" in stats:
+            names.append(f"{target}_count_by_{col}")  # 1の個数
+        return names
 
-    te_tr_dict = {
-        f"{col}_te": np.zeros(tr_df.height, dtype=np.float32)
-        for col in cat_cols
-    }
-    te_test_dict = {
-        f"{col}_te": np.zeros(test_df.height, dtype=np.float32)
-        for col in cat_cols
-    }
+    all_cols = []
+    for col in key_cols:
+        all_cols.extend(stat_names(col))
+
+    N_tr, N_te = tr_df.height, test_df.height
+
+    te_train = {c: np.zeros(N_tr, dtype=np.float32) for c in all_cols}
+    te_test = {c: np.zeros(N_te, dtype=np.float32) for c in all_cols}
 
     for fold_idx, (tr_idx, val_idx) in enumerate(
         tqdm(skf.split(np.zeros_like(y), y))
@@ -61,46 +71,108 @@ def target_encoding(
         train = tr_df[tr_idx]
         val = tr_df[val_idx]
 
-        for col in tqdm(cat_cols):
-            means_df = (
+        for col in tqdm(key_cols):
+            base = train.select([
+                pl.col(target).mean().alias("mean"),
+                pl.col(target).std(ddof=1).alias("std"),
+                pl.col(target).min().alias("min"),
+                pl.col(target).max().alias("max"),
+                pl.col(target).median().alias("median"),
+                (pl.col(target) == 1).sum().alias("cnt"),
+            ]).to_dicts()[0]
+
+            fill_map = {}
+            for s in stats:
+                name = f"{target}_{s}_by_{col}"
+                if s == "count":
+                    fill_map[name] = 0.0
+                else:
+                    fill_map[name] = float(base[s])
+
+            aggs = []
+            col_names = []
+            if "mean" in stats:
+                aggs.append(
+                    pl.col(target).mean().alias(f"{target}_mean_by_{col}")
+                )
+                col_names.append(f"{target}_mean_by_{col}")
+            if "std" in stats:
+                aggs.append(
+                    pl.col(target).std(ddof=1).alias(f"{target}_std_by_{col}")
+                )
+                col_names.append(f"{target}_std_by_{col}")
+            if "min" in stats:
+                aggs.append(
+                    pl.col(target).min().alias(f"{target}_min_by_{col}")
+                )
+                col_names.append(f"{target}_min_by_{col}")
+            if "max" in stats:
+                aggs.append(
+                    pl.col(target).max().alias(f"{target}_max_by_{col}")
+                )
+                col_names.append(f"{target}_max_by_{col}")
+            if "median" in stats:
+                aggs.append(
+                    pl.col(target).median().alias(f"{target}_median_by_{col}")
+                )
+                col_names.append(f"{target}_median_by_{col}")
+            if "count" in stats:
+                aggs.append(
+                    (pl.col(target) == 1).sum().alias(f"{target}_count_by_{col}")
+                )
+                col_names.append(f"{target}_count_by_{col}")
+
+            grouped_df = (
                 train.select([col, target])
                 .group_by(col)
-                .agg(pl.col(target).mean().alias("mean_target"))
+                .agg(aggs)
             )
 
             # validation
-            overall_mean = means_df["mean_target"].mean()
-            val_te = (
+            val_mat = (
                 val.join(
-                    means_df.select(["mean_target", col]),
+                    grouped_df.select(col_names + [col]),
                     on=col,
                     how="left"
                 )
-                .get_column("mean_target")
-                .fill_null(overall_mean)
+                .select(col_names)
+                .with_columns(
+                    [
+                        pl.col(c).fill_null(fill_map[c]).alias(c)
+                        for c in col_names
+                    ]
+                )
                 .to_numpy()
                 .astype(dtype=np.float32, copy=False)
             )
-            te_tr_dict[f"{col}_te"][val_idx] = val_te
+
+            for j, name in enumerate(col_names):
+                te_train[name][val_idx] = val_mat[:, j]
 
             # test
-            test_te = (
+            test_mat = (
                 test_df.join(
-                    means_df.select(["mean_target", col]),
+                    grouped_df.select(col_names + [col]),
                     on=col,
                     how="left"
                 )
-                .get_column("mean_target")
-                .fill_null(overall_mean)
+                .select(col_names)
+                .with_columns(
+                    [
+                        pl.col(c).fill_null(fill_map[c]).alias(c)
+                        for c in col_names
+                    ]
+                )
                 .to_numpy()
                 .astype(dtype=np.float32, copy=False)
             )
-            te_test_dict[f"{col}_te"] += test_te / n_splits
+            for j, name in enumerate(col_names):
+                te_test[name] += test_mat[:, j] / n_splits
 
-            del means_df, val_te, test_te
+            del grouped_df, val_mat, test_mat
         del train, val
 
-    te_tr = pl.DataFrame(te_tr_dict)
-    te_test = pl.DataFrame(te_test_dict)
+    te_tr = pl.DataFrame(te_train)
+    te_test = pl.DataFrame(te_test)
 
     return pl.concat([te_tr, te_test], how="vertical")

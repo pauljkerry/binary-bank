@@ -1,14 +1,26 @@
-from cuml.ensemble import RandomForestClassifier
-import numpy as np
+import gc
+import os
+from dataclasses import dataclass, field
+from time import perf_counter as now
+from typing import Optional
+
 import cudf
-import pandas as pd
-from sklearn.model_selection import StratifiedKFold
+import rmm
+import cupy as cp
+import numpy as np
+import polars as pl
+import rmm.mr as mr
+from cuml.ensemble import RandomForestClassifier
+from rmm.allocators.cupy import rmm_cupy_allocator
+from sklearn.metrics import log_loss
 from sklearn.metrics import roc_auc_score
-import joblib
-import time
+
+from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
+from src.utils.mem_info import free_ram_gib, free_vram_gib
 
 
+@dataclass
 class RFCCVTrainer:
     """
     RFCを使ったGPUでのCVトレーナー。
@@ -22,54 +34,100 @@ class RFCCVTrainer:
     params : dict
         RFCのパラメータ。
     n_splits : int, default 5
-        StratifiedKFoldの分割数。
+        KFoldの分割数。
     seed : int, default 42
         乱数シード。
     """
+    data_id: str
+    train_paths: str | list[str]
+    test_paths: str | list[str] | None = None
 
-    def __init__(self, tr_df, test_df=None, params=None, n_splits=5, seed=42):
-        self.params = params or {}
-        self.n_splits = n_splits
-        self.fold_models = []
-        self.fold_scores = []
-        self.seed = seed
-        self.oof_score = None
+    features: Optional[list[str]] = None
 
-        if "weight" in tr_df.columns:
-            tr_df = tr_df.drop("weight", axis=1)
+    target: str = "target"
+    fold_col: Optional[str] = None
+    weight_col: Optional[str] = None
+    cat_cols: Optional[list[str]] = None
 
-        if isinstance(tr_df, pd.DataFrame):
-            tr_df = cudf.DataFrame.from_pandas(tr_df)
+    params: dict = field(default_factory=dict)
 
-        self.X = tr_df.drop("target", axis=1)
-        self.y = tr_df["target"].to_cupy()
+    n_folds: int = 5
+    seed: int = 42
+    gpu: bool = True
 
-        # test
-        if test_df is not None:
-            if isinstance(test_df, pd.DataFrame):
-                self.test = cudf.DataFrame.from_pandas(test_df)
-            else:
-                self.test = test_df
+    opts: dict = field(init=True, default_factory=dict)
+
+    def __post_init__(self):
+        if isinstance(self.train_paths, (str, os.PathLike)):
+            self.train_paths = [str(self.train_paths)]
         else:
-            self.test = None
+            self.train_paths = [str(p) for p in self.train_paths]
 
-        # fold indices
-        skf = StratifiedKFold(
-            n_splits=n_splits, shuffle=True, random_state=self.seed
-        )
-        self.fold_indices = list(
-            skf.split(self.X.to_pandas(), self.y.get()))
+        if self.test_paths:
+            if isinstance(self.test_paths, (str, os.PathLike)):
+                self.test_paths = [str(self.test_paths)]
+            else:
+                self.test_paths = [str(p) for p in self.test_paths]
 
-        self.default_params = {
+        self.lf_train = pl.scan_parquet(self.train_paths)
+
+        default_params = {
             "n_estimators": 100,
             "max_depth": 16,
             "bootstrap": True,
             "random_state": self.seed,
             "n_streams": 1
         }
-        self.params = {**self.default_params, **self.params}
 
-    def fit(self):
+        self.params = {**default_params, **self.params}
+
+        hdr = pl.read_parquet(self.train_paths, n_rows=0)
+        all_cols = hdr.columns
+
+        if self.fold_col is None:
+            self.fold_col = f"{self.n_folds}fold-s{self.seed}"
+
+        if self.cat_cols is None:
+            self.cat_cols = [
+                c for c, dt in zip(hdr.columns, hdr.dtypes)
+                if dt == pl.Categorical
+            ]
+
+        if self.fold_col not in all_cols:
+            raise ValueError(f"fold_col not found in dataset: {self.fold_col}")
+        else:
+            print(f"Fold Col: {self.fold_col}")
+
+        if self.features is None:
+            meta = {"row_id"}
+            if self.target in all_cols:
+                meta.add(self.target)
+            if self.weight_col in all_cols:
+                meta.add(self.weight_col)
+            if self.fold_col:
+                meta.add(self.fold_col)
+
+            self.features = [
+                c for c in all_cols
+                if c not in meta and "fold" not in c
+            ]
+
+        dev_mr = mr.CudaAsyncMemoryResource()
+        mr.set_current_device_resource(dev_mr)
+        rmm.reinitialize(
+            managed_memory=False,
+            initial_pool_size=None,
+        )
+        cp.cuda.set_allocator(rmm_cupy_allocator)
+
+        cp.get_default_memory_pool().set_limit(4 * 1024**3)
+        self.pmp = cp.cuda.PinnedMemoryPool()
+        cp.cuda.set_pinned_memory_allocator(self.pmp.malloc)
+
+    def fit(
+        self,
+        loggers: list[CVLogger] | None = None
+    ):
         """
         CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
 
@@ -80,54 +138,179 @@ class RFCCVTrainer:
         test_preds : ndarray
             test_dfに対する予測配列
         """
-        if self.test is None:
-            raise ValueError("test_df not provided for RFCCVTrainer.")
+        if self.test_paths is None:
+            raise ValueError("Please provide test_paths (got None).")
 
-        oof_preds = np.zeros(len(self.X))
-        test_preds = np.zeros(len(self.test))
+        t_total_start = now()
 
-        for fold, (tr_idx, val_idx) in enumerate(self.fold_indices):
-            print(f"\nFold {fold + 1}")
-            start = time.time()
-            X_tr, y_tr = self.X.iloc[tr_idx], self.y[tr_idx]
-            X_val, y_val = self.X.iloc[val_idx], self.y[val_idx]
+        loggers = loggers or [NoOpLogger()]
+        meta = {
+            "data_id": self.data_id,
+            "seed": self.seed,
+            "n_folds": self.n_folds
+            **self.params
+        }
+        for lg in loggers:
+            lg.on_start(meta)
 
-            model = RandomForestClassifier(**self.params)
-            model.fit(X_tr, y_tr)
-
-            oof_preds[val_idx] = model.predict_proba(X_val).to_numpy()[:, 1]
-            test_preds += model.predict_proba(self.test).to_numpy()[:, 1]
-
-            end = time.time()
-            print_duration(start, end)
-
-            score = roc_auc_score(y_val.get(), oof_preds[val_idx])
-
-            print(f"Valid AUC: {score:.5f}")
-
-            self.fold_models.append(RFCFoldModel(
-                model=model,
-                X_val=X_val,
-                y_val=y_val,
-                fold=fold,
-            ))
-            self.fold_scores.append(score)
-
-        print("\n=== CV Results ===")
-        print(f"Fold scores: {self.fold_scores}")
-        print(
-            f"Mean: {np.mean(self.fold_scores):.5f}, "
-            f"Std: {np.std(self.fold_scores):.5f}"
+        train_rows = (
+            self.lf_train
+            .select(pl.len())
+            .collect()
+            .item()
+        )
+        test_rows = (
+            pl.scan_parquet(self.test_paths)
+              .select(pl.len())
+              .collect()
+              .item()
         )
 
-        self.oof_score = roc_auc_score(self.y.get(), oof_preds)
-        print(f"OOF score: {self.oof_score:.5f}")
+        oof = np.zeros(train_rows, dtype=np.float32)
+        test_pred = np.zeros(test_rows, dtype=np.float32)
 
-        test_preds /= self.n_splits
+        logloss_scores = []
+        auc_scores = []
 
-        return oof_preds, test_preds
+        test = cudf.read_parquet(self.test_paths, columns=self.features)
 
-    def fit_one_fold(self, fold=0):
+        for i in range(self.n_folds):
+            title = f" Fold {i + 1} / {self.n_folds} "
+            print("=" * 48)
+            print(f"{title:=^48}")
+            print("=" * 48)
+            print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+            print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
+
+            t_fold_start = now()
+
+            train = cudf.read_parquet(
+                self.train_paths,
+                columns=self.features + self.target + self.fold_col
+            )
+
+            X_train = train[~train[self.fold_col] != i][self.features].to_cupy()
+            y_train = train[~train[self.fold_col] != i][self.target].to_cupy()
+
+            X_valid = train[train[self.fold_col] == i][self.features].to_cupy()
+            y_valid = (
+                self.lf_train
+                .filter(pl.col(self.fold_col) == i)
+                .select(self.features)
+                .collect(engine="streaming")
+            )
+
+            val_idx = (
+                pl.scan_parquet(self.train_paths)
+                  .select(["row_id", self.fold_col])
+                  .filter(pl.col(self.fold_col) == i)
+                  .select("row_id")
+                  .collect()
+                  .get_column("row_id")
+                  .to_numpy()
+                  .astype(np.int32, copy=False)
+            )
+
+            model = RandomForestClassifier(**self.params)
+            model.fit(X_train, y_train)
+
+            pred = model.predict(X_valid).to_numpy()
+            oof[val_idx] = pred
+            test_pred += model.predict(test).to_numpy()
+
+            logloss_valid = log_loss(y_valid, pred)
+            auc_valid = roc_auc_score(y_valid, pred)
+
+            t_fold_end = now()
+
+            runtime = print_duration(
+                t_fold_start, t_fold_end, f"Fold {i+1} Runtime"
+            )
+
+            print(f"Logloss Valid: {logloss_valid:.5f}")
+            print(f"AUC Valid: {auc_valid:.5f}\n")
+
+            logloss_scores.append(logloss_valid)
+            auc_scores.append(auc_valid)
+
+            fold_summary = {
+                "logloss": logloss_valid,
+                "auc": auc_valid,
+                "runtime": runtime
+            }
+
+            for lg in loggers:
+                lg.on_fold_end(
+                    i,
+                    "iter",
+                    summary=fold_summary
+                )
+
+            del X_train, y_train, X_valid, y_valid
+            gc.collect()
+            cp.get_default_memory_pool().free_all_blocks()
+            self.pmp.free_all_blocks()
+
+        y = (
+            pl.read_parquet(self.train_paths, columns=self.target)
+              .get_column(self.target)
+              .cast(pl.Float32)
+              .to_numpy()
+        )
+        test_pred /= self.n_folds
+
+        logloss_oof = log_loss(y, oof)
+        logloss_mean = np.mean(logloss_scores)
+        logloss_std = np.mean(logloss_scores)
+
+        auc_oof = roc_auc_score(y, oof)
+        auc_mean = np.mean(auc_scores)
+        auc_std = np.mean(auc_scores)
+
+        print(f"\n{' CV Results ':*^48}")
+        print("─" * 48)
+        print(f" {'Metric':^9}  {'OOF':>10}  {'Mean':>10} ± {'Std':<10} ")
+        print("-" * 48)
+        print(f" {'Logloss':^9} "
+              f" {logloss_oof:>10.5f} "
+              f" {logloss_mean:>10.5f} ± {logloss_std:<10.5f} ")
+        print(f" {'AUC':^9} "
+              f" {auc_oof:>10.5f} "
+              f" {auc_mean:>10.5f} ± {auc_std:<10.5f} ")
+        print("─" * 48)
+
+        t_total_end = now()
+        total_runtime = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
+
+        result = {
+            "oof": oof,
+            "test_pred": test_pred,
+            "oof_score": logloss_oof
+        }
+        overall_summary = {
+            "logloss_oof": logloss_oof,
+            "logloss_mean": logloss_mean,
+            "logloss_std": logloss_std,
+            "auc_oof": auc_oof,
+            "auc_mean": auc_mean,
+            "auc_std": auc_std,
+            "total_runtime": total_runtime
+        }
+
+        for lg in loggers:
+            lg.on_end(overall_summary)
+
+        return result
+
+    def fit_one_fold(
+        self,
+        fold_idx=0,
+        loggers=None
+    ):
         """
         指定した1つのfoldのみを用いてモデルを学習する。
         主にOptunaによるハイパーパラメータ探索時に使用。
@@ -137,78 +320,73 @@ class RFCCVTrainer:
         fold : int
             学習に使うfold番号。
 
-        Return
+        Rerurn
         ------
-        score : float
-            Score
         """
-        start = time.time()
-        tr_idx, va_idx = self.fold_indices[fold]
+        t_total_start = now()
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-        X_tr, y_tr = self.X.iloc[tr_idx], self.y[tr_idx]
-        X_val, y_val = self.X.iloc[va_idx], self.y[va_idx]
+        loggers = loggers or [NoOpLogger()]
+        meta = {
+            "data_id": self.data_id,
+            "seed": self.seed,
+            "n_folds": self.n_folds,
+            **self.params
+        }
+        for lg in loggers:
+            lg.on_start(meta)
+
+        train = cudf.read_parquet(
+            self.train_paths,
+            columns=self.features + self.target + self.fold_col
+        )
+
+        X_train = train[~train[self.fold_col] != fold_idx][self.features].to_cupy()
+        y_train = train[~train[self.fold_col] != fold_idx][self.target].to_cupy()
+
+        X_valid = train[train[self.fold_col] == fold_idx][self.features].to_cupy()
+        y_valid = (
+            self.lf_train
+            .filter(pl.col(self.fold_col) == fold_idx)
+            .select(self.features)
+            .collect(engine="streaming")
+        )
 
         model = RandomForestClassifier(**self.params)
-        model.fit(X_tr, y_tr)
+        model.fit(X_train, y_train)
 
-        end = time.time()
-        print_duration(start, end)
+        pred = model.predict(X_valid).to_numpy()
 
-        preds = model.predict_proba(X_val).to_numpy()[:, 1]
-        auc = roc_auc_score(y_val.get(), preds)
+        logloss_valid = log_loss(y_valid, pred)
+        auc_valid = roc_auc_score(y_valid, pred)
 
-        print(f"Valid AUC: {auc:.5f}")
+        print(f"Logloss Valid: {logloss_valid:.5f}")
+        print(f"AUC Valid: {auc_valid:.5f}\n")
 
-        return auc
+        del train, X_train, y_train, X_valid, y_valid
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
+        self.pmp.free_all_blocks()
 
+        t_total_end = now()
+        total_runtime = print_duration(
+            t_total_start, t_total_end, "Total Runtime"
+        )
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-class RFCFoldModel:
-    """
-    RFCのfold単位モデルを保持するクラス。。
+        fold_summary = {
+            "logloss": logloss_valid,
+            "auc": auc_valid,
+            "runtime": total_runtime
+        }
 
-    Attributes
-    ----------
-    model : cuml.linear_model.RandomForestClassifier
-        学習済みのRFCモデル。
-    X_val : cudf.DataFrame
-        検証用の特徴量データ。
-    y_val : cudf.Series
-        検証用のターゲットラベル。
-    fold_index : int
-        foldの番号。
-    """
+        for lg in loggers:
+            lg.on_fold_end(
+                fold_idx,
+                "iter",
+                summary=fold_summary
+            )
 
-    def __init__(self, model, X_val, y_val, fold):
-        self.model = model
-        self.X_val = X_val
-        self.y_val = y_val
-        self.fold = fold
-
-    def save_model(self, path="../artifacts/model/logreg_vn.pkl"):
-        """
-        学習済みモデルを指定パスに保存する。
-
-        Parameters
-        ----------
-        path : str
-            モデルを保存するパス。
-        """
-
-        joblib.dump(self.model, path)
-
-    def load_model(self, path):
-        """
-        指定されたパスからモデルを読み込む。
-
-        Parameters
-        ----------
-        path : str
-            モデルファイルのパス。
-
-        Returns
-        -------
-        self : LogRegFoldModel
-            読み込んだモデルを保持するインスタンス自身を返す。
-        """
-        self.model = joblib.load(path)
-        return self
+        return logloss_valid

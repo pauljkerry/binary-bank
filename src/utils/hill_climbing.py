@@ -1,17 +1,17 @@
 import gc
+import os
 import numpy as np
 import cupy as cp
 import pandas as pd
 import polars as pl
 from sklearn.metrics import roc_auc_score
 from src.utils.multiple_auc_scores import multiple_auc_scores
-import matplotlib.pyplot as plt
 
 
 def hill_climbing_auc(
-    data_id,
-    train_paths,
-    test_paths,
+    train_paths: str | list[str],
+    test_paths: str | list[str],
+    target: str = "target",
     TOL=1e-5,
     USE_NEGATIVE_WGT=True
 ):
@@ -39,114 +39,139 @@ def hill_climbing_auc(
         ensembleの予測値
         test_arrayがNoneのときは返り値なし
     """
-    oof_array = pl.read_parquet(train_paths)
-    test_array = pl.read_parquet(test_paths)
+    if isinstance(train_paths, (str, os.PathLike)):
+        train_paths = [str(train_paths)]
+    else:
+        train_paths = [str(p) for p in train_paths]
 
-    features = [c for c in oof_array.columns if c not in ["target", "row_id"] and "fold" not in c]
+    if test_paths:
+        if isinstance(test_paths, (str, os.PathLike)):
+            test_paths = [str(test_paths)]
+        else:
+            test_paths = [str(p) for p in test_paths]
 
-    n_samples, n_models = oof_array.shape
+    oof_df = pl.read_parquet(train_paths)
+    test_df = pl.read_parquet(test_paths)
+
+    features = [
+        c for c in oof_df.columns
+        if c not in ["target", "row_id", "weight"]
+        and "fold" not in c
+    ]
+
+    X = (
+        oof_df
+        .select(features)
+        .to_numpy()
+        .astype(np.float32, copy=False)
+    )
+    y = oof_df.get_column(target)
+
+    test_X = (
+        test_df
+        .select(features)
+        .to_numpy()
+        .astype(np.float32, copy=False)
+    )
+
+    n_samples, n_models = X.shape
 
     # 1. 各モデル単体のAUCを計算
-    aucs = [roc_auc_score(y_true, oof_array[:, i]) for i in range(n_models)]
+    aucs = [roc_auc_score(y, X[:, i]) for i in range(n_models)]
     best_index = np.argmax(aucs)
-
-    # 2. 初期ベストモデル
-    best_models = [best_index]
     best_score = aucs[best_index]
-    old_best_score = best_score
 
-    oof_array2 = cp.array(oof_array)
-    truth = cp.array(y_true)
-    best_ensemble = oof_array2[:, best_index]
+    X_cp = cp.array(X)
+    y_cp = cp.array(y)
+    best_ensemble = X_cp[:, best_index]
 
-    start = -0.50
-    if not USE_NEGATIVE_WGT:
-        start = 0.01
-    ww = cp.arange(start, 0.51, 0.01)
-    nn = len(ww)
+    w_grid = cp.arange(
+        -0.50 if USE_NEGATIVE_WGT else 0.01, 0.51, 0.01, dtype=cp.float32
+    )
 
+    remaining = set(range(n_models)) - {best_index}
     models = [best_index]
     weights = []
     best_history = [best_score]
+    history_rows = [{
+        "iteration": 0,
+        "model": features[best_index],
+        "weight": 1.0,
+        "score": round(best_score, 5),
+    }]
 
-    remaining = set(range(n_models)) - set(best_models)
+    old_best = best_score
 
     print(f"0 We begin with best single model AUC {best_score:0.5f} "
-          f"from {files[best_index]}")
+          f"from {features[best_index]}")
     while remaining:
         candidate_score = best_score
-        best_index = -1
-        best_weight = 0
+        chosen_index = -1
+        chosen_weight = 0
+        potential_ensemble = None
 
         # 3. 残りのモデルを1つずつ追加してAUCを計算
-        for i in remaining:
-            if i in models:
-                continue
-            new_model = oof_array2[:, i]
-            m1 = cp.repeat(best_ensemble[:, cp.newaxis], nn, axis=1) * (1-ww)
-            m2 = cp.repeat(new_model[:, cp.newaxis], nn, axis=1) * ww
-            mm = m1 + m2
-            new_scores = multiple_auc_scores(truth, mm)
-            new_best_score = cp.max(new_scores)
+        for i in list(remaining):
+            new_model = X_cp[:, i]
+            mm = (
+                best_ensemble[:, None] * (1 - w_grid)[None, :]
+                + new_model[:, None] * w_grid[None, :]
+            )
+            new_scores = multiple_auc_scores(y_cp, mm)
+            w_arg = int(np.argmax(new_scores))
+            new_best_score = float(new_scores[w_arg])
             if new_best_score > candidate_score:
                 candidate_score = new_best_score
-                best_index = i
-                best_wgt_idx = np.argmax(new_scores).item()
-                best_weight = ww[best_wgt_idx].item()
-                potential_ensemble = mm[:, best_wgt_idx]
-            del new_model, m1, m2, mm, new_scores, new_best_score
+                chosen_index = i
+                chosen_weight = float(w_grid[w_arg].item())
+                potential_ensemble = mm[:, w_arg]
+            del new_model, mm, new_scores
             gc.collect()
 
         # 終了判定
-        if (candidate_score - old_best_score) < TOL:
+        if (candidate_score - old_best) < TOL or chosen_index < 0:
             print(f'=> We reached tolerance {TOL}')
             break
 
         print(f"New best score: {candidate_score:.5f}\n"
-              f"adding: {files[best_index]}\n"
-              f"with weight: {best_weight:0.3f}\n")
-        models.append(best_index)
-        weights.append(best_weight)
+              f"adding: {features[chosen_index]}\n"
+              f"with weight: {chosen_weight:0.3f}\n")
+
+        models.append(chosen_index)
+        weights.append(chosen_weight)
         best_history.append(candidate_score)
         best_ensemble = potential_ensemble
-        old_best_score = candidate_score
-        remaining.remove(best_index)
+        old_best = candidate_score
+        best_score = candidate_score
+        remaining.remove(chosen_index)
 
-    wgt = np.array([1])
+        history_rows.append({
+            "iteration": len(models) - 1,
+            "model": features[chosen_index],
+            "weight": round(chosen_weight, 3),
+            "score": round(candidate_score, 5)
+        })
+
+    final_weights = np.array([1.0], dtype=np.float32)
     for w in weights:
-        wgt = wgt*(1-w)
-        wgt = np.concatenate([wgt, np.array([w])])
+        final_weights = final_weights * (1.0 - w)
+        final_weights = np.concatenate(
+            [final_weights, np.array([w], dtype=np.float32)]
+        )
 
-    rows = []
-    t = 0
-    for m, w, s in zip(models, wgt, best_history):
-        name = files[m]
-        dd = {}
-        dd['weight'] = w
-        dd['model'] = name
-        dd["score"] = np.round(s, 5)
-        rows.append(dd)
-        t += float(f'{w:.3f}')
+    oof_pred = cp.asnumpy(best_ensemble).astype(np.float32, copy=False)
+    test_pred = (
+        test_X[:, models] @ final_weights.astype(np.float32)
+    ).astype(np.float32, copy=False)
 
-    # DISPLAY WEIGHT PER MODEL
-    df = pd.DataFrame(rows)
-    wgt_df = df[["weight", "model"]].groupby('model').agg('sum').reset_index()
-    wgt_df = wgt_df.sort_values('weight', ascending=False).reset_index(drop=True)
-    print(wgt_df)
+    history_df = pd.DataFrame(history_rows)
 
-    plt.figure(figsize=(8, 5))
-    plt.plot(df.index, df["score"], marker="o", label="AUC")
-    plt.xlabel("Iteration")
-    plt.ylabel("AUC")
-    plt.title("AUC Progression during Hill Climbing")
-    plt.grid(True)
-    plt.legend()
-    plt.gca().yaxis.set_major_formatter(plt.FormatStrFormatter('%.5f'))
+    # モデル名/重みも並行して返す
+    weight_dict = {features[m]: float(w) for m, w in zip(models, final_weights)}
 
-    plt.show()
-
-    if test_array is not None:
-        ens_preds = np.zeros(len(test_array))
-        for i, idx in enumerate(models):
-            ens_preds += test_array[:, idx] * wgt[i]
-        return ens_preds
+    return {
+        "oof_pred": oof_pred,                 # (n_samples,)
+        "test_pred": test_pred,               # (n_test,) or None
+        "weights": weight_dict,                # 使われた列名
+        "history_df": history_df             # 最終のmodel別weight表
+    }

@@ -1,15 +1,4 @@
-from dataclasses import dataclass
-from typing import Protocol, Optional, Any
-
-import polars as pl
-
-
-@dataclass
-class CVResult:
-    oof: Any
-    test_pred: Optional[Any]
-    oof_score: float
-    fi_mean: Optional[pl.DataFrame] = None
+from typing import Protocol
 
 
 # ===== Logger Protocol =====
@@ -19,7 +8,8 @@ class CVLogger(Protocol):
     def on_fold_end(
         self,
         fold_idx: int,
-        evals_result: dict,
+        axis_name: str | None = None,
+        evals_result: dict | None = None,
         extra: dict | None = None,
         summary: dict | None = None
     ) -> None: ...
@@ -35,7 +25,8 @@ class NoOpLogger:
     def on_fold_end(
         self,
         fold_idx: int,
-        evals_result: dict,
+        axis_name: str | None = None,
+        evals_result: dict | None = None,
         extra: dict | None = None,
         summary: dict | None = None
     ) -> None:
@@ -73,32 +64,33 @@ class WandbLogger:
     def on_fold_end(
         self,
         fold_idx: int,
-        axis_name: str,
-        evals_result: dict,
+        axis_name: str | None = None,
+        evals_result: dict | None = None,
         extra: dict | None = None,
         summary: dict | None = None
     ) -> None:
         fno = fold_idx + 1
         self._define_fold_metrics(axis_name, fno)
 
-        # 長さ合わせ
-        lengths = [
-            len(arr)
-            for md in evals_result.values() for arr in md.values()
-        ]
+        if evals_result:
+            lengths = [
+                len(arr)
+                for md in evals_result.values() for arr in md.values()
+            ]
         if extra:
             lengths += [len(arr) for arr in extra.values()]
-        L = min(lengths) if lengths else 0
+        if evals_result or extra:
+            L = min(lengths) if lengths else 0
 
-        for t in range(L):
-            payload = {self._k(f"{axis_name}_f{fno}"): t}   # ← fold専用のx軸
-            for split, md in evals_result.items():
-                for mname, arr in md.items():
-                    payload[self._k(f"{split}/f{fno}/{mname}")] = float(arr[t])
-            if extra:
-                for name, arr in extra.items():
-                    payload[self._k(f"meta/f{fno}/{name}")] = float(arr[t])
-            self.wandb.log(payload)                 # ← step= は渡さない
+            for t in range(L):
+                payload = {self._k(f"{axis_name}_f{fno}"): t}
+                for split, md in evals_result.items():
+                    for mname, arr in md.items():
+                        payload[self._k(f"{split}/f{fno}/{mname}")] = float(arr[t])
+                if extra:
+                    for name, arr in extra.items():
+                        payload[self._k(f"meta/f{fno}/{name}")] = float(arr[t])
+                self.wandb.log(payload)
 
         if summary:
             for k, v in summary.items():

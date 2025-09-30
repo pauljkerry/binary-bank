@@ -1,396 +1,549 @@
-from pytorch_tabnet.tab_model import TabNetClassifier
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score
+import gc
+import os
+from dataclasses import dataclass, field
+from typing import Iterable, Optional
+from time import perf_counter as now
+
 import torch
 import numpy as np
-import time
+import polars as pl
+
+from pytorch_tabnet.tab_model import TabNetClassifier
+from sklearn.metrics import log_loss
+from sklearn.metrics import roc_auc_score
+
+from src.utils.loggers import CVResult, CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
+from src.utils.mem_info import free_ram_gib, free_vram_gib
 
 
+def compute_feature_stats(
+    paths: list[str],
+    features: list[str],
+    num_cols: list[str],
+    fold_col: str = None,
+    include_folds: Optional[Iterable[int]] = None,
+    exclude_folds: Optional[Iterable[int]] = None
+):
+    lf = pl.scan_parquet(paths, low_memory=True)
+    if fold_col:
+        if include_folds is not None:
+            lf = lf.filter(pl.col(fold_col).is_in(sorted(include_folds)))
+        if exclude_folds is not None:
+            lf = lf.filter(~pl.col(fold_col).is_in(sorted(exclude_folds)))
+
+    exprs = []
+    for c in num_cols:
+        exprs += [pl.col(c).cast(pl.Float32).mean().alias(f"{c}_mean"),
+                  pl.col(c).cast(pl.Float32).std(ddof=0).alias(f"{c}_std")]
+    out = lf.select(exprs).collect(streaming=True)
+    mean = out.select(
+        [f"{c}_mean" for c in num_cols]).to_numpy().ravel().astype(np.float32)
+    std = out.select(
+        [f"{c}_std" for c in num_cols]).to_numpy().ravel().astype(np.float32)
+    std[std == 0] = 1.0
+    return mean, std
+
+
+@dataclass(eq=False)
 class TabNetCVTrainer:
-    def __init__(
-        self, n_splits=5, seed=42, max_epochs=100, batch_size=1024,
-        early_stopping_rounds=20, lr=2e-2, weight_decay=1e-5, use_gpu=True,
-        hidden_dims=None, log_interval=10, t_max=50, lr_min=1e-6, **kwargs
-    ):
-        self.n_splits = n_splits
-        self.seed = seed
-        self.max_epochs = max_epochs
-        self.batch_size = batch_size
-        self.early_stopping_rounds = early_stopping_rounds
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.device = torch.device(
-            "cuda" if use_gpu and torch.cuda.is_available() else "cpu")
-        self.fold_models = []
-        self.fold_scores = []
-        self.oof_score = None
-        self.log_interval = log_interval
-        self.t_max = t_max
-        self.lr_min = lr_min
-        self.tabnet_params = kwargs
+    data_id: str
+    train_paths: str | list[str]
+    test_paths: str | list[str] | None = None
 
-        if hidden_dims is not None:
-            self.hidden_dims = hidden_dims
+    features: Optional[list[str]] = None
+
+    target: str = "target"
+    fold_col: Optional[str] = None
+    weight_col: Optional[str] = None
+    cat_cols: Optional[list[str]] = None
+
+    params: dict = field(default_factory=dict)
+
+    n_fold: int = 5
+    seed: int = 42
+    gpu: bool = True
+
+    opts: dict = field(init=True, default_factory=dict)
+
+    def __post_init__(self):
+        if isinstance(self.train_paths, (str, os.PathLike)):
+            self.train_paths = [str(self.train_paths)]
         else:
-            dims_from_kwargs = [
-                v for k, v in sorted(kwargs.items())
-                if k.startswith("hidden_dim")
+            self.train_paths = [str(p) for p in self.train_paths]
+
+        if self.test_paths:
+            if isinstance(self.test_paths, (str, os.PathLike)):
+                self.test_paths = [str(self.test_paths)]
+            else:
+                self.test_paths = [str(p) for p in self.test_paths]
+
+        self.lf_train = pl.scan_parquet(self.train_paths)
+        self.lf_test = (
+            pl.scan_parquet(self.test_paths) if self.test_paths else None
+        )
+
+        default_params = {
+            "n_d": 16,
+            "n_a": 32,
+            "n_steps": 5,
+            "gamma": 1.5,
+            "n_independent": 2,
+            "n_shared": 2,
+            "momentum": 0.3,
+            "lambda_sparse": 1e-3,
+            "eval_metric": ["logloss"],
+            "patience": 5,
+            "lr": 1e-3,
+            "batch_size": 256,
+            "virtual_batch_size": 32,
+            "max_epochs": 100,
+            "t_max": 50,
+            "eta_min": 1e-6,
+            "mask_type": "entmax",
+            "device": "cuda"
+        }
+
+        self.params = {**default_params, **self.params}
+
+        hdr = pl.read_parquet(self.train_paths, n_rows=0)
+        all_cols = hdr.columns
+
+        if self.fold_col is None:
+            self.fold_col = f"{self.n_fold}fold-s{self.seed}"
+
+        if self.fold_col not in all_cols:
+            raise ValueError(f"fold_col not found in dataset: {self.fold_col}")
+        else:
+            print(f"Fold Col: {self.fold_col}")
+
+        if self.features is None:
+            meta = {"row_id"}
+            if self.target in all_cols:
+                meta.add(self.target)
+            if self.weight_col in all_cols:
+                meta.add(self.weight_col)
+            if self.fold_col:
+                meta.add(self.fold_col)
+
+            self.features = [
+                c for c in all_cols
+                if c not in meta and "fold" not in c
             ]
-            self.hidden_dims = dims_from_kwargs or [128, 64]
 
-    def fit(self, tr_df, test_df):
-        tr_df = tr_df.copy()
-        test_df = test_df.copy()
+        if self.cat_cols is None:
+            self.cat_cols = [
+                c for c, dt in zip(hdr.columns, hdr.dtypes)
+                if dt == pl.Categorical
+            ]
 
-        if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32").values
-            tr_df = tr_df.drop("weight", axis=1)
+        self.num_cols = [
+            col for col in self.features
+            if col not in self.cat_cols
+        ]
+
+        self.cat_idxs = [self.features.index(c) for c in self.cat_cols]
+        self.num_idxs = [self.features.index(c) for c in self.num_cols]
+
+        exprs = [pl.col(c).n_unique().alias(c) for c in self.cat_cols]
+        df1 = self.lf_train.select(exprs).collect()
+
+        if df1.width == 0 or df1.height == 0:
+            self.cat_dims = []
         else:
-            weights = np.ones(len(tr_df), dtype="float32")
+            self.cat_dims = [int(x) if x is not None else 0 for x in df1.row(0)]
 
-        self.cat_cols = tr_df.select_dtypes(include=["object", "category"]).columns.tolist()
-        self.num_cols = [col for col in tr_df.columns if col not in self.cat_cols + ["target"]]
+        self.embedding_dims = [
+            min(50, (n + 1) // 2)
+            for n in self.cat_dims
+        ]
 
-        cat_idxs = [tr_df.columns.get_loc(col) for col in self.cat_cols]
-        cat_dims = [tr_df[col].nunique() for col in self.cat_cols]
+    def fit(
+        self,
+        loggers: list[CVLogger] | None = None
+    ):
+        if self.test_paths is None:
+            raise ValueError("Please provide test_paths (got None).")
 
-        features = self.num_cols + self.cat_cols
+        t_total_start = now()
 
-        X = tr_df[features].values.astype(np.float32)
-        y = tr_df["target"].values.astype(np.float32)
+        loggers = loggers or [NoOpLogger()]
+        meta = {
+            "data_id": self.data_id,
+            "seed": self.seed,
+            "n_fold": self.n_fold,
+            **self.params
+        }
+        for lg in loggers:
+            lg.on_start(meta)
 
-        X_test = test_df[features].values.astype(np.float32)
+        train_rows = (
+            self.lf_train
+                .select(pl.len())
+                .collect()
+                .item()
+        )
+        test_rows = (
+            self.lf_test
+                .select(pl.len())
+                .collect()
+                .item()
+        )
 
-        oof_preds = np.zeros(len(X))
-        test_preds = np.zeros(len(X_test))
-
-        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.seed)
+        oof = np.zeros(train_rows, dtype=np.float32)
+        test_pred = np.zeros(test_rows, dtype=np.float32)
 
         epoch_list = []
+        loss_scores = []
+        auc_scores = []
 
-        for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
-            print(f"\nFold {fold + 1}")
-            start = time.time()
+        for i in range(self.n_fold):
+            print("=" * 22)
+            print(f"===== Fold {i + 1} / {self.n_fold} =====")
+            print("=" * 22)
+            print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+            print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-            X_train, y_train, w_train = X[tr_idx], y[tr_idx], weights[tr_idx]
-            X_val, y_val = X[val_idx], y[val_idx]
+            t_fold_start = now()
+
+            need_cols = self.features + [self.target, "row_id"]
+            train = (
+                self.lf_train
+                .filter(pl.col(self.fold_col) != i)
+                .select(need_cols)
+                .collect(engine="streaming")
+            )
+            valid = (
+                self.lf_train
+                .filter(pl.col(self.fold_col) == i)
+                .select(need_cols)
+                .collect(engine="streaming")
+            )
+            X_train = (
+                train
+                .select(self.features)
+                .to_numpy()
+                .astype(np.float32)
+            )
+            y_train = (
+                train
+                .select(self.target)
+                .to_numpy()
+                .astype(np.int64)
+            )
+            X_valid = (
+                valid
+                .select(self.features)
+                .to_numpy()
+                .astype(np.float32)
+            )
+            y_valid = (
+                valid
+                .select(self.target)
+                .to_numpy()
+                .astype(np.int64)
+            )
+            val_idx = (
+                valid
+                .select("row_id")
+                .to_series()
+                .to_numpy()
+                .astype(np.int32, copy=False)
+            )
+            test = (
+                self.lf_test
+                .select(self.features)
+                .collect(streaming=True)
+                .to_numpy()
+                .astype(np.float32)
+            )
+
+            mean, std = compute_feature_stats(
+                self.train_paths,
+                self.features,
+                self.num_cols,
+                self.fold_col,
+                exclude_folds=[i]
+            )
+
+            X_train[:, self.num_idxs] = (X_train[:, self.num_idxs] - mean) / std
+            X_valid[:, self.num_idxs] = (X_valid[:, self.num_idxs] - mean) / std
+            test[:, self.num_idxs] = (test[:, self.num_idxs] - mean) / std
+
+            history = {
+                "train": {"loss": [], "auc": []},
+                "valid": {"loss": [], "auc": []}
+            }
+            extra_hist = {"lr": []}
 
             model = TabNetClassifier(
-                cat_idxs=cat_idxs,
-                cat_dims=cat_dims,
-                cat_emb_dim=1,
-                n_d=self.hidden_dims[0] if self.hidden_dims else 8,
-                n_a=self.hidden_dims[0] if self.hidden_dims else 8,
-                n_steps=5,
-                gamma=1.5,
-                n_independent=2,
-                n_shared=2,
-                momentum=0.3,
-                lambda_sparse=1e-3,
+                cat_idxs=self.cat_idxs,
+                cat_dims=self.cat_dims,
+                cat_emb_dim=self.embedding_dims,
+                n_d=self.params["n_d"],
+                n_a=self.params["n_a"],
+                n_steps=self.params["n_steps"],
+                gamma=self.params["gamma"],
+                n_independent=self.params["n_independent"],
+                n_shared=self.params["n_shared"],
+                momentum=self.params["momentum"],
+                lambda_sparse=self.params["lambda_sparse"],
                 optimizer_fn=torch.optim.Adam,
-                optimizer_params=dict(lr=self.lr),
+                optimizer_params=dict(lr=self.params["lr"], weight_decay=1e-5),
                 scheduler_params={
-                    "T_max": self.t_max,
-                    "eta_min": self.lr_min,
-                    "verbose": False
+                    "T_max": self.params["t_max"],
+                    "eta_min": self.params["eta_min"]
                 },
                 scheduler_fn=torch.optim.lr_scheduler.CosineAnnealingLR,
-                mask_type='entmax',
-                verbose=self.log_interval,
+                mask_type=self.params["mask_type"],
+                verbose=1,
                 seed=self.seed,
-                device_name="cuda" if torch.cuda.is_available() else "cpu"
+                device_name=self.params["device"]
             )
 
             model.fit(
                 X_train=X_train,
                 y_train=y_train.flatten(),
-                eval_set=[(X_val, y_val.flatten())],
-                eval_metric=["logloss"],
-                max_epochs=self.max_epochs,
-                patience=self.early_stopping_rounds,
-                batch_size=self.batch_size,
-                virtual_batch_size=128,
+                eval_set=[(X_valid, y_valid.flatten())],
+                eval_metric=self.params["eval_metric"],
+                max_epochs=self.params["max_epochs"],
+                patience=self.params["patience"],
+                batch_size=self.params["batch_size"],
+                virtual_batch_size=self.params["virtual_batch_size"],
                 num_workers=0,
-                drop_last=False,
-                weights=w_train
+                drop_last=False
             )
 
-            val_preds = model.predict_proba(X_val)[:, 1]
-            val_logloss = roc_auc_score(y_val, val_preds)
-            print(f"Best Logloss: {val_logloss:.5f}")
+            val_pred = model.predict_proba(X_valid)[:, 1]
+            oof[val_idx] = val_pred
+            test_pred += model.predict_proba(test)[:, 1]
 
-            self.fold_models.append(model)
-            self.fold_scores.append(val_logloss)
-            epoch_list.append(len(model.history["loss"]))
+            best_logloss = log_loss(y_valid, val_pred)
+            loss_scores.append(best_logloss)
+            print(f"Best Logloss: {best_logloss:.5f}")
 
-            oof_preds[val_idx] = val_preds
-            test_preds += model.predict_proba(X_test)[:, 1]
+            best_auc = roc_auc_score(y_valid, val_pred)
+            auc_scores.append(best_auc)
+            print(f"Best AUC: {best_auc:.5f}")
 
-            end = time.time()
-            print_duration(start, end)
+            t_fold_end = now()
+            runtime = print_duration(
+                t_fold_start, t_fold_end, f"Fold {i+1} Runtime"
+            )
+            fold_summary = {
+                "loss": best_logloss,
+                "auc": best_auc,
+                "runtime": runtime
+            }
 
-        self.oof_score = roc_auc_score(y, oof_preds)
-        print("\n=== CV Results ===")
-        print(f"Fold scores: {self.fold_scores}")
-        print(f"Mean: {np.mean(self.fold_scores):.5f}, Std: {np.std(self.fold_scores):.5f}")
-        print(f"OOF score: {self.oof_score:.5f}")
-        print(f"Avg best epoch: {np.mean(epoch_list)}")
-        print(f"Best epochs: \n{epoch_list}")
-
-        test_preds /= self.n_splits
-        return oof_preds, test_preds
-
-    def get_best_fold(self):
-        """
-        最もスコアの高かったfoldのインデックスとそのスコアを返す。
-
-        Returns
-        -------
-        best_index: int
-            ベストスコアのfoldのインデックス。
-        self.fold_scores[best_index] : float
-            スコア。
-        """
-        best_index = int(np.argmax(self.fold_scores))
-        return best_index, self.fold_scores[best_index]
-
-    def fit_one_fold(self, tr_df, fold=0):
-        """
-        指定した1つのfoldのみを用いてモデルを学習する。
-        主にOptunaによるハイパーパラメータ探索時に使用。
-
-        Parameters
-        ----------
-        tr_df : pd.DataFrame
-            学習用データ。
-        fold : int
-            学習に使うfold番号。
-        """
-        tr_df = tr_df.copy()
-
-        if "weight" in tr_df.columns:
-            weights = tr_df["weight"].astype("float32").values
-            tr_df = tr_df.drop("weight", axis=1)
-        else:
-            weights = np.ones(len(tr_df), dtype="float32")
-
-        self.cat_cols = tr_df.select_dtypes(
-            include=["object", "category"]).columns.tolist()
-        self.num_cols = [col for col in tr_df.columns
-                         if col not in self.cat_cols + ["target"]]
-        categorical_cardinalities = {
-            col: tr_df[col].nunique()
-            for col in self.cat_cols
-        }
-
-        X_num = tr_df[self.num_cols].to_numpy().astype(np.float32)
-        X_cat = tr_df[self.cat_cols].to_numpy().astype(np.int64)
-        y = tr_df["target"].to_numpy().astype(np.float32)
-
-        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.seed)
-
-        tr_idx, val_idx = list(skf.split(X_num, y))[fold]
-        start = time.time()
-
-        X_tr_num, X_tr_cat, y_tr, w_tr = (
-            X_num[tr_idx], X_cat[tr_idx], y[tr_idx], weights[tr_idx])
-        X_val_num, X_val_cat, y_val = X_num[val_idx], X_cat[val_idx], y[val_idx]
-
-        # Dataloaders
-        train_dataset = TensorDataset(
-            torch.tensor(X_tr_num),
-            torch.tensor(X_tr_cat),
-            torch.tensor(y_tr),
-            torch.tensor(w_tr)
-        )
-        val_dataset = TensorDataset(
-            torch.tensor(X_val_num),
-            torch.tensor(X_val_cat),
-            torch.tensor(y_val)
-        )
-
-        train_loader = DataLoader(
-            train_dataset, batch_size=self.batch_size, shuffle=True
-        )
-        val_loader = DataLoader(
-            val_dataset, batch_size=self.batch_size, shuffle=False
-        )
-
-        model = SimpleMLP(
-            input_dim=X_num.shape[1],
-            hidden_dims=self.hidden_dims,
-            dropout_rate=self.dropout_rate,
-            activation=self.activation,
-            categorical_cardinalities=categorical_cardinalities
-        ).to(self.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
-        scheduler = CosineAnnealingLR(
-            optimizer,
-            T_max=self.t_max,
-            eta_min=self.eta_min
-        )
-        criterion = nn.BCEWithLogitsLoss()
-
-        best_logloss = float("inf")
-        best_model_state = None
-        best_epoch = 0
-
-        for epoch in range(self.epochs):
-            model.train()
-            for xb_num, xb_cat, yb, wb in train_loader:
-                xb_num = xb_num.to(self.device)
-                yb = yb.to(self.device)
-                wb = wb.to(self.device)
-                x_cat_dict = {
-                    col: xb_cat[:, i].long().to(self.device)
-                    for i, col in enumerate(self.cat_cols)
-                }
-
-                preds = model(xb_num, x_cat_dict)
-                loss = criterion(preds, yb)
-                loss = (loss * wb).mean()
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-            # Validation
-            model.eval()
-            preds = []
-            with torch.no_grad():
-                for xb_num, xb_cat, yb in val_loader:
-                    xb_num = xb_num.to(self.device)
-                    x_cat_dict = {
-                        col: xb_cat[:, i].long().to(self.device)
-                        for i, col in enumerate(self.cat_cols)
-                    }
-                    pred_logits = model(xb_num, x_cat_dict)
-                    pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
-                    preds.append(pred_probs)
-            val_pred = np.concatenate(preds)
-            val_logloss = roc_auc_score(y_val, val_pred)
-            scheduler.step()
-
-            if (epoch + 1) % 1 == 0 or epoch == 0:
-                model.eval()
-
-                train_preds = []
-                train_targets = []
-                with torch.no_grad():
-                    for xb_num, xb_cat, yb, wb in train_loader:
-                        xb_num = xb_num.to(self.device)
-                        x_cat_dict = {
-                            col: xb_cat[:, i].long().to(self.device)
-                            for i, col in enumerate(self.cat_cols)
-                        }
-                        pred_logits = model(xb_num, x_cat_dict)
-                        pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
-                        train_preds.append(pred_probs)
-                        train_targets.append(yb.numpy())
-                train_preds = np.concatenate(train_preds)
-                train_targets = np.concatenate(train_targets)
-                train_roc_auc_score = roc_auc_score(train_targets, train_preds)
-
-                print(
-                    f"Epoch {epoch+1}: "
-                    f"Train Logloss = {train_roc_auc_score:.5f}, "
-                    f"Val Logloss = {val_logloss:.5f}"
+            for lg in loggers:
+                lg.on_fold_end(
+                    i,
+                    "epoch",
+                    history,
+                    extra_hist,
+                    fold_summary
                 )
+            del model, X_train, y_train, X_valid, y_valid, test
+            gc.collect()
 
-            if val_logloss < best_logloss:
-                best_logloss = val_logloss
-                best_model_state = model.state_dict()
-                best_model_state = {
-                    k: v.cpu().clone() for k, v
-                    in model.state_dict().items()
-                }
-                print(
-                    f"New best model saved at epoch {epoch+1}, "
-                    f"Logloss: {val_logloss:.5f}")
-                best_epoch = epoch + 1
-            elif (
-                (epoch - best_epoch >= self.early_stopping_rounds) and
-                (epoch + 1 >= self.min_epochs)
-            ):
-                print(f"Early stopping at epoch {epoch+1}")
-                print(
-                    f"Loading best model from epoch {best_epoch} "
-                    f"with Logloss {best_logloss:.5f}")
-                break
+        print("\n=== CV Results ===")
+        y = (
+            pl.read_parquet(self.train_paths, columns=self.target)
+              .get_column(self.target)
+              .cast(pl.Float32)
+              .to_numpy()
+        )
+        oof_score_auc = roc_auc_score(y, oof)
+        oof_score_loss = log_loss(y, oof)
 
-        model.load_state_dict(
-            {k: v.to(self.device) for k, v in best_model_state.items()}
+        auc_mean = np.mean(auc_scores)
+        auc_std = np.std(auc_scores)
+
+        loss_mean = np.mean(loss_scores)
+        loss_std = np.std(loss_scores)
+
+        epoch_mean = np.mean(epoch_list)
+
+        test_pred /= self.n_fold
+
+        print(f"OOF AUC score: {oof_score_auc:.5f}")
+        print(
+            f"Mean: {auc_mean:.5f}, "
+            f"Std: {auc_std:.5f}"
+        )
+        print(f"Avg best epoch: {epoch_mean}")
+
+        t_total_end = now()
+        total_runtime = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
+
+        result = CVResult(
+            oof,
+            test_pred,
+            oof_score_auc
+        )
+        overall_summary = {
+            "auc_oof": oof_score_auc,
+            "auc_mean": auc_mean,
+            "auc_std": auc_std,
+            "loss_oof": oof_score_loss,
+            "loss_mean": loss_mean,
+            "loss_std": loss_std,
+            "epoch_mean": epoch_mean,
+            "total_runtime": total_runtime
+        }
+        for lg in loggers:
+            lg.on_end(overall_summary)
+
+        return result
+
+    def fit_one_fold(
+        self,
+        fold_idx: int,
+        loggers: list[CVLogger] | None = None
+    ):
+        t_total_start = now()
+
+        loggers = loggers or [NoOpLogger()]
+        meta = {
+            "data_id": self.data_id,
+            "seed": self.seed,
+            "n_fold": self.n_fold,
+            **self.params
+        }
+        for lg in loggers:
+            lg.on_start(meta)
+
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
+
+        need_cols = self.features + [self.target, "row_id"]
+        train = (
+            self.lf_train
+            .filter(pl.col(self.fold_col) != fold_idx)
+            .select(need_cols)
+            .collect(engine="streaming")
+        )
+        valid = (
+            self.lf_train
+            .filter(pl.col(self.fold_col) == fold_idx)
+            .select(need_cols)
+            .collect(engine="streaming")
+        )
+        X_train = (
+            train
+            .select(self.features)
+            .to_numpy()
+            .astype(np.float32)
+        )
+        y_train = (
+            train
+            .select(self.target)
+            .to_numpy()
+            .astype(np.int64)
+        )
+        X_valid = (
+            valid
+            .select(self.features)
+            .to_numpy()
+            .astype(np.float32)
+        )
+        y_valid = (
+            valid
+            .select(self.target)
+            .to_numpy()
+            .astype(np.int64)
         )
 
-        end = time.time()
-        print_duration(start, end)
+        mean, std = compute_feature_stats(
+            self.train_paths,
+            self.features,
+            self.num_cols,
+            self.fold_col,
+            exclude_folds=[fold_idx]
+        )
+
+        X_train[:, self.num_idxs] = (X_train[:, self.num_idxs] - mean) / std
+        X_valid[:, self.num_idxs] = (X_valid[:, self.num_idxs] - mean) / std
+
+        history = {
+            "train": {"loss": [], "auc": []},
+            "valid": {"loss": [], "auc": []}
+        }
+        extra_hist = {"lr": []}
+
+        model = TabNetClassifier(
+            cat_idxs=self.cat_idxs,
+            cat_dims=self.cat_dims,
+            cat_emb_dim=self.embedding_dims,
+            n_d=self.params["n_d"],
+            n_a=self.params["n_a"],
+            n_steps=self.params["n_steps"],
+            gamma=self.params["gamma"],
+            n_independent=self.params["n_independent"],
+            n_shared=self.params["n_shared"],
+            momentum=self.params["momentum"],
+            lambda_sparse=self.params["lambda_sparse"],
+            optimizer_fn=torch.optim.Adam,
+            optimizer_params=dict(lr=self.params["lr"], weight_decay=1e-5),
+            scheduler_params={
+                "T_max": self.params["t_max"],
+                "eta_min": self.params["eta_min"]
+            },
+            scheduler_fn=torch.optim.lr_scheduler.CosineAnnealingLR,
+            mask_type=self.params["mask_type"],
+            verbose=1,
+            seed=self.seed,
+            device_name=self.params["device"]
+        )
+
+        model.fit(
+            X_train=X_train,
+            y_train=y_train.flatten(),
+            eval_set=[(X_valid, y_valid.flatten())],
+            eval_metric=self.params["eval_metric"],
+            max_epochs=self.params["max_epochs"],
+            patience=self.params["patience"],
+            batch_size=self.params["batch_size"],
+            virtual_batch_size=self.params["virtual_batch_size"],
+            num_workers=0,
+            drop_last=False
+        )
+
+        val_pred = model.predict_proba(X_valid)[:, 1]
+
+        best_logloss = log_loss(y_valid, val_pred)
         print(f"Best Logloss: {best_logloss:.5f}")
 
-        self.fold_models.append(MLPFoldModel(
-            model,
-            X_val_num,
-            X_val_cat,
-            y_val,
-            0,
-            best_rounds=best_epoch
-        ))
-        self.fold_scores.append(best_logloss)
+        best_auc = roc_auc_score(y_valid, val_pred)
+        print(f"Best AUC: {best_auc:.5f}")
 
+        del model, X_train, y_train, X_valid, y_valid
+        gc.collect()
 
-class MLPFoldModel:
-    """
-    MLPのfold単位のモデルを保持するクラス。
+        t_total_end = now()
+        total_runtime = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
+        fold_summary = {
+            "loss": best_logloss,
+            "auc": best_auc,
+            "runtime": total_runtime
+        }
 
-    Attributes
-    ----------
-    model : torch.nn.Module
-        学習済みのMLPモデル。
-    X_val_num : pd.DataFrame
-        検証用の数値特徴量データ。
-    X_val_cat : pd.DataFrame
-        検証用のカテゴリ特徴量データ。
-    y_val : pd.Series
-        検証用のターゲットラベル。
-    fold_index : int
-        foldの番号。
-    best_rounds : int
-        最良スコア時のエポック数
-    """
+        for lg in loggers:
+            lg.on_fold_end(
+                fold_idx,
+                "epoch",
+                history,
+                extra_hist,
+                fold_summary
+            )
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-    def __init__(
-        self, model, X_val_num, X_val_cat, y_val, fold_index, best_rounds
-    ):
-        self.model = model
-        self.X_val_num = X_val_num
-        self.X_val_cat = X_val_cat
-        self.y_val = y_val
-        self.fold_index = fold_index
-        self.best_rounds = best_rounds
-
-    def save_model(self, path="../artifacts/model/xgb_vn.pkl"):
-        """
-        学習済みモデルを指定パスに保存する。
-
-        Parameters
-        ----------
-        path : str
-            モデルを保存するパス。
-        """
-        joblib.dump(self.model, path)
-
-    def load_model(self, path):
-        """
-        指定されたパスからモデルを読み込む。
-
-        Parameters
-        ----------
-        path : str
-            モデルファイルのパス。
-
-        Returns
-        -------
-        self : XGBFoldModel
-            読み込んだモデルを保持するインスタンス自身を返す。
-        """
-        self.model = joblib.load(path)
-        return self
+        return best_auc
