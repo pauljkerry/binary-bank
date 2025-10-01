@@ -1,0 +1,27 @@
+{
+    "params": {
+        "hidden_dim1": 640,
+        "hidden_dim2": 320,
+        "hidden_dim3": 192,
+        "hidden_dim4": -1,
+        "batch_size": 640,
+        "lr": 0.005674343525332421,
+        "eta_min": 0.00025329670536771446,
+        "dropout_rate": 0.2,
+        "activation": "ReLU",
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 10,
+        "min_epochs": 4
+    },
+    "n_fold": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "ghyjsfjr",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/ghyjsfjr",
+    "opts": {
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 10,
+        "min_epochs": 4
+    },
+    "score": 0.97292136752318
+}

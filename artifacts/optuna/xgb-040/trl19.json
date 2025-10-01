@@ -1,0 +1,22 @@
+{
+    "params": {
+        "learning_rate": 0.02,
+        "max_depth": 13,
+        "min_child_weight": 47.428268266554085,
+        "colsample_bytree": 0.4637320193912863,
+        "subsample": 0.8498676980352918,
+        "reg_alpha": 5.558058271155851,
+        "reg_lambda": 0.2015016591594736
+    },
+    "n_fold": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "nvy9d4hs",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/nvy9d4hs",
+    "opts": {
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 10,
+        "min_epochs": 4
+    },
+    "score": 0.9763808167908384
+}

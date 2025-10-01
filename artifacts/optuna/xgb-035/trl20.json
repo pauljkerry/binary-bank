@@ -1,0 +1,22 @@
+{
+    "params": {
+        "learning_rate": 0.02,
+        "max_depth": 7,
+        "min_child_weight": 41.99005477361848,
+        "colsample_bytree": 0.464196093655463,
+        "subsample": 0.8669744747703488,
+        "reg_alpha": 0.024700671457991052,
+        "reg_lambda": 0.002258679276329608
+    },
+    "n_fold": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "xmtrytmk",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/xmtrytmk",
+    "opts": {
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 10,
+        "min_epochs": 4
+    },
+    "score": 0.968962354482712
+}

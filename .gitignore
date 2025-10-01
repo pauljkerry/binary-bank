@@ -1,15 +1,14 @@
 __pycache__/
 .ipynb_checkpoints/
 .env
-artifacts/
 input/
 output/
+artifacts/features/
+artifacts/wandb/
 data_description.txt
 docker-compose.yml
-todo.txt
 *.pyc
 *.log
 .virtual_documents/
 notebooks/wandb/
 notebooks/fe/AutogluonModels/
-artifacts/wandb/

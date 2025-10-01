@@ -1,0 +1,19 @@
+{
+    "params": {
+        "learning_rate": 0.02,
+        "max_depth": 7,
+        "min_child_weight": 80.21969807540397,
+        "colsample_bytree": 0.3298202574719083,
+        "subsample": 0.8947547746402069,
+        "reg_alpha": 2.119149156242054,
+        "reg_lambda": 0.0009853225172032562
+    },
+    "n_fold": 10,
+    "seed": 42,
+    "fold_idx": 0,
+    "batch_rows": 1000000,
+    "wandb_id": "pcmo0lkh",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/pcmo0lkh",
+    "opts": {},
+    "score": 0.977296566138608
+}

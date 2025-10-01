@@ -1,6 +1,7 @@
 from __future__ import annotations
 import gc
 import os
+import re
 import math
 from dataclasses import dataclass, field
 from time import perf_counter as now
@@ -111,7 +112,7 @@ class ParquetIter(xgb.core.DataIter):
             if self.include_fold is not None:
                 gdf = gdf[gdf[self.fold_col] == self.include_fold]
             if self.exclude_fold is not None:
-                gdf = gdf[~gdf[self.fold_col] != self.exclude_folds]
+                gdf = gdf[gdf[self.fold_col] != self.exclude_fold]
 
             # カテゴリ化（必要な列のみ）
             if self.cat_cols:
@@ -240,17 +241,15 @@ class XGBCVTrainer:
             print(f"Fold Col: {self.fold_col}")
 
         if self.features is None:
-            meta = {"row_id"}
-            if self.target in all_cols:
-                meta.add(self.target)
-            if self.weight_col in all_cols:
-                meta.add(self.weight_col)
-            if self.fold_col:
-                meta.add(self.fold_col)
-
+            meta = {
+                c
+                for c in ("row_id", self.target, self.weight_col, self.fold_col)
+                if c and c in all_cols
+            }
+            pat = re.compile(r"^\d+fold(?:-[A-Za-z0-9]+)?$")
             self.features = [
                 c for c in all_cols
-                if c not in meta and "fold" not in c
+                if c not in meta and not pat.fullmatch(c)
             ]
 
         dev_mr = mr.CudaAsyncMemoryResource()
@@ -428,7 +427,7 @@ class XGBCVTrainer:
             df = pl.DataFrame(
                 {
                     "Feature": list(importances.keys()),
-                    "ImportanceRatio": [
+                    "Importance": [
                         ((v/total_gain)*100.0)/self.n_folds
                         for v in importances.values()
                     ],
@@ -469,9 +468,9 @@ class XGBCVTrainer:
             all_fi
             .group_by("Feature")
             .agg([
-                pl.sum("ImportanceRatio").alias("mean_ratio")
+                pl.sum("Importance").alias("Importance")
             ])
-        ).sort("mean_ratio", descending=True)
+        ).sort("Importance", descending=True)
 
         auc_oof = roc_auc_score(y, oof)
         auc_mean = np.mean(auc_scores)

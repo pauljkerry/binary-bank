@@ -39,5 +39,8 @@ def get_objective(model_type: str):
     elif model_type == "ridge":
         from src.models.ridge.ridge_objective import create_objective
         return create_objective
+    elif model_type == "lasso":
+        from src.models.lasso.lasso_objective import create_objective
+        return create_objective
     else:
         raise ValueError(f"Unknown model type: {model_type}")

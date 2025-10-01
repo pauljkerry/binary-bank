@@ -1,5 +1,6 @@
 import gc
 import os
+import re
 from dataclasses import dataclass, field
 from time import perf_counter as now
 from typing import Optional
@@ -33,7 +34,7 @@ def compute_feature_stats(
         if include_fold is not None:
             lf = lf.filter(pl.col(fold_col) == include_fold)
         if exclude_fold is not None:
-            lf = lf.filter(~pl.col(fold_col) != exclude_fold)
+            lf = lf.filter(pl.col(fold_col) != exclude_fold)
 
     exprs = []
     for c in num_cols:
@@ -127,18 +128,16 @@ class LogRegCVTrainer:
             ]
 
         if self.features is None:
-            meta = {"row_id"}
-            meta.add(self.cat_cols)
-            if self.target in all_cols:
-                meta.add(self.target)
-            if self.weight_col in all_cols:
-                meta.add(self.weight_col)
-            if self.fold_col:
-                meta.add(self.fold_col)
-
+            meta = {
+                c
+                for c in ("row_id", self.target, self.weight_col, self.fold_col)
+                if c and c in all_cols
+            }
+            meta |= self.cat_cols
+            pat = re.compile(r"^\d+fold(?:-[A-Za-z0-9]+)?$")
             self.features = [
                 c for c in all_cols
-                if c not in meta and "fold" not in c
+                if c not in meta and not pat.fullmatch(c)
             ]
 
         dev_mr = mr.CudaAsyncMemoryResource()
@@ -216,7 +215,7 @@ class LogRegCVTrainer:
             mean, std = compute_feature_stats(
                 self.train_paths,
                 self.features,
-                self.num_cols,
+                self.features,
                 self.fold_col,
                 exclude_fold=i
             )
@@ -225,18 +224,20 @@ class LogRegCVTrainer:
 
             train = cudf.read_parquet(
                 self.train_paths,
-                columns=self.features + self.target + self.fold_col
+                columns=self.features + [self.target, self.fold_col]
             )
 
-            X_train = train[~train[self.fold_col] != i][self.features].to_cupy()
-            y_train = train[~train[self.fold_col] != i][self.target].to_cupy()
+            X_train = train[train[self.fold_col] != i][self.features].to_cupy()
+            y_train = train[train[self.fold_col] != i][self.target].to_cupy()
 
             X_valid = train[train[self.fold_col] == i][self.features].to_cupy()
             y_valid = (
                 self.lf_train
                 .filter(pl.col(self.fold_col) == i)
-                .select(self.features)
+                .select(self.target)
                 .collect(engine="streaming")
+                .to_numpy()
+                .ravel()
             )
 
             X_train -= mean
@@ -259,9 +260,9 @@ class LogRegCVTrainer:
             model = LogisticRegression(**self.params)
             model.fit(X_train, y_train)
 
-            pred = model.predict(X_valid).to_numpy()
+            pred = model.predict(X_valid).get()
             oof[val_idx] = pred
-            test_pred += model.predict(test).to_numpy()
+            test_pred += model.predict(test).get()
 
             logloss_valid = log_loss(y_valid, pred)
             auc_valid = roc_auc_score(y_valid, pred)
@@ -387,7 +388,7 @@ class LogRegCVTrainer:
         mean, std = compute_feature_stats(
             self.train_paths,
             self.features,
-            self.num_cols,
+            self.features,
             self.fold_col,
             exclude_fold=fold_idx
         )
@@ -396,18 +397,20 @@ class LogRegCVTrainer:
 
         train = cudf.read_parquet(
             self.train_paths,
-            columns=self.features + self.target + self.fold_col
+            columns=self.features + [self.target, self.fold_col]
         )
 
-        X_train = train[~train[self.fold_col] != fold_idx][self.features].to_cupy()
-        y_train = train[~train[self.fold_col] != fold_idx][self.target].to_cupy()
+        X_train = train[train[self.fold_col] != fold_idx][self.features].to_cupy()
+        y_train = train[train[self.fold_col] != fold_idx][self.target].to_cupy()
 
         X_valid = train[train[self.fold_col] == fold_idx][self.features].to_cupy()
         y_valid = (
             self.lf_train
             .filter(pl.col(self.fold_col) == fold_idx)
-            .select(self.features)
+            .select(self.target)
             .collect(engine="streaming")
+            .to_numpy()
+            .ravel()
         )
 
         X_train -= mean
@@ -419,7 +422,7 @@ class LogRegCVTrainer:
         model = LogisticRegression(**self.params)
         model.fit(X_train, y_train)
 
-        pred = model.predict(X_valid).to_numpy()
+        pred = model.predict(X_valid).get()
 
         logloss_valid = log_loss(y_valid, pred)
         auc_valid = roc_auc_score(y_valid, pred)

@@ -1,0 +1,22 @@
+{
+    "9": [
+        "job",
+        "campaign",
+        "education",
+        "previous",
+        "marital",
+        "loan",
+        "default"
+    ],
+    "11": [
+        "education",
+        "previous",
+        "marital",
+        "loan",
+        "default"
+    ],
+    "14": [
+        "loan",
+        "default"
+    ]
+}

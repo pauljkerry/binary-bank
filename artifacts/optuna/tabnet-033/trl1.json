@@ -1,0 +1,31 @@
+{
+    "params": {
+        "n_d": 14,
+        "n_a": 24,
+        "n_steps": 8,
+        "gamma": 1.6789267873576292,
+        "n_independent": 1,
+        "n_shared": 1,
+        "momentum": 0.042071772623915794,
+        "lambda_sparse": 0.0005399484409787432,
+        "lr": 0.000641003510568888,
+        "batch_size": 8952,
+        "eta_min": 0.00010485387725194633,
+        "mask_type": "entmax",
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 10,
+        "min_epochs": 4,
+        "virtual_batch_size": 1119.0
+    },
+    "n_fold": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "i44kw58r",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/i44kw58r",
+    "opts": {
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 10,
+        "min_epochs": 4
+    },
+    "score": 0.7894696465774625
+}

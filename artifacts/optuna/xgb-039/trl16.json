@@ -1,0 +1,22 @@
+{
+    "params": {
+        "learning_rate": 0.02,
+        "max_depth": 13,
+        "min_child_weight": 46.861162026250824,
+        "colsample_bytree": 0.3030189277265172,
+        "subsample": 0.8729161367647149,
+        "reg_alpha": 17.438954224009642,
+        "reg_lambda": 0.6445177844178243
+    },
+    "n_fold": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "nwvamket",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/nwvamket",
+    "opts": {
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 10,
+        "min_epochs": 4
+    },
+    "score": 0.9755113594166462
+}

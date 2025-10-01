@@ -1,0 +1,11 @@
+{
+  "created_at": "2025-09-28T11:20:45.147073+09:00",
+  "folds_shape": [
+    1545211,
+    3
+  ],
+  "cfg_list": [
+    "skf/k=5/s=42@train",
+    "skf/k=5/s=42@train+orig"
+  ]
+}

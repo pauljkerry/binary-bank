@@ -37,7 +37,10 @@ def get_trainer(model_type: str):
         from src.models.logreg.logreg_cv_trainer import LogRegCVTrainer
         return LogRegCVTrainer
     elif model_type == "ridge":
-        from src.models.ridge import RidgeCVTrainer
+        from src.models.ridge.ridge_cv_trainer import RidgeCVTrainer
         return RidgeCVTrainer
+    elif model_type == "lasso":
+        from src.models.lasso.lasso_cv_trainer import LassoCVTrainer
+        return LassoCVTrainer
     else:
         raise ValueError(f"Unknown model type: {model_type}")

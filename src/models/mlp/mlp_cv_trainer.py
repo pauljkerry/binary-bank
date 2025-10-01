@@ -1,5 +1,6 @@
 import gc
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 from time import perf_counter as now
@@ -40,7 +41,7 @@ def compute_feature_stats(
         if include_fold is not None:
             lf = lf.filter(pl.col(fold_col) == include_fold)
         if exclude_fold is not None:
-            lf = lf.filter(~pl.col(fold_col) != exclude_fold)
+            lf = lf.filter(pl.col(fold_col) != exclude_fold)
 
     exprs = []
     for c in num_cols:
@@ -173,7 +174,7 @@ class ParquetStream(IterableDataset):
                 if self.include_fold is not None:
                     gdf = gdf[gdf[self.fold_col] == self.include_fold]
                 if self.exclude_fold is not None:
-                    gdf = gdf[~gdf[self.fold_col] != self.exclude_fold]
+                    gdf = gdf[gdf[self.fold_col] != self.exclude_fold]
 
                 # GPU 内シャッフル
                 if self.shuffle:
@@ -458,17 +459,15 @@ class MLPCVTrainer:
             print(f"Fold Col: {self.fold_col}")
 
         if self.features is None:
-            meta = {"row_id"}
-            if self.target in all_cols:
-                meta.add(self.target)
-            if self.weight_col in all_cols:
-                meta.add(self.weight_col)
-            if self.fold_col:
-                meta.add(self.fold_col)
-
+            meta = {
+                c
+                for c in ("row_id", self.target, self.weight_col, self.fold_col)
+                if c and c in all_cols
+            }
+            pat = re.compile(r"^\d+fold(?:-[A-Za-z0-9]+)?$")
             self.features = [
                 c for c in all_cols
-                if c not in meta and "fold" not in c
+                if c not in meta and not pat.fullmatch(c)
             ]
 
         self.num_cols = [

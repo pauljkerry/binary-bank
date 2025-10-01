@@ -1,6 +1,7 @@
 import gc
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from time import perf_counter as now
 from typing import Optional
@@ -116,17 +117,15 @@ class LGBMCVTrainer:
             print(f"Fold Col: {self.fold_col}")
 
         if self.features is None:
-            meta = {"row_id"}
-            if self.target in all_cols:
-                meta.add(self.target)
-            if self.weight_col in all_cols:
-                meta.add(self.weight_col)
-            if self.fold_col:
-                meta.add(self.fold_col)
-
+            meta = {
+                c
+                for c in ("row_id", self.target, self.weight_col, self.fold_col)
+                if c and c in all_cols
+            }
+            pat = re.compile(r"^\d+fold(?:-[A-Za-z0-9]+)?$")
             self.features = [
                 c for c in all_cols
-                if c not in meta and "fold" not in c
+                if c not in meta and not pat.fullmatch(c)
             ]
 
     def fit(
