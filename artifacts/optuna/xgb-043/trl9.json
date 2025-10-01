@@ -1,0 +1,22 @@
+{
+    "params": {
+        "learning_rate": 0.02,
+        "max_depth": 10,
+        "min_child_weight": 92.18742350231169,
+        "colsample_bytree": 0.3353970008207678,
+        "subsample": 0.578393144967658,
+        "reg_alpha": 0.00017921154573376048,
+        "reg_lambda": 0.004233032996527599
+    },
+    "n_folds": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "flqxhcst",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/flqxhcst",
+    "opts": {
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 20,
+        "min_epochs": 4
+    },
+    "score": 0.976377074722062
+}

@@ -1,0 +1,22 @@
+{
+    "params": {
+        "learning_rate": 0.02,
+        "max_depth": 12,
+        "min_child_weight": 41.69246083275005,
+        "colsample_bytree": 0.5091238846081099,
+        "subsample": 0.8493246691718297,
+        "reg_alpha": 0.03365524290208088,
+        "reg_lambda": 0.9341028829557501
+    },
+    "n_folds": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "rl14x750",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/rl14x750",
+    "opts": {
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 20,
+        "min_epochs": 4
+    },
+    "score": 0.9766294868439903
+}
