@@ -1,0 +1,18 @@
+{
+    "params": {
+        "learning_rate": 0.01,
+        "max_depth": 13,
+        "min_child_weight": 35.63922748575267,
+        "colsample_bytree": 0.5068052640251843,
+        "subsample": 0.7881264971247407,
+        "reg_alpha": 1.2596289171899167,
+        "reg_lambda": 0.0025904034600259442
+    },
+    "n_folds": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "poicosry",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/poicosry",
+    "opts": {},
+    "score": 0.976763953105469
+}

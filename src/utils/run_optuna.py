@@ -4,13 +4,12 @@ from src.utils.telegram import send_message
 
 def run_optuna_search(
     objective,
-    n_trials=50,
-    n_jobs=1,
-    direction="minimize",
-    study_name="study",
-    storage=None,
-    initial_params: dict = None,
-    sampler=None,
+    n_trials: int = 50,
+    direction: str = "minimize",
+    study_name: str = "study",
+    storage: str = None,
+    initial_params: dict | list[dict] = None,
+    sampler: optuna.samplers.BaseSampler | None = None,
     pruner=None
 ):
     """
@@ -22,8 +21,6 @@ def run_optuna_search(
         Optunaの目的関数。
     n_trials : int, default 50
         試行回数。
-    n_jobs : int, default 1
-        並列実行数。
     direction : str, default "minimize"
         Optunaの探索方向。
     study_name : str or None, default "study"
@@ -55,15 +52,19 @@ def run_optuna_search(
         elif isinstance(initial_params, list):
             for p in initial_params:
                 if not isinstance(p, dict):
-                    raise ValueError("initial_paramsの各要素はdictである必要があります。")
+                    raise ValueError(
+                        "Each element of initial_params must be a dict."
+                    )
                 study.enqueue_trial(p)
+                print(f"[initial] {len(initial_params)} trial(s) will be enqueued:")
         else:
-            raise ValueError("initial_paramsはdictまたはlist[dict]である必要があります。")
+            raise ValueError("initial_params must be a dict or list[dict].")
+    else:
+        print("[initial] none")
 
     study.optimize(
         objective,
         n_trials=n_trials,
-        n_jobs=n_jobs,
         show_progress_bar=True
     )
 

@@ -1,0 +1,18 @@
+{
+    "params": {
+        "learning_rate": 0.01,
+        "max_depth": 13,
+        "min_child_weight": 66.6357042429454,
+        "colsample_bytree": 0.44004732616616377,
+        "subsample": 0.8354031299682657,
+        "reg_alpha": 0.6052793728264945,
+        "reg_lambda": 0.13295557745593092
+    },
+    "n_folds": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "frsveoaa",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/frsveoaa",
+    "opts": {},
+    "score": 0.9767808352502867
+}

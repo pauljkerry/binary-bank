@@ -5,10 +5,12 @@ input/
 output/
 artifacts/features/
 artifacts/wandb/
+artifacts/ds_sub_fit/
 data_description.txt
 docker-compose.yml
 *.pyc
 *.log
+*.parquet
 .virtual_documents/
 notebooks/wandb/
 notebooks/fe/AutogluonModels/

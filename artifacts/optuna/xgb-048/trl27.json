@@ -1,0 +1,18 @@
+{
+    "params": {
+        "learning_rate": 0.01,
+        "max_depth": 11,
+        "min_child_weight": 39.99806993837147,
+        "colsample_bytree": 0.39820514268386387,
+        "subsample": 0.7213815618438911,
+        "reg_alpha": 0.11754577401352602,
+        "reg_lambda": 0.0060994021307615425
+    },
+    "n_folds": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "k41mmxhi",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/k41mmxhi",
+    "opts": {},
+    "score": 0.9767216657383914
+}

@@ -1,0 +1,22 @@
+{
+    "params": {
+        "learning_rate": 0.02,
+        "max_depth": 10,
+        "min_child_weight": 17.052412368729154,
+        "colsample_bytree": 0.3260206371941118,
+        "subsample": 0.8795542149013333,
+        "reg_alpha": 25.676071644288232,
+        "reg_lambda": 1.1015056790269626
+    },
+    "n_folds": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "glpbfaca",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/glpbfaca",
+    "opts": {
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 20,
+        "min_epochs": 4
+    },
+    "score": 0.9765785549105314
+}

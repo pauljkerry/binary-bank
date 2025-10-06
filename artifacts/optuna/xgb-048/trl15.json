@@ -1,0 +1,22 @@
+{
+    "params": {
+        "learning_rate": 0.02,
+        "max_depth": 12,
+        "min_child_weight": 0.2429956550411685,
+        "colsample_bytree": 0.42650597295732545,
+        "subsample": 0.6387403565626487,
+        "reg_alpha": 0.1474342775014059,
+        "reg_lambda": 0.46343808617582577
+    },
+    "n_folds": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "ktk7tarx",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/ktk7tarx",
+    "opts": {
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 20,
+        "min_epochs": 4
+    },
+    "score": 0.9764410235669141
+}

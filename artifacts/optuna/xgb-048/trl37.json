@@ -1,0 +1,18 @@
+{
+    "params": {
+        "learning_rate": 0.01,
+        "max_depth": 12,
+        "min_child_weight": 24.10318965216932,
+        "colsample_bytree": 0.5353490017574145,
+        "subsample": 0.8666038994135905,
+        "reg_alpha": 9.664073072218233,
+        "reg_lambda": 0.0012942734977607843
+    },
+    "n_folds": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "efhvkrua",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/efhvkrua",
+    "opts": {},
+    "score": 0.976772256036576
+}

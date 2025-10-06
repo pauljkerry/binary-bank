@@ -1,0 +1,18 @@
+{
+    "params": {
+        "learning_rate": 0.02,
+        "max_depth": 17,
+        "min_child_weight": 54.39645499969017,
+        "colsample_bytree": 0.3335644011630281,
+        "subsample": 0.8736838639084301,
+        "reg_alpha": 0.2366545277095805,
+        "reg_lambda": 9.922363245478374
+    },
+    "n_folds": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "hcmwbw54",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/hcmwbw54",
+    "opts": {},
+    "score": 0.976702311084207
+}

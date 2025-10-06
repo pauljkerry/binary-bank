@@ -1,4 +1,3 @@
-from typing import Optional
 import polars as pl
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
@@ -11,31 +10,56 @@ def target_encoding(
     key_cols: list[str],
     target: str = "target",
     stats: tuple[str, ...] = ("mean", "std", "min", "max", "median", "count"),
+    alpha: int = 0,
     n_splits: int = 5,
     seed: int = 42
-):
+) -> pl.DataFrame:
     """
-    Target Encodingを行う関数
+    Out-of-fold (OOF) target encoding with M-estimate smoothing.
+
+    For each column in `key_cols`, per-category statistics are computed on the
+    fold's training split and joined to the validation split (leak-free).
+    Test features are computed per fold and averaged. For "mean", the smoothed
+    estimate is:
+        (n * mean + alpha * global_mean) / (n + alpha)
+    Unseen categories are filled with the fold's global statistics.
 
     Parameters
     ----------
     tr_df : pl.DataFrame
-        Training data
+        Training data. Must contain `target` and all `key_cols`.
     test_df : pl.DataFrame
-        Unlabeled data
-    target : str
-        Targetカラムの列名
-    cat_cols : list
-        カテゴリ変数の列名のリスト
-    n_splits : int
-        SKFの分割数
-    seed : int
-        Random seed
+        Unlabeled data. Must contain all `key_cols`.
+    key_cols : list[str]
+        Discrete/categorical keys used for grouping. Do not pass raw float
+        columns; round/bin or stringify them first to avoid join drift.
+    target : str, default "target"
+        Target column name. For "count", this function counts positives as
+        `(target == 1).sum()` (binary assumption).
+    stats : tuple of {"mean","std","min","max","median","count"}, default (...)
+        Per-category statistics to output. Only "mean" is smoothed by `alpha`.
+        ("count" means positive count for binary targets.)
+    alpha : float, default 20.0
+        Smoothing strength (half-life). `alpha=0` disables smoothing.
+        n≈alpha ⇒ the category mean is trusted ~50%.
+    n_splits : int, default 5
+        Number of StratifiedKFold splits.
+    seed : int, default 42
+        Random seed for fold shuffling.
 
     Returns
     -------
-    te_df : pl.DataFrame
-        Target Encodingを行ったDF
+    pl.DataFrame
+        Encoded features for train and test stacked vertically. Columns are
+        named `{target}_{stat}_by_{col}` in the order of `key_cols`.
+        Shape: (tr_df.height + test_df.height, sum_over_cols len(stats_for_col))
+
+    Notes
+    -----
+    - OOF computation prevents target leakage.
+    - Unseen categories are filled with fold-wise global stats (e.g., global_mean).
+    - If you need raw frequency n_i, add an explicit aggregation; "count" here
+      is the positive-class count (binary).
     """
     y = tr_df.get_column(target).to_numpy()
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
@@ -70,17 +94,18 @@ def target_encoding(
     ):
         train = tr_df[tr_idx]
         val = tr_df[val_idx]
+        global_mean = train.select(pl.col(target).mean()).to_series()[0]
+
+        base = train.select([
+            pl.col(target).mean().alias("mean"),
+            pl.col(target).std(ddof=1).alias("std"),
+            pl.col(target).min().alias("min"),
+            pl.col(target).max().alias("max"),
+            pl.col(target).median().alias("median"),
+            (pl.col(target) == 1).sum().alias("cnt"),
+        ]).to_dicts()[0]
 
         for col in tqdm(key_cols):
-            base = train.select([
-                pl.col(target).mean().alias("mean"),
-                pl.col(target).std(ddof=1).alias("std"),
-                pl.col(target).min().alias("min"),
-                pl.col(target).max().alias("max"),
-                pl.col(target).median().alias("median"),
-                (pl.col(target) == 1).sum().alias("cnt"),
-            ]).to_dicts()[0]
-
             fill_map = {}
             for s in stats:
                 name = f"{target}_{s}_by_{col}"
@@ -93,7 +118,10 @@ def target_encoding(
             col_names = []
             if "mean" in stats:
                 aggs.append(
-                    pl.col(target).mean().alias(f"{target}_mean_by_{col}")
+                    (
+                        (pl.col(target).sum() + pl.lit(alpha) * pl.lit(global_mean))
+                        / (pl.len() + pl.lit(alpha))
+                    ).alias(f"{target}_mean_by_{col}")
                 )
                 col_names.append(f"{target}_mean_by_{col}")
             if "std" in stats:

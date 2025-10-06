@@ -1,0 +1,22 @@
+{
+    "params": {
+        "learning_rate": 0.02,
+        "max_depth": 6,
+        "min_child_weight": 86.61761457749351,
+        "colsample_bytree": 0.5404460046972834,
+        "subsample": 0.7832290311184182,
+        "reg_alpha": 0.00013041140442542025,
+        "reg_lambda": 7.072114131472227
+    },
+    "n_folds": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "tybgdpvc",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/tybgdpvc",
+    "opts": {
+        "earlys_stopping_rounds": 5,
+        "max_epochs": 20,
+        "min_epochs": 4
+    },
+    "score": 0.9763397466172484
+}
