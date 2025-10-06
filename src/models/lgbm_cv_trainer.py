@@ -285,7 +285,7 @@ class LGBMCVTrainer:
             df = pl.DataFrame(
                 {
                     "Feature": model.feature_name(),
-                    "ImportanceRatio": [
+                    "Importance": [
                         ((v/total_gain)*100.0)/self.n_folds for v in importances
                     ],
                 }
@@ -327,9 +327,9 @@ class LGBMCVTrainer:
             all_fi
             .group_by("Feature")
             .agg([
-                pl.sum("ImportanceRatio").alias("mean_ratio")
+                pl.sum("Importance").alias("Importance")
             ])
-        ).sort("mean_ratio", descending=True)
+        ).sort("Importance", descending=True)
 
         oof_score = roc_auc_score(y, oof)
 
