@@ -128,7 +128,6 @@ class CBCVTrainer:
             "data_id": self.data_id,
             "seed": self.seed,
             "n_folds": self.n_folds,
-            "early_stopping_rounds": self.early_stopping_rounds,
             **self.params
         }
         for lg in loggers:
@@ -337,7 +336,6 @@ class CBCVTrainer:
             "data_id": self.data_id,
             "seed": self.seed,
             "n_folds": self.n_folds,
-            "early_stopping_rounds": self.early_stopping_rounds,
             **self.params
         }
         for lg in loggers:
@@ -441,7 +439,6 @@ class CBCVTrainer:
             "data_id": self.data_id,
             "seed": self.seed,
             "n_folds": self.n_folds,
-            "early_stopping_rounds": self.early_stopping_rounds,
             **self.params
         }
         for lg in loggers:

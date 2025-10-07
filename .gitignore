@@ -11,6 +11,7 @@ docker-compose.yml
 *.pyc
 *.log
 *.parquet
+*.db
 .virtual_documents/
 notebooks/wandb/
 notebooks/fe/AutogluonModels/
