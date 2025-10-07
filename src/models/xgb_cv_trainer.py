@@ -190,7 +190,7 @@ class XGBCVTrainer:
             "max_depth": 7,
             "min_child_weight": 10.0,
             "gamma": 0,
-            "colsample_bytree": 0.8,
+            "colsample_bytree": 0.4,
             "subsample": 0.8,
             "reg_alpha": 0.0,
             "reg_lambda": 1.0,

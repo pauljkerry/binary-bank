@@ -1,5 +1,6 @@
 import gc
 import os
+import re
 import numpy as np
 import cupy as cp
 import pandas as pd
@@ -53,10 +54,16 @@ def hill_climbing_auc(
     oof_df = pl.read_parquet(train_paths)
     test_df = pl.read_parquet(test_paths)
 
+    all_cols = pl.read_parquet(train_paths, n_rows=0).columns
+    meta = {
+        c
+        for c in ("row_id", target)
+        if c and c in all_cols
+    }
+    pat = re.compile(r"^\d+fold(?:-[A-Za-z0-9]+)?$")
     features = [
-        c for c in oof_df.columns
-        if c not in ["target", "row_id", "weight"]
-        and "fold" not in c
+        c for c in all_cols
+        if c not in meta and not pat.fullmatch(c)
     ]
 
     X = (

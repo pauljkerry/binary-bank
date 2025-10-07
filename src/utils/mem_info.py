@@ -15,7 +15,7 @@ def free_ram_gib():
         data = json.loads(r.stdout.strip())
         return data["FreeGB"]
     except Exception:
-        return None
+        return -1
 
 
 def free_vram_gib():
@@ -31,4 +31,4 @@ def free_vram_gib():
         nvml.nvmlShutdown()
         return frees[0]
     except Exception:
-        return None
+        return -1

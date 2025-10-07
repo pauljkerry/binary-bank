@@ -1,0 +1,26 @@
+{
+    "run_id": "ridge-058-trl16-5fold-s42",
+    "wandb_id": "zd1sw81d",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/zd1sw81d",
+    "created_at": "2025-10-07 11:39:27",
+    "model_name": "ridge",
+    "data_id": "058",
+    "n_folds": 5,
+    "seed": 42,
+    "feature_dir": "/home/hanse/kaggle/binary-bank/artifacts/features/058",
+    "phash": "f3c446c699",
+    "param_source": "../../artifacts/optuna/ridge-058/trl16.json",
+    "params": {
+        "alpha": 8.471801418819979
+    },
+    "run_dir": "/home/hanse/kaggle/binary-bank/runs/ridge-058-trl16-5fold-s42",
+    "cv_score": 0.9766839316245376,
+    "submission": {
+        "competition": null,
+        "ref": null,
+        "file": null,
+        "public_score": null,
+        "private_score": null,
+        "submitted_at": null
+    }
+}

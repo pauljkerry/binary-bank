@@ -1,0 +1,24 @@
+{
+    "run_id": "hc-058",
+    "wandb_id": "2y4ictkj",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/2y4ictkj",
+    "created_at": "2025-10-06 20:19:03",
+    "model_name": "hc",
+    "data_id": "058",
+    "feature_dir": "/home/hanse/kaggle/binary-bank/artifacts/features/058",
+    "run_dir": "/home/hanse/kaggle/binary-bank/runs/hc-058",
+    "cv_score": 0.97668,
+    "weights": {
+        "lgbm-057-trl21-5fold-s42": 0.5248000025749207,
+        "mlp-057-trl0-5fold-s42": 0.1151999831199646,
+        "xgb-057-trl5-5fold-s42": 0.35999998450279236
+    },
+    "submission": {
+        "competition": "playground-series-s5e8",
+        "ref": 47217091,
+        "file": "../../output/hc-058.csv",
+        "public_score": "0.97747",
+        "private_score": "0.97712",
+        "submitted_at": "2025-10-06 20:19:27"
+    }
+}

@@ -13,8 +13,9 @@ import polars as pl
 import rmm.mr as mr
 from cuml.ensemble import RandomForestClassifier
 from rmm.allocators.cupy import rmm_cupy_allocator
-from sklearn.metrics import log_loss
 from sklearn.metrics import roc_auc_score
+from sklearn.metrics import log_loss
+from sklearn.metrics import accuracy_score
 
 from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
@@ -82,6 +83,13 @@ class RFCCVTrainer:
 
         self.params = {**default_params, **self.params}
 
+        self.rep_metric = "auc"
+        self.metrics = {
+            "accuracy": accuracy_score,
+            "log_loss": log_loss,
+            "auc": roc_auc_score
+        }
+
         hdr = pl.read_parquet(self.train_paths, n_rows=0)
         all_cols = hdr.columns
 
@@ -90,7 +98,7 @@ class RFCCVTrainer:
 
         if self.cat_cols is None:
             self.cat_cols = [
-                c for c, dt in zip(hdr.columns, hdr.dtypes)
+                c for c, dt in hdr.schema.items()
                 if dt == pl.Categorical
             ]
 
@@ -146,7 +154,7 @@ class RFCCVTrainer:
         meta = {
             "data_id": self.data_id,
             "seed": self.seed,
-            "n_folds": self.n_folds
+            "n_folds": self.n_folds,
             **self.params
         }
         for lg in loggers:
@@ -168,8 +176,7 @@ class RFCCVTrainer:
         oof = np.zeros(train_rows, dtype=np.float32)
         test_pred = np.zeros(test_rows, dtype=np.float32)
 
-        logloss_scores = []
-        auc_scores = []
+        fold_scores = {name: [] for name in self.metrics.keys()}
 
         test = cudf.read_parquet(self.test_paths, columns=self.features)
 
@@ -182,6 +189,7 @@ class RFCCVTrainer:
             print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
             t_fold_start = now()
+            fold_summary = {}
 
             train = cudf.read_parquet(
                 self.train_paths,
@@ -219,26 +227,17 @@ class RFCCVTrainer:
             oof[val_idx] = pred
             test_pred += model.predict(test).get()
 
-            logloss_valid = log_loss(y_valid, pred)
-            auc_valid = roc_auc_score(y_valid, pred)
+            for name, metric_func in self.metrics.items():
+                val_score = metric_func(y_valid, pred)
+                print(f"{name.upper()} Valid: {val_score:.5f}")
+                fold_summary[name] = val_score
+                fold_scores[name].append(val_score)
 
             t_fold_end = now()
 
-            runtime = print_duration(
+            fold_summary["runtime"] = print_duration(
                 t_fold_start, t_fold_end, f"Fold {i+1} Runtime"
             )
-
-            print(f"Logloss Valid: {logloss_valid:.5f}")
-            print(f"AUC Valid: {auc_valid:.5f}\n")
-
-            logloss_scores.append(logloss_valid)
-            auc_scores.append(auc_valid)
-
-            fold_summary = {
-                "logloss": logloss_valid,
-                "auc": auc_valid,
-                "runtime": runtime
-            }
 
             for lg in loggers:
                 lg.on_fold_end(
@@ -260,47 +259,48 @@ class RFCCVTrainer:
         )
         test_pred /= self.n_folds
 
-        logloss_oof = log_loss(y, oof)
-        logloss_mean = np.mean(logloss_scores)
-        logloss_std = np.mean(logloss_scores)
+        oofs = {
+            name: metric_func(y, oof)
+            for name, metric_func in self.metrics.items()
+        }
 
-        auc_oof = roc_auc_score(y, oof)
-        auc_mean = np.mean(auc_scores)
-        auc_std = np.mean(auc_scores)
+        oof_stats = {
+            name: {
+                "oof": oofs[name],
+                "mean": np.mean(vals),
+                "std": np.std(vals)
+            }
+            for name, vals in fold_scores.items()
+        }
 
         print(f"\n{' CV Results ':*^48}")
         print("─" * 48)
         print(f" {'Metric':^9}  {'OOF':>10}  {'Mean':>10} ± {'Std':<10} ")
         print("-" * 48)
-        print(f" {'Logloss':^9} "
-              f" {logloss_oof:>10.5f} "
-              f" {logloss_mean:>10.5f} ± {logloss_std:<10.5f} ")
-        print(f" {'AUC':^9} "
-              f" {auc_oof:>10.5f} "
-              f" {auc_mean:>10.5f} ± {auc_std:<10.5f} ")
+        for name, stats in oof_stats.items():
+            print(f" {name.upper():^9} "
+                  f" {stats['oof']:>10.5f} "
+                  f" {stats['mean']:>10.5f} ± {stats['std']:<10.5f} ")
         print("─" * 48)
 
-        t_total_end = now()
-        total_runtime = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
         result = {
             "oof": oof,
             "test_pred": test_pred,
-            "oof_score": logloss_oof
+            "oof_score": oofs[self.rep_metric]
         }
-        overall_summary = {
-            "logloss_oof": logloss_oof,
-            "logloss_mean": logloss_mean,
-            "logloss_std": logloss_std,
-            "auc_oof": auc_oof,
-            "auc_mean": auc_mean,
-            "auc_std": auc_std,
-            "total_runtime": total_runtime
-        }
+        overall_summary = {}
+        for name, stats in oof_stats.items():
+            overall_summary[f"{name}_mean"] = stats["mean"]
+            overall_summary[f"{name}_std"] = stats["std"]
+            overall_summary[f"{name}_oof"] = oofs[name]
+
+        t_total_end = now()
+        overall_summary["total_runtime"] = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
 
         for lg in loggers:
             lg.on_end(overall_summary)

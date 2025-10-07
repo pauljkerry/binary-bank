@@ -24,11 +24,11 @@
     "run_dir": "/home/hanse/kaggle/binary-bank/runs/lgbm-057-trl21-5fold-s42",
     "cv_score": 0.9765490925207327,
     "submission": {
-        "competition": null,
-        "ref": null,
-        "file": null,
-        "public_score": null,
-        "private_score": null,
-        "submitted_at": null
+        "competition": "playground-series-s5e8",
+        "ref": 47216843,
+        "file": "../../output/lgbm-057-trl21-5fold-s42.csv",
+        "public_score": "0.97742",
+        "private_score": "0.97703",
+        "submitted_at": "2025-10-06 20:03:59"
     }
 }

@@ -15,6 +15,9 @@ from cuml.ensemble import RandomForestRegressor
 from rmm.allocators.cupy import rmm_cupy_allocator
 from sklearn.metrics import mean_squared_error as mse
 from sklearn.metrics import r2_score
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import log_loss
+from sklearn.metrics import accuracy_score
 
 from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
@@ -79,8 +82,18 @@ class RFRCVTrainer:
             "random_state": self.seed,
             "n_streams": 1
         }
-
         self.params = {**default_params, **self.params}
+
+        self.rep_metric = "auc"
+        self.metrics = {
+            "rmse": lambda y, p: np.sqrt(mse(y, p)),
+            "r2": r2_score,
+            "mae": lambda y, p: np.mean(np.abs(y-p)),
+            # "mape": lambda y, p: np.mean(np.abs((y-p)/y)),
+            # "accuracy": accuracy_score,
+            # "log_loss": log_loss,
+            "auc": roc_auc_score
+        }
 
         hdr = pl.read_parquet(self.train_paths, n_rows=0)
         all_cols = hdr.columns
@@ -168,8 +181,7 @@ class RFRCVTrainer:
         oof = np.zeros(train_rows, dtype=np.float32)
         test_pred = np.zeros(test_rows, dtype=np.float32)
 
-        rmse_scores = []
-        r2_scores = []
+        fold_scores = {name: [] for name in self.metrics.keys()}
 
         test = cudf.read_parquet(self.test_paths, columns=self.features)
 
@@ -182,6 +194,7 @@ class RFRCVTrainer:
             print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
             t_fold_start = now()
+            fold_summary = {}
 
             train = cudf.read_parquet(
                 self.train_paths,
@@ -219,26 +232,17 @@ class RFRCVTrainer:
             oof[val_idx] = pred
             test_pred += model.predict(test).get()
 
-            rmse_valid = np.sqrt(mse(y_valid, pred))
-            r2_valid = r2_score(y_valid, pred)
+            for name, metric_func in self.metrics.items():
+                val_score = metric_func(y_valid, pred)
+                print(f"{name.upper()} Valid: {val_score:.5f}")
+                fold_summary[name] = val_score
+                fold_scores[name].append(val_score)
 
             t_fold_end = now()
 
-            runtime = print_duration(
+            fold_summary["runtime"] = print_duration(
                 t_fold_start, t_fold_end, f"Fold {i+1} Runtime"
             )
-
-            print(f"RMSE Valid: {rmse_valid:.5f}")
-            print(f"R2 Valid: {r2_valid:.5f}\n")
-
-            rmse_scores.append(rmse_valid)
-            r2_scores.append(r2_valid)
-
-            fold_summary = {
-                "rmse": rmse_valid,
-                "r2": r2_valid,
-                "runtime": runtime
-            }
 
             for lg in loggers:
                 lg.on_fold_end(
@@ -260,47 +264,48 @@ class RFRCVTrainer:
         )
         test_pred /= self.n_folds
 
-        rmse_oof = np.sqrt(mse(y, oof))
-        rmse_mean = np.mean(rmse_scores)
-        rmse_std = np.mean(rmse_scores)
+        oofs = {
+            name: metric_func(y, oof)
+            for name, metric_func in self.metrics.items()
+        }
 
-        r2_oof = r2_score(y, oof)
-        r2_mean = np.mean(r2_scores)
-        r2_std = np.mean(r2_scores)
+        oof_stats = {
+            name: {
+                "oof": oofs[name],
+                "mean": np.mean(vals),
+                "std": np.std(vals)
+            }
+            for name, vals in fold_scores.items()
+        }
 
         print(f"\n{' CV Results ':*^48}")
         print("─" * 48)
         print(f" {'Metric':^9}  {'OOF':>10}  {'Mean':>10} ± {'Std':<10} ")
         print("-" * 48)
-        print(f" {'RMSE':^9} "
-              f" {rmse_oof:>10.5f} "
-              f" {rmse_mean:>10.5f} ± {rmse_std:<10.5f} ")
-        print(f" {'R2':^9} "
-              f" {r2_oof:>10.5f} "
-              f" {r2_mean:>10.5f} ± {r2_std:<10.5f} ")
+        for name, stats in oof_stats.items():
+            print(f" {name.upper():^9} "
+                  f" {stats['oof']:>10.5f} "
+                  f" {stats['mean']:>10.5f} ± {stats['std']:<10.5f} ")
         print("─" * 48)
 
-        t_total_end = now()
-        total_runtime = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
         result = {
             "oof": oof,
             "test_pred": test_pred,
-            "oof_score": rmse_oof
+            "oof_score": oofs[self.rep_metric]
         }
-        overall_summary = {
-            "rmse_oof": rmse_oof,
-            "rmse_mean": rmse_mean,
-            "rmse_std": rmse_std,
-            "r2_oof": r2_oof,
-            "r2_mean": r2_mean,
-            "r2_std": r2_std,
-            "total_runtime": total_runtime
-        }
+        overall_summary = {}
+        for name, stats in oof_stats.items():
+            overall_summary[f"{name}_mean"] = stats["mean"]
+            overall_summary[f"{name}_std"] = stats["std"]
+            overall_summary[f"{name}_oof"] = oofs[name]
+
+        t_total_end = now()
+        overall_summary["total_runtime"] = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
 
         for lg in loggers:
             lg.on_end(overall_summary)
@@ -327,6 +332,7 @@ class RFRCVTrainer:
             Score
         """
         t_total_start = now()
+        fold_summary = {}
 
         loggers = loggers or [NoOpLogger()]
         meta = {
@@ -363,11 +369,10 @@ class RFRCVTrainer:
 
         pred = model.predict(X_valid).get()
 
-        rmse_valid = np.sqrt(mse(y_valid, pred))
-        r2_valid = r2_score(y_valid, pred)
-
-        print(f"RMSE Valid: {rmse_valid:.5f}")
-        print(f"R2 Valid: {r2_valid:.5f}\n")
+        for name, metric_func in self.metrics.items():
+            val_score = metric_func(y_valid, pred)
+            print(f"{name.upper()} Valid: {val_score:.5f}")
+            fold_summary[name] = val_score
 
         del train, X_train, y_train, X_valid, y_valid
         gc.collect()
@@ -375,17 +380,11 @@ class RFRCVTrainer:
         self.pmp.free_all_blocks()
 
         t_total_end = now()
-        total_runtime = print_duration(
+        fold_summary["runtime"] = print_duration(
             t_total_start, t_total_end, "Total Runtime"
         )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        fold_summary = {
-            "rmse": rmse_valid,
-            "r2": r2_valid,
-            "runtime": total_runtime
-        }
 
         for lg in loggers:
             lg.on_fold_end(
@@ -394,4 +393,4 @@ class RFRCVTrainer:
                 summary=fold_summary
             )
 
-        return rmse_valid
+        return fold_summary[self.rep_metric]

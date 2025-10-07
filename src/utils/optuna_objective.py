@@ -230,7 +230,7 @@ def create_objective(
                 "wandb_id": run.id,
                 "wandb_url": run.url,
                 "opts": opts,
-                "score": score
+                "score": float(score)
             }
             with open(path, "w") as f:
                 json.dump(manifest, f, indent=4)
