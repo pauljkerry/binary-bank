@@ -1,0 +1,17 @@
+{
+    "params": {
+        "learning_rate": 0.02,
+        "depth": 8,
+        "min_data_in_leaf": 31,
+        "random_strength": 42.45575809894679,
+        "l2_leaf_reg": 5,
+        "bagging_temperature": 2.9193791105784386
+    },
+    "n_folds": 5,
+    "seed": 42,
+    "fold_idx": 0,
+    "wandb_id": "aiv410nw",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/aiv410nw",
+    "opts": {},
+    "score": 0.9759908021076392
+}

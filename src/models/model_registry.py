@@ -8,6 +8,7 @@ _REGISTRY = {
     "rfr": "src.models.rfr_cv_trainer:RFRCVTrainer",
     "rfc": "src.models.rfc_cv_trainer:RFCCVTrainer",
     "mlp": "src.models.mlp_cv_trainer:MLPCVTrainer",
+    "realmlp": "src.models.realmlp_cv_trainer:RealMLPCVTrainer",
     "tabnet": "src.models.tabnet_cv_trainer:TabNetCVTrainer",
     "logreg": "src.models.logreg_cv_trainer:LogRegCVTrainer",
     "lasso": "src.models.lasso_cv_trainer:LassoCVTrainer",

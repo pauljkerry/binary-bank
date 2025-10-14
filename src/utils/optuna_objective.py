@@ -115,6 +115,10 @@ def space_mlp(t: optuna.trial.Trial) -> dict[str, Any]:
     }
 
 
+def space_realmlp(t: optuna.trial.Trial) -> dict[str, Any]:
+    return {}
+
+
 def space_tabnet(t: optuna.trial.Trial) -> dict[str, Any]:
     return {
         "n_d": t.suggest_int("n_d", 8, 24),
@@ -157,6 +161,7 @@ _REGISTRY: dict[str, SearchSpace] = {
     "rfr": space_rfr,
     "rfc": space_rfc,
     "mlp": space_mlp,
+    "realmlp": space_realmlp,
     "tabnet": space_tabnet,
     "logreg": space_logreg,
     "lasso": space_lasso,

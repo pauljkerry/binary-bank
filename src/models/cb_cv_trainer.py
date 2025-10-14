@@ -5,9 +5,13 @@ from dataclasses import dataclass, field
 from time import perf_counter as now
 from typing import Optional
 
+import rmm
+import cupy as cp
 import numpy as np
 import polars as pl
 from catboost import CatBoostClassifier, Pool
+import rmm.mr as mr
+from rmm.allocators.cupy import rmm_cupy_allocator
 from sklearn.metrics import roc_auc_score
 
 from src.utils.loggers import CVLogger, NoOpLogger
@@ -17,12 +21,6 @@ from src.utils.mem_info import free_ram_gib, free_vram_gib
 
 @dataclass(eq=False)
 class CBCVTrainer:
-    """
-    CBを使ったCVトレーナー。
-
-    Attributes
-    ----------
-    """
     data_id: str
     train_paths: str | list[str]
     test_paths: str | list[str] | None = None
@@ -108,16 +106,22 @@ class CBCVTrainer:
                 if c not in meta and not pat.fullmatch(c)
             ]
 
+        dev_mr = mr.CudaAsyncMemoryResource()
+        mr.set_current_device_resource(dev_mr)
+        rmm.reinitialize(
+            managed_memory=False,
+            initial_pool_size=None,
+        )
+        cp.cuda.set_allocator(rmm_cupy_allocator)
+
+        cp.get_default_memory_pool().set_limit(4 * 1024**3)
+        self.pmp = cp.cuda.PinnedMemoryPool()
+        cp.cuda.set_pinned_memory_allocator(self.pmp.malloc)
+
     def fit(
         self,
         loggers: list[CVLogger] | None = None
     ):
-        """
-        CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
-
-        Returns
-        -------
-        """
         if self.test_paths is None:
             raise ValueError("Please provide test_paths (got None).")
 
@@ -265,6 +269,8 @@ class CBCVTrainer:
                 )
             del model, X_train, y_train, X_valid, y_valid, test
             gc.collect()
+            cp.get_default_memory_pool().free_all_blocks()
+            self.pmp.free_all_blocks()
 
         y = (
             self.lf_train
@@ -320,12 +326,6 @@ class CBCVTrainer:
         self,
         loggers: list[CVLogger] | None = None
     ):
-        """
-        訓練データ全体でモデルを学習し、test_dfに対する予測結果をnpy形式で保存する。
-
-        Parameters
-        ----------
-        """
         if self.test_paths is None:
             raise ValueError("Please provide test_paths (got None).")
 
@@ -510,6 +510,8 @@ class CBCVTrainer:
 
         del model, X_train, y_train, X_valid, y_valid
         gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
+        self.pmp.free_all_blocks()
 
         t_total_end = now()
         total_runtime = print_duration(
