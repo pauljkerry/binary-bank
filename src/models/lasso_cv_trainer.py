@@ -17,7 +17,6 @@ from sklearn.metrics import mean_squared_error as mse
 from sklearn.metrics import r2_score
 from sklearn.metrics import roc_auc_score
 from sklearn.metrics import log_loss
-from sklearn.metrics import accuracy_score
 
 from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
@@ -29,47 +28,24 @@ def compute_feature_stats(
     features: list[str],
     num_cols: list[str],
     fold_col: str = None,
-    include_fold: int = None,
-    exclude_fold: int = None
-):
+) -> (float, float):
     lf = pl.scan_parquet(paths, low_memory=True)
-    if fold_col:
-        if include_fold is not None:
-            lf = lf.filter(pl.col(fold_col) == include_fold)
-        if exclude_fold is not None:
-            lf = lf.filter(pl.col(fold_col) != exclude_fold)
 
     exprs = []
     for c in num_cols:
-        exprs += [pl.col(c).cast(pl.Float64).mean().alias(f"{c}_mean"),
-                  pl.col(c).cast(pl.Float64).std(ddof=0).alias(f"{c}_std")]
+        exprs += [pl.col(c).cast(pl.Float32).mean().alias(f"{c}_mean"),
+                  pl.col(c).cast(pl.Float32).std(ddof=0).alias(f"{c}_std")]
     out = lf.select(exprs).collect(engine="streaming")
     mean = out.select(
         [f"{c}_mean" for c in num_cols]).to_numpy().ravel().astype(np.float32)
     std = out.select(
         [f"{c}_std" for c in num_cols]).to_numpy().ravel().astype(np.float32)
     std[std == 0] = 1.0
-    return mean, std
+    return cp.asarray(mean, dtype=cp.float32), cp.asarray(std, dtype=cp.float32)
 
 
 @dataclass
 class LassoCVTrainer:
-    """
-    Lassoを使ったGPUでのCVトレーナー。
-
-    Attributes
-    ----------
-    tr_df : pd.DataFrame
-        label付データ
-    test_df : pd.DataFrame, default None
-        labelなしデータ。CV学習はtest_df必須。
-    params : dict
-        Lassoのパラメータ。
-    n_splits : int, default 5
-        KFoldの分割数。
-    seed : int, default 42
-        乱数シード。
-    """
     data_id: str
     train_paths: str | list[str]
     test_paths: str | list[str] | None = None
@@ -116,7 +92,9 @@ class LassoCVTrainer:
             "r2": r2_score,
             "mae": lambda y, p: np.mean(np.abs(y-p)),
             # "mape": lambda y, p: np.mean(np.abs((y-p)/y)),
-            # "accuracy": accuracy_score,
+            "accuracy": lambda y, p: np.mean(
+                [y_i == (1 if p_i > 0.5 else 0) for y_i, p_i in zip(y, p)]
+            ),
             # "log_loss": log_loss,
             "auc": roc_auc_score
         }
@@ -138,6 +116,7 @@ class LassoCVTrainer:
         else:
             print(f"Fold Col: {self.fold_col}")
 
+        # Cat Colsを除外
         if self.features is None:
             meta = {
                 c
@@ -151,6 +130,12 @@ class LassoCVTrainer:
                 c for c in all_cols
                 if c not in meta and not pat.fullmatch(c)
             ]
+
+        self.mean, self.std = compute_feature_stats(
+            self.train_paths,
+            self.features,
+            self.features,
+        )
 
         dev_mr = mr.CudaAsyncMemoryResource()
         mr.set_current_device_resource(dev_mr)
@@ -167,17 +152,7 @@ class LassoCVTrainer:
     def fit(
         self,
         loggers: list[CVLogger] | None = None
-    ):
-        """
-        CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
-
-        Returns
-        -------
-        oof_preds : ndarray
-            OOF予測配列
-        test_preds : ndarray
-            test_dfに対する予測配列
-        """
+    ) -> dict:
         if self.test_paths is None:
             raise ValueError("Please provide test_paths (got None).")
 
@@ -212,7 +187,14 @@ class LassoCVTrainer:
         fold_scores = {name: [] for name in self.metrics.keys()}
         coef_list = []
 
-        test = cudf.read_parquet(self.test_paths, columns=self.features)
+        test = cudf.read_parquet(self.test_paths, columns=self.features).to_cupy()
+
+        fold_df = (
+            pl.read_parquet(
+                self.train_paths,
+                columns=["row_id", self.fold_col]
+            )
+        )
 
         for i in range(self.n_folds):
             title = f" Fold {i + 1} / {self.n_folds} "
@@ -225,49 +207,46 @@ class LassoCVTrainer:
             t_fold_start = now()
             fold_summary = {}
 
-            mean, std = compute_feature_stats(
+            train = cudf.read_parquet(
                 self.train_paths,
-                self.features,
-                self.features,
-                self.fold_col,
-                exclude_fold=i
+                columns=self.features + [self.target, self.fold_col]
             )
-            mean = cp.asarray(mean, dtype=cp.float32)
-            std = cp.asarray(std, dtype=cp.float32)
 
             train = cudf.read_parquet(
                 self.train_paths,
                 columns=self.features + [self.target, self.fold_col]
             )
 
-            X_train = train[train[self.fold_col] != i][self.features].to_cupy()
-            y_train = train[train[self.fold_col] != i][self.target].to_cupy()
-
-            X_valid = train[train[self.fold_col] == i][self.features].to_cupy()
-            y_valid = (
-                self.lf_train
-                .filter(pl.col(self.fold_col) == i)
-                .select(self.target)
-                .collect(engine="streaming")
-                .to_numpy()
-                .ravel()
+            X_train = (
+                train[train[self.fold_col] != i]
+                [self.features].to_cupy().astype(cp.float32)
+            )
+            y_train = (
+                train[train[self.fold_col] != i]
+                [self.target].to_cupy().astype(cp.float32)
             )
 
-            X_train -= mean
-            X_train /= (std + 1e-8)
+            X_valid = (
+                train[train[self.fold_col] == i]
+                [self.features].to_cupy().astype(cp.float32)
+            )
+            y_valid = (
+                train[train[self.fold_col] == i]
+                [self.target].to_cupy().get().astype(cp.float32)
+            )
 
-            X_valid -= mean
-            X_valid /= (std + 1e-8)
+            X_train -= self.mean
+            X_train /= (self.std + 1e-8)
+
+            X_valid -= self.mean
+            X_valid /= (self.std + 1e-8)
 
             val_idx = (
-                pl.scan_parquet(self.train_paths)
-                  .select(["row_id", self.fold_col])
-                  .filter(pl.col(self.fold_col) == i)
-                  .select("row_id")
-                  .collect()
-                  .get_column("row_id")
-                  .to_numpy()
-                  .astype(np.int32, copy=False)
+                fold_df
+                .filter(pl.col(self.fold_col) == i)
+                .get_column("row_id")
+                .to_numpy()
+                .astype(np.int32, copy=False)
             )
 
             model = Lasso(**self.params)
@@ -372,25 +351,14 @@ class LassoCVTrainer:
 
     def fit_one_fold(
         self,
-        fold_idx=0,
-        loggers=None
-    ):
-        """
-        指定した1つのfoldのみを用いてモデルを学習する。
-        主にOptunaによるハイパーパラメータ探索時に使用。
-
-        Parameters
-        ----------
-        fold : int
-            学習に使うfold番号。
-
-        Return
-        ------
-        rmse : float
-            Score
-        """
+        fold_idx: int = 0,
+        loggers: list[CVLogger] | None = None
+    ) -> float:
         t_total_start = now()
         fold_summary = {}
+
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
         loggers = loggers or [NoOpLogger()]
         meta = {
@@ -402,35 +370,25 @@ class LassoCVTrainer:
         for lg in loggers:
             lg.on_start(meta)
 
-        mean, std = compute_feature_stats(
-            self.train_paths,
-            self.features,
-            self.features,
-            self.fold_col,
-            exclude_fold=fold_idx
-        )
-        mean = cp.asarray(mean, dtype=cp.float32)
-        std = cp.asarray(std, dtype=cp.float32)
-
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
         train = cudf.read_parquet(
             self.train_paths,
             columns=self.features + [self.target, self.fold_col]
         )
+
         X_train = train[train[self.fold_col] != fold_idx][self.features].to_cupy()
         y_train = train[train[self.fold_col] != fold_idx][self.target].to_cupy()
 
         X_valid = train[train[self.fold_col] == fold_idx][self.features].to_cupy()
         y_valid = (
-            self.lf_train
-            .filter(pl.col(self.fold_col) == fold_idx)
-            .select(self.target)
-            .collect(engine="streaming")
-            .to_numpy()
-            .ravel()
+            train[train[self.fold_col] == fold_idx]
+            [self.target].to_cupy().get()
         )
+
+        X_train -= self.mean
+        X_train /= (self.std + 1e-8)
+
+        X_valid -= self.mean
+        X_valid /= (self.std + 1e-8)
 
         model = Lasso(**self.params)
         model.fit(X_train, y_train)
@@ -441,11 +399,6 @@ class LassoCVTrainer:
             val_score = metric_func(y_valid, pred)
             print(f"{name.upper()} Valid: {val_score:.5f}")
             fold_summary[name] = val_score
-
-        del train, X_train, y_train, X_valid, y_valid
-        gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
-        self.pmp.free_all_blocks()
 
         t_total_end = now()
         fold_summary["runtime"] = print_duration(
@@ -460,5 +413,10 @@ class LassoCVTrainer:
                 "iter",
                 summary=fold_summary
             )
+
+        del train, X_train, y_train, X_valid, y_valid
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
+        self.pmp.free_all_blocks()
 
         return fold_summary[self.rep_metric]

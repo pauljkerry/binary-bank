@@ -13,9 +13,9 @@ def hill_climbing_auc(
     train_paths: str | list[str],
     test_paths: str | list[str],
     target: str = "target",
-    TOL=1e-5,
-    USE_NEGATIVE_WGT=True
-):
+    TOL: float = 1e-5,
+    USE_NEGATIVE_WGT: float = True
+) -> dict:
     """
     AUCでHill Climbingを行う関数
 

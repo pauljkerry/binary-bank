@@ -11,8 +11,10 @@ import polars as pl
 from pytorch_tabnet.tab_model import TabNetClassifier
 from sklearn.metrics import log_loss
 from sklearn.metrics import roc_auc_score
+from sklearn.metrics import mean_squared_error as mse
+from sklearn.metrics import r2_score
 
-from src.utils.loggers import CVResult, CVLogger, NoOpLogger
+from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
 from src.utils.mem_info import free_ram_gib, free_vram_gib
 
@@ -106,6 +108,19 @@ class TabNetCVTrainer:
         self.params = {**default_params, **self.params}
         self.params["virtual_batch_size"] = self.params["batch_size"] / 8
 
+        self.rep_metric = "auc"
+        self.metrics = {
+            "rmse": lambda y, p: np.sqrt(mse(y, p)),
+            "r2": r2_score,
+            "mae": lambda y, p: np.mean(np.abs(y-p)),
+            # "mape": lambda y, p: np.mean(np.abs((y-p)/y)),
+            "accuracy": lambda y, p: np.mean(
+                [y_i == (1 if p_i > 0.5 else 0) for y_i, p_i in zip(y, p)]
+            ),
+            "log_loss": log_loss,
+            "auc": roc_auc_score
+        }
+
         hdr = pl.read_parquet(self.train_paths, n_rows=0)
         all_cols = hdr.columns
 
@@ -158,10 +173,16 @@ class TabNetCVTrainer:
             for n in self.cat_dims
         ]
 
+        self.mean, self.std = compute_feature_stats(
+            self.train_paths,
+            self.features,
+            self.num_cols
+        )
+
     def fit(
         self,
         loggers: list[CVLogger] | None = None
-    ):
+    ) -> dict:
         if self.test_paths is None:
             raise ValueError("Please provide test_paths (got None).")
 
@@ -194,17 +215,18 @@ class TabNetCVTrainer:
         test_pred = np.zeros(test_rows, dtype=np.float32)
 
         epoch_list = []
-        loss_scores = []
-        auc_scores = []
+        fold_scores = {name: [] for name in self.metrics.keys()}
 
         for i in range(self.n_fold):
-            print("=" * 22)
-            print(f"===== Fold {i + 1} / {self.n_fold} =====")
-            print("=" * 22)
+            title = f" Fold {i + 1} / {self.n_folds} "
+            print("=" * 48)
+            print(f"{title:=^48}")
+            print("=" * 48)
             print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
             print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
             t_fold_start = now()
+            fold_summary = {}
 
             need_cols = self.features + [self.target, "row_id"]
             train = (
@@ -258,21 +280,22 @@ class TabNetCVTrainer:
                 .astype(np.float32)
             )
 
-            mean, std = compute_feature_stats(
-                self.train_paths,
-                self.features,
-                self.num_cols,
-                self.fold_col,
-                exclude_folds=[i]
+            X_train[:, self.num_idxs] = (
+                (X_train[:, self.num_idxs] - self.mean)
+                / self.std
+            )
+            X_valid[:, self.num_idxs] = (
+                (X_valid[:, self.num_idxs] - self.mean)
+                / self.std
+            )
+            test[:, self.num_idxs] = (
+                (test[:, self.num_idxs] - self.mean)
+                / self.std
             )
 
-            X_train[:, self.num_idxs] = (X_train[:, self.num_idxs] - mean) / std
-            X_valid[:, self.num_idxs] = (X_valid[:, self.num_idxs] - mean) / std
-            test[:, self.num_idxs] = (test[:, self.num_idxs] - mean) / std
-
             history = {
-                "train": {"loss": [], "auc": []},
-                "valid": {"loss": [], "auc": []}
+                "train": {key: [] for key in self.metrics},
+                "valid": {key: [] for key in self.metrics}
             }
             extra_hist = {"lr": []}
 
@@ -318,23 +341,17 @@ class TabNetCVTrainer:
             oof[val_idx] = val_pred
             test_pred += model.predict_proba(test)[:, 1]
 
-            best_logloss = log_loss(y_valid, val_pred)
-            loss_scores.append(best_logloss)
-            print(f"Best Logloss: {best_logloss:.5f}")
-
-            best_auc = roc_auc_score(y_valid, val_pred)
-            auc_scores.append(best_auc)
-            print(f"Best AUC: {best_auc:.5f}")
+            for name, metric_func in self.metrics.items():
+                val_score = metric_func(y_valid, val_pred)
+                print(f"{name.upper()} Valid: {val_score:.5f}")
+                fold_summary[name] = val_score
+                fold_scores[name].append(val_score)
 
             t_fold_end = now()
-            runtime = print_duration(
-                t_fold_start, t_fold_end, f"Fold {i+1} Runtime"
+            t_fold_end = now()
+            fold_summary["runtime"] = print_duration(
+                t_fold_start, t_fold_end, f"\nFold {i+1} Runtime"
             )
-            fold_summary = {
-                "loss": best_logloss,
-                "auc": best_auc,
-                "runtime": runtime
-            }
 
             for lg in loggers:
                 lg.on_fold_end(
@@ -347,55 +364,61 @@ class TabNetCVTrainer:
             del model, X_train, y_train, X_valid, y_valid, test
             gc.collect()
 
-        print("\n=== CV Results ===")
         y = (
             pl.read_parquet(self.train_paths, columns=self.target)
               .get_column(self.target)
               .cast(pl.Float32)
               .to_numpy()
         )
-        oof_score_auc = roc_auc_score(y, oof)
-        oof_score_loss = log_loss(y, oof)
+        test_pred /= self.n_folds
 
-        auc_mean = np.mean(auc_scores)
-        auc_std = np.std(auc_scores)
+        oofs = {
+            name: metric_func(y, oof)
+            for name, metric_func in self.metrics.items()
+        }
 
-        loss_mean = np.mean(loss_scores)
-        loss_std = np.std(loss_scores)
-
+        oof_stats = {
+            name: {
+                "oof": oofs[name],
+                "mean": np.mean(vals),
+                "std": np.std(vals)
+            }
+            for name, vals in fold_scores.items()
+        }
+        # epochの追加方法の確認!!!!!!!!!!!!!!!!!!!!!
         epoch_mean = np.mean(epoch_list)
 
-        test_pred /= self.n_fold
+        print(f"\n{' CV Results ':*^48}")
+        print("─" * 48)
+        print(f" {'Metric':^9}  {'OOF':>10}  {'Mean':>10} ± {'Std':<10} ")
+        print("-" * 48)
+        for name, stats in oof_stats.items():
+            print(f" {name.upper():^9} "
+                  f" {stats['oof']:>10.5f} "
+                  f" {stats['mean']:>10.5f} ± {stats['std']:<10.5f} ")
+        print("─" * 48)
 
-        print(f"OOF AUC score: {oof_score_auc:.5f}")
-        print(
-            f"Mean: {auc_mean:.5f}, "
-            f"Std: {auc_std:.5f}"
-        )
         print(f"Avg best epoch: {epoch_mean}")
 
-        t_total_end = now()
-        total_runtime = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-        result = CVResult(
-            oof,
-            test_pred,
-            oof_score_auc
-        )
-        overall_summary = {
-            "auc_oof": oof_score_auc,
-            "auc_mean": auc_mean,
-            "auc_std": auc_std,
-            "loss_oof": oof_score_loss,
-            "loss_mean": loss_mean,
-            "loss_std": loss_std,
-            "epoch_mean": epoch_mean,
-            "total_runtime": total_runtime
+        result = {
+            "oof": oof,
+            "test_pred": test_pred,
+            "oof_score": oofs[self.rep_metric]
         }
+        overall_summary = {"epoch_mean": epoch_mean}
+        for name, stats in oof_stats.items():
+            overall_summary[f"{name}_mean"] = stats["mean"]
+            overall_summary[f"{name}_std"] = stats["std"]
+            overall_summary[f"{name}_oof"] = oofs[name]
+
+        t_total_end = now()
+        overall_summary["total_runtime"] = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
+
         for lg in loggers:
             lg.on_end(overall_summary)
 
@@ -403,10 +426,11 @@ class TabNetCVTrainer:
 
     def fit_one_fold(
         self,
-        fold_idx: int,
+        fold_idx: int = 0,
         loggers: list[CVLogger] | None = None
-    ):
+    ) -> float:
         t_total_start = now()
+        fold_summary = {}
 
         loggers = loggers or [NoOpLogger()]
         meta = {
@@ -459,20 +483,16 @@ class TabNetCVTrainer:
             .astype(np.int64)
         )
 
-        mean, std = compute_feature_stats(
-            self.train_paths,
-            self.features,
-            self.num_cols,
-            self.fold_col,
-            exclude_folds=[fold_idx]
+        X_train[:, self.num_idxs] = (
+            (X_train[:, self.num_idxs] - self.mean) / self.std
+        )
+        X_valid[:, self.num_idxs] = (
+            (X_valid[:, self.num_idxs] - self.mean) / self.std
         )
 
-        X_train[:, self.num_idxs] = (X_train[:, self.num_idxs] - mean) / std
-        X_valid[:, self.num_idxs] = (X_valid[:, self.num_idxs] - mean) / std
-
         history = {
-            "train": {"loss": [], "auc": []},
-            "valid": {"loss": [], "auc": []}
+            "train": {key: [] for key in self.metrics},
+            "valid": {key: [] for key in self.metrics}
         }
         extra_hist = {"lr": []}
 
@@ -514,36 +534,28 @@ class TabNetCVTrainer:
             drop_last=False
         )
 
-        val_pred = model.predict_proba(X_valid)[:, 1]
+        pred = model.predict_proba(X_valid).get()[:, 1]
 
-        best_logloss = log_loss(y_valid, val_pred)
-        print(f"Best Logloss: {best_logloss:.5f}")
-
-        best_auc = roc_auc_score(y_valid, val_pred)
-        print(f"Best AUC: {best_auc:.5f}")
-
-        del model, X_train, y_train, X_valid, y_valid
-        gc.collect()
+        for name, metric_func in self.metrics.items():
+            val_score = metric_func(y_valid, pred)
+            print(f"{name.upper()} Valid: {val_score:.5f}")
+            fold_summary[name] = val_score
 
         t_total_end = now()
-        total_runtime = print_duration(
+        fold_summary["runtime"] = print_duration(
             t_total_start, t_total_end, "Total CV Runtime"
         )
-        fold_summary = {
-            "loss": best_logloss,
-            "auc": best_auc,
-            "runtime": total_runtime
-        }
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
         for lg in loggers:
             lg.on_fold_end(
                 fold_idx,
                 "epoch",
-                history,
-                extra_hist,
-                fold_summary
+                summary=fold_summary
             )
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-        return best_auc
+        del train, X_train, y_train, X_valid, y_valid
+        gc.collect()
+
+        return fold_summary[self.rep_metric]

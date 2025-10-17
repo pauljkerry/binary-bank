@@ -1,4 +1,4 @@
-import subprocess, json
+import json, subprocess
 
 
 def free_ram_gib():

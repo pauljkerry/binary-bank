@@ -12,7 +12,10 @@ import polars as pl
 from catboost import CatBoostClassifier, Pool
 import rmm.mr as mr
 from rmm.allocators.cupy import rmm_cupy_allocator
+from sklearn.metrics import log_loss
 from sklearn.metrics import roc_auc_score
+from sklearn.metrics import mean_squared_error as mse
+from sklearn.metrics import r2_score
 
 from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
@@ -77,6 +80,19 @@ class CBCVTrainer:
         }
         self.params = {**default_params, **self.params}
 
+        self.rep_metric = "auc"
+        self.metrics = {
+            "rmse": lambda y, p: np.sqrt(mse(y, p)),
+            "r2": r2_score,
+            "mae": lambda y, p: np.mean(np.abs(y-p)),
+            # "mape": lambda y, p: np.mean(np.abs((y-p)/y)),
+            "accuracy": lambda y, p: np.mean(
+                [y_i == (1 if p_i > 0.5 else 0) for y_i, p_i in zip(y, p)]
+            ),
+            "log_loss": log_loss,
+            "auc": roc_auc_score
+        }
+
         hdr = pl.read_parquet(self.train_paths, n_rows=0)
         all_cols = hdr.columns
 
@@ -121,7 +137,7 @@ class CBCVTrainer:
     def fit(
         self,
         loggers: list[CVLogger] | None = None
-    ):
+    ) -> dict:
         if self.test_paths is None:
             raise ValueError("Please provide test_paths (got None).")
 
@@ -154,7 +170,22 @@ class CBCVTrainer:
         test_pred = np.zeros(test_rows, dtype=np.float32)
 
         iteration_list = []
-        auc_scores = []
+        fold_scores = {name: [] for name in self.metrics.keys()}
+
+        test = (
+            self.lf_test
+            .select(self.features)
+            .collect(engine="streaming")
+            .to_numpy()
+            .astype(np.float32)
+        )
+
+        fold_df = (
+            pl.read_parquet(
+                self.train_paths,
+                columns=["row_id", self.fold_col]
+            )
+        )
 
         for i in range(self.n_folds):
             title = f" Fold {i + 1} / {self.n_folds} "
@@ -165,6 +196,7 @@ class CBCVTrainer:
             print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
             t_fold_start = now()
+            fold_summary = {}
 
             need_cols = self.features + [self.target, "row_id"]
             train = (
@@ -206,18 +238,11 @@ class CBCVTrainer:
                 .ravel()
             )
             val_idx = (
-                valid
-                .select("row_id")
-                .to_series()
+                fold_df
+                .filter(pl.col(self.fold_col) == i)
+                .get_column("row_id")
                 .to_numpy()
                 .astype(np.int32, copy=False)
-            )
-            test = (
-                self.lf_test
-                .select(self.features)
-                .collect(engine="streaming")
-                .to_numpy()
-                .astype(np.float32)
             )
 
             train_pool = Pool(
@@ -240,26 +265,25 @@ class CBCVTrainer:
             )
 
             best_iter = model.best_iteration_
+            fold_summary["best_iter"] = best_iter
 
             val_pred = model.predict_proba(X_valid, ntree_end=best_iter)[:, 1]
             oof[val_idx] = val_pred
 
             test_pred += model.predict_proba(test)[:, 1]
 
-            valid_auc = roc_auc_score(y_valid, val_pred)
-            print(f"AUC Valid: {valid_auc:.5f}")
+            for name, metric_func in self.metrics.items():
+                val_score = metric_func(y_valid, val_pred)
+                print(f"{name.upper()} Valid: {val_score:.5f}")
+                fold_summary[name] = val_score
+                fold_scores[name].append(val_score)
 
-            auc_scores.append(valid_auc)
             iteration_list.append(best_iter)
 
             t_fold_end = now()
-            runtime = print_duration(
-                t_fold_start, t_fold_end, f"Fold {i+1} Runtime"
+            fold_summary["runtime"] = print_duration(
+                t_fold_start, t_fold_end, f"\nFold {i+1} Runtime"
             )
-            fold_summary = {
-                "auc": valid_auc,
-                "runtime": runtime
-            }
 
             for lg in loggers:
                 lg.on_fold_end(
@@ -267,56 +291,65 @@ class CBCVTrainer:
                     axis_name="iter",
                     summary=fold_summary
                 )
-            del model, X_train, y_train, X_valid, y_valid, test
+            del model, X_train, y_train, X_valid, y_valid
             gc.collect()
             cp.get_default_memory_pool().free_all_blocks()
             self.pmp.free_all_blocks()
 
         y = (
-            self.lf_train
-            .select(self.target)
-            .cast(pl.Float32)
-            .collect(engine="streaming")
-            .to_numpy()
-            .ravel()
+            pl.read_parquet(self.train_paths, columns=self.target)
+              .get_column(self.target)
+              .cast(pl.Float32)
+              .to_numpy()
         )
         test_pred /= self.n_folds
-        auc_oof = roc_auc_score(y, oof)
 
-        auc_mean = np.mean(auc_scores)
-        auc_std = np.std(auc_scores)
+        oofs = {
+            name: metric_func(y, oof)
+            for name, metric_func in self.metrics.items()
+        }
+
+        oof_stats = {
+            name: {
+                "oof": oofs[name],
+                "mean": np.mean(vals),
+                "std": np.std(vals)
+            }
+            for name, vals in fold_scores.items()
+        }
+
         iter_mean = np.mean(iteration_list)
 
         print(f"\n{' CV Results ':*^48}")
         print("─" * 48)
         print(f" {'Metric':^9}  {'OOF':>10}  {'Mean':>10} ± {'Std':<10} ")
         print("-" * 48)
-        print(f" {'AUC':^9} "
-              f" {auc_oof:>10.5f} "
-              f" {auc_mean:>10.5f} ± {auc_std:<10.5f} ")
+        for name, stats in oof_stats.items():
+            print(f" {name.upper():^9} "
+                  f" {stats['oof']:>10.5f} "
+                  f" {stats['mean']:>10.5f} ± {stats['std']:<10.5f} ")
         print("─" * 48)
+        print(f"Avg best iteration: {iter_mean}")
 
-        print(f"Avg best iteration: {np.mean(iteration_list)}")
-
-        t_total_end = now()
-        total_runtime = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
         result = {
             "oof": oof,
             "test_pred": test_pred,
-            "oof_score": auc_oof
+            "oof_score": oofs[self.rep_metric]
         }
-        overall_summary = {
-            "auc_oof": auc_oof,
-            "auc_mean": auc_mean,
-            "auc_std": auc_std,
-            "iter_mean": iter_mean,
-            "total_runtime": total_runtime
-        }
+        overall_summary = {"iter_mean": iter_mean}
+        for name, stats in oof_stats.items():
+            overall_summary[f"{name}_mean"] = stats["mean"]
+            overall_summary[f"{name}_std"] = stats["std"]
+            overall_summary[f"{name}_oof"] = oofs[name]
+
+        t_total_end = now()
+        overall_summary["total_runtime"] = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
+
         for lg in loggers:
             lg.on_end(overall_summary)
 
@@ -325,7 +358,7 @@ class CBCVTrainer:
     def full_train(
         self,
         loggers: list[CVLogger] | None = None
-    ):
+    ) -> dict:
         if self.test_paths is None:
             raise ValueError("Please provide test_paths (got None).")
 
@@ -417,22 +450,11 @@ class CBCVTrainer:
 
     def fit_one_fold(
         self,
-        fold_idx=0,
+        fold_idx: int = 0,
         loggers: list[CVLogger] | None = None
-    ):
-        """
-        指定した1つのfoldのみを用いてモデルを学習する。
-        主にOptunaによるハイパーパラメータ探索時に使用。
-
-        Parameters
-        ----------
-
-        Return
-        ------
-        auc : float
-            Score
-        """
+    ) -> float:
         t_total_start = now()
+        fold_summary = {}
 
         loggers = loggers or [NoOpLogger()]
         meta = {
@@ -504,9 +526,15 @@ class CBCVTrainer:
             train_pool, eval_set=valid_pool, use_best_model=True,
         )
 
+        fold_summary["best_iter"] = model.best_iteration_
+
         val_pred = model.predict_proba(X_valid)[:, 1]
-        auc_valid = roc_auc_score(y_valid, val_pred)
-        print(f"Valid AUC: {auc_valid:.5f}")
+
+        val_pred = model.predict(X_valid)
+        for name, metric_func in self.metrics.items():
+            val_score = metric_func(y_valid, val_pred)
+            print(f"{name.upper()} Valid: {val_score:.5f}")
+            fold_summary[name] = val_score
 
         del model, X_train, y_train, X_valid, y_valid
         gc.collect()
@@ -514,16 +542,11 @@ class CBCVTrainer:
         self.pmp.free_all_blocks()
 
         t_total_end = now()
-        total_runtime = print_duration(
+        fold_summary["runtime"] = print_duration(
             t_total_start, t_total_end, "Total CV Runtime"
         )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        fold_summary = {
-            "auc": auc_valid,
-            "runtime": total_runtime
-        }
 
         for lg in loggers:
             lg.on_fold_end(
@@ -532,4 +555,4 @@ class CBCVTrainer:
                 summary=fold_summary
             )
 
-        return auc_valid
+        return fold_summary[self.rep_metric]

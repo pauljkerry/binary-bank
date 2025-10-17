@@ -1,0 +1,26 @@
+{
+    "run_id": "logreg-057-trl8-5fold-s42",
+    "wandb_id": "5fkxp04q",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/5fkxp04q",
+    "created_at": "2025-10-17 13:54:44",
+    "model_name": "logreg",
+    "data_id": "057",
+    "n_folds": 5,
+    "seed": 42,
+    "feature_dir": "/home/hanse/kaggle/binary-bank/artifacts/features/057",
+    "phash": "e38f914d93",
+    "param_source": "../../artifacts/optuna/logreg-057/trl8.json",
+    "params": {
+        "C": 0.31489116479568624
+    },
+    "run_dir": "/home/hanse/kaggle/binary-bank/runs/logreg-057-trl8-5fold-s42",
+    "cv_score": 0.9706130759507392,
+    "submission": {
+        "competition": null,
+        "ref": null,
+        "file": null,
+        "public_score": null,
+        "private_score": null,
+        "submitted_at": null
+    }
+}

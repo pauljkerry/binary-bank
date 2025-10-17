@@ -19,6 +19,8 @@ import torch.nn.functional as F
 from rmm.allocators.cupy import rmm_cupy_allocator
 from sklearn.metrics import log_loss
 from sklearn.metrics import roc_auc_score
+from sklearn.metrics import mean_squared_error as mse
+from sklearn.metrics import r2_score
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from torch.utils.dlpack import from_dlpack as torch_from_dlpack
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -33,20 +35,13 @@ def compute_feature_stats(
     features: list[str],
     num_cols: list[str],
     fold_col: str = None,
-    include_fold: int = None,
-    exclude_fold: int = None
 ):
     lf = pl.scan_parquet(paths, low_memory=True)
-    if fold_col:
-        if include_fold is not None:
-            lf = lf.filter(pl.col(fold_col) == include_fold)
-        if exclude_fold is not None:
-            lf = lf.filter(pl.col(fold_col) != exclude_fold)
 
     exprs = []
     for c in num_cols:
-        exprs += [pl.col(c).cast(pl.Float64).mean().alias(f"{c}_mean"),
-                  pl.col(c).cast(pl.Float64).std(ddof=0).alias(f"{c}_std")]
+        exprs += [pl.col(c).cast(pl.Float32).mean().alias(f"{c}_mean"),
+                  pl.col(c).cast(pl.Float32).std(ddof=0).alias(f"{c}_std")]
     out = lf.select(exprs).collect(engine="streaming")
     mean = out.select(
         [f"{c}_mean" for c in num_cols]).to_numpy().ravel().astype(np.float32)
@@ -262,25 +257,6 @@ class ParquetStream(IterableDataset):
 
 
 class SimpleMLP(nn.Module):
-    """
-    Parameters
-    ----------
-    input_dim : int
-        数値特徴量の次元数（カテゴリ変数を除いたもの）
-    hidden_dims : list of int
-        MLPの隠れ層サイズリスト
-    dropout_rate : float
-        ドロップアウト率
-    activation : nn.Module
-        活性化関数
-    num_idxs : list
-        数値変数のインデックスのリスト
-    cat_idxs : list
-        カテゴリ変数のインデックスのリスト
-    cat_dims : list
-        カテゴリ変数のユニークな値のリスト
-    """
-
     def __init__(
         self,
         input_dim,
@@ -319,17 +295,6 @@ class SimpleMLP(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, xb):
-        """
-        Parameters
-        ----------
-        xb : torch.Tensor
-            数値特徴量とカテゴリ特徴量を統合したもの
-
-        Returns
-        -------
-        torch.Tensor
-            (B,) の予測
-        """
         emb_list = [
             self.embedding_layers[i](xb[:, cat_idx].long())
             for i, cat_idx in enumerate(self.cat_idxs)
@@ -350,24 +315,6 @@ class SimpleMLP(nn.Module):
 
 @dataclass
 class MLPCVTrainer:
-    """
-    MLPを使ったCVトレーナー。
-
-    Attributes
-    ----------
-    data_id : int
-        ID for dataset version
-    train_paths : str or list[str]
-        Path(s) to training parquet files.
-    test_paths : str or list[str]
-        Path(s) to test parquet files.
-    features : Optional[list[str]], default None
-        name of column for training
-    target : str, default "target"
-        name of column for target.
-    seed : int, default 42
-        乱数シード
-    """
     data_id: int
     train_paths: str | list[str]
     test_paths: str | list[str] | None = None
@@ -442,6 +389,19 @@ class MLPCVTrainer:
 
         self.params["hidden_dims"] = hidden_dims
 
+        self.rep_metric = "auc"
+        self.metrics = {
+            "rmse": lambda y, p: np.sqrt(mse(y, p)),
+            "r2": r2_score,
+            "mae": lambda y, p: np.mean(np.abs(y-p)),
+            # "mape": lambda y, p: np.mean(np.abs((y-p)/y)),
+            "accuracy": lambda y, p: np.mean(
+                [y_i == (1 if p_i > 0.5 else 0) for y_i, p_i in zip(y, p)]
+            ),
+            "log_loss": log_loss,
+            "auc": roc_auc_score
+        }
+
         hdr = pl.read_parquet(self.train_paths, n_rows=0)
         all_cols = hdr.columns
 
@@ -496,6 +456,12 @@ class MLPCVTrainer:
 
         torch.cuda.manual_seed(self.seed)
 
+        self.mean, self.std = compute_feature_stats(
+            self.train_paths,
+            self.features,
+            self.num_cols
+        )
+
         dev_mr = mr.CudaAsyncMemoryResource()
         mr.set_current_device_resource(dev_mr)
         rmm.reinitialize(
@@ -511,17 +477,7 @@ class MLPCVTrainer:
     def fit(
         self,
         loggers: list[CVLogger] | None = None
-    ):
-        """
-        CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
-
-        Returns
-        -------
-        oof_preds : ndarray
-            OOF予測配列
-        test_preds : ndarray
-            test_dfに対する予測配列
-        """
+    ) -> dict:
         if self.test_paths is None:
             raise ValueError("Please provide test_paths (got None).")
 
@@ -544,8 +500,14 @@ class MLPCVTrainer:
         test_pred = np.zeros(test_rows, dtype=np.float32)
 
         epoch_list = []
-        logloss_scores = []
-        auc_scores = []
+        fold_scores = {name: [] for name in self.metrics.keys()}
+
+        fold_df = (
+            pl.read_parquet(
+                self.train_paths,
+                columns=["row_id", self.fold_col]
+            )
+        )
 
         for i in range(self.n_folds):
             title = f" Fold {i + 1} / {self.n_folds} "
@@ -556,22 +518,15 @@ class MLPCVTrainer:
             print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
             t_fold_start = now()
-
-            mean, std = compute_feature_stats(
-                self.train_paths,
-                self.features,
-                self.num_cols,
-                self.fold_col,
-                exclude_fold=i
-            )
+            fold_summary = {}
 
             train_ds = ParquetStream(
                 self.train_paths,
                 self.features,
                 self.target,
                 self.num_idxs,
-                mean,
-                std,
+                self.mean,
+                self.std,
                 fold_col=self.fold_col,
                 exclude_fold=i,
                 weight_col=self.weight_col,
@@ -585,8 +540,8 @@ class MLPCVTrainer:
                 self.features,
                 self.target,
                 self.num_idxs,
-                mean,
-                std,
+                self.mean,
+                self.std,
                 fold_col=self.fold_col,
                 include_fold=i,
                 batch_size=self.params["batch_size"],
@@ -599,8 +554,8 @@ class MLPCVTrainer:
                 self.features,
                 self.target,
                 self.num_idxs,
-                mean,
-                std,
+                self.mean,
+                self.std,
                 fold_col=self.fold_col,
                 batch_size=self.params["batch_size"],
                 predict_mode=True,
@@ -637,12 +592,11 @@ class MLPCVTrainer:
                 .astype("float32")
             )
             val_idx = (
-                lf.filter(pl.col(self.fold_col) == i)
-                  .select("row_id")
-                  .collect(engine="streaming")
-                  .to_series()
-                  .to_numpy()
-                  .astype(np.int32, copy=False)
+                fold_df
+                .filter(pl.col(self.fold_col) == i)
+                .get_column("row_id")
+                .to_numpy()
+                .astype(np.int32, copy=False)
             )
 
             model = SimpleMLP(
@@ -667,8 +621,8 @@ class MLPCVTrainer:
             best_epoch = 0
 
             history = {
-                "train": {"logloss": [], "auc": []},
-                "valid": {"logloss": [], "auc": []}
+                "train": {key: [] for key in self.metrics},
+                "valid": {key: [] for key in self.metrics}
             }
             extra_hist = {"lr": []}
 
@@ -698,26 +652,14 @@ class MLPCVTrainer:
                 # Validation
                 model.eval()
                 preds = []
+                train_pred = []
+                y_train = []
                 with torch.no_grad():
                     for xb, yb in val_loader:
                         pred_logits = model(xb)
                         pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
                         preds.append(pred_probs)
-                val_pred = np.concatenate(preds)
-                logloss_val = log_loss(y_val, val_pred)
-                auc_val = roc_auc_score(y_val, val_pred)
-                lr = scheduler.get_last_lr()[0]
 
-                history["valid"]["logloss"].append(logloss_val)
-                history["valid"]["auc"].append(auc_val)
-
-                extra_hist["lr"].append(lr)
-
-                scheduler.step()
-
-                train_pred = []
-                y_train = []
-                with torch.no_grad():
                     for batch in train_loader:
                         if len(batch) == 3:
                             xb, yb, wb = batch
@@ -730,19 +672,27 @@ class MLPCVTrainer:
                             pred_logits).cpu().numpy()
                         train_pred.append(pred_probs)
                         y_train.append(yb.cpu().numpy())
+
+                val_pred = np.concatenate(preds)
                 train_pred = np.concatenate(train_pred)
                 y_train = np.concatenate(y_train)
 
-                logloss_train = log_loss(y_train, train_pred)
-                auc_train = roc_auc_score(y_train, train_pred)
+                for name, metric_func in self.metrics.items():
+                    train_score = metric_func(y_train, train_pred)
+                    val_score = metric_func(y_val, val_pred)
+                    history["train"][name].append(train_score)
+                    history["valid"][name].append(val_score)
 
-                history["train"]["logloss"].append(logloss_train)
-                history["train"]["auc"].append(auc_train)
+                lr = scheduler.get_last_lr()[0]
+                extra_hist["lr"].append(lr)
+                scheduler.step()
 
+                logloss_train = history['train']['log_loss'][-1]
+                logloss_val = history['valid']['log_loss'][-1]
                 print(
                     f"Epoch {epoch+1}: "
-                    f"Train Logloss = {logloss_train:.5f}, "
-                    f"Val Logloss = {logloss_val:.5f}"
+                    f"Train LogLoss = {logloss_train:.5f}, "
+                    f"Val LogLoss = {logloss_val:.5f}"
                 )
 
                 if logloss_val < best_logloss:
@@ -773,6 +723,7 @@ class MLPCVTrainer:
 
             model.eval()
             val_preds = []
+            fold_test_preds = []
             with torch.no_grad():
                 for xb, _ in val_loader:
                     xb = xb.to(self.params["device"])
@@ -780,36 +731,26 @@ class MLPCVTrainer:
                     val_probs = torch.sigmoid(val_logits).cpu().numpy()
                     val_preds.append(val_probs)
 
-            val_preds = np.concatenate(val_preds).ravel()
-            oof[val_idx] = val_preds
-
-            best_auc = roc_auc_score(y_val, val_preds)
-
-            logloss_scores.append(best_logloss)
-            auc_scores.append(best_auc)
-            epoch_list.append(best_epoch)
-
-            print(f"Best Logloss: {best_logloss:.5f}")
-            print(f"Best AUC: {best_auc:.5f}")
-
-            with torch.no_grad():
-                fold_test_preds = []
                 for xb in test_loader:
                     xb = xb.to(self.params["device"])
                     test_logits = model(xb)
                     test_probs = torch.sigmoid(test_logits).cpu().numpy()
                     fold_test_preds.append(test_probs)
-                test_pred += np.concatenate(fold_test_preds).ravel()
+
+            val_preds = np.concatenate(val_preds).ravel()
+            oof[val_idx] = val_preds
+            test_pred += np.concatenate(fold_test_preds).ravel()
+
+            for name, metric_func in self.metrics.items():
+                val_score = metric_func(y_val, val_preds)
+                print(f"{name.upper()} Valid: {val_score:.5f}")
+                fold_summary[name] = val_score
+                fold_scores[name].append(val_score)
 
             t_fold_end = now()
-            runtime = print_duration(
+            fold_summary["runtime"] = print_duration(
                 t_fold_start, t_fold_end, f"\nFold {i+1} Runtime"
             )
-            fold_summary = {
-                "loss": best_logloss,
-                "auc": best_auc,
-                "runtime": runtime
-            }
 
             for lg in loggers:
                 lg.on_fold_end(
@@ -832,13 +773,19 @@ class MLPCVTrainer:
         )
         test_pred /= self.n_folds
 
-        auc_oof = roc_auc_score(y, oof)
-        auc_mean = np.mean(auc_scores)
-        auc_std = np.std(auc_scores)
+        oofs = {
+            name: metric_func(y, oof)
+            for name, metric_func in self.metrics.items()
+        }
 
-        logloss_oof = log_loss(y, oof)
-        logloss_mean = np.mean(logloss_scores)
-        logloss_std = np.std(logloss_scores)
+        oof_stats = {
+            name: {
+                "oof": oofs[name],
+                "mean": np.mean(vals),
+                "std": np.std(vals)
+            }
+            for name, vals in fold_scores.items()
+        }
 
         epoch_mean = np.mean(epoch_list)
 
@@ -846,38 +793,33 @@ class MLPCVTrainer:
         print("─" * 48)
         print(f" {'Metric':^9}  {'OOF':>10}  {'Mean':>10} ± {'Std':<10} ")
         print("-" * 48)
-        print(f" {'Logloss':^9} "
-              f" {logloss_oof:>10.5f} "
-              f" {logloss_mean:>10.5f} ± {logloss_std:<10.5f} ")
-        print(f" {'AUC':^9} "
-              f" {auc_oof:>10.5f} "
-              f" {auc_mean:>10.5f} ± {auc_std:<10.5f} ")
+        for name, stats in oof_stats.items():
+            print(f" {name.upper():^9} "
+                  f" {stats['oof']:>10.5f} "
+                  f" {stats['mean']:>10.5f} ± {stats['std']:<10.5f} ")
         print("─" * 48)
 
         print(f"Avg best epoch: {epoch_mean}")
 
-        t_total_end = now()
-        total_runtime = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
         result = {
             "oof": oof,
             "test_pred": test_pred,
-            "oof_score": auc_oof
+            "oof_score": oofs[self.rep_metric]
         }
-        overall_summary = {
-            "auc_oof": auc_oof,
-            "auc_mean": auc_mean,
-            "auc_std": auc_std,
-            "loss_oof": logloss_oof,
-            "loss_mean": logloss_mean,
-            "loss_std": logloss_std,
-            "epoch_mean": epoch_mean,
-            "total_runtime": total_runtime
-        }
+        overall_summary = {"epoch_mean": epoch_mean}
+        for name, stats in oof_stats.items():
+            overall_summary[f"{name}_mean"] = stats["mean"]
+            overall_summary[f"{name}_std"] = stats["std"]
+            overall_summary[f"{name}_oof"] = oofs[name]
+
+        t_total_end = now()
+        overall_summary["total_runtime"] = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
+
         for lg in loggers:
             lg.on_end(overall_summary)
 
@@ -885,24 +827,11 @@ class MLPCVTrainer:
 
     def fit_one_fold(
         self,
-        fold_idx=0,
-        loggers=None
-    ):
-        """
-        指定した1つのfoldのみを用いてモデルを学習する。
-        主にOptunaによるハイパーパラメータ探索時に使用。
-
-        Parameters
-        ----------
-        fold : int
-            学習に使うfold番号。
-
-        Rerurn
-        ------
-        best_logloss : float
-            Score
-        """
+        fold_idx: int = 0,
+        loggers: list[CVLogger] | None = None
+    ) -> float:
         t_total_start = now()
+        fold_summary = {}
 
         loggers = loggers or [NoOpLogger()]
         meta = {
@@ -917,21 +846,13 @@ class MLPCVTrainer:
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-        mean, std = compute_feature_stats(
-            self.train_paths,
-            self.features,
-            self.num_cols,
-            self.fold_col,
-            exclude_fold=fold_idx
-        )
-
         train_ds = ParquetStream(
             self.train_paths,
             self.features,
             self.target,
             self.num_idxs,
-            mean,
-            std,
+            self.mean,
+            self.std,
             fold_col=self.fold_col,
             exclude_fold=fold_idx,
             weight_col=self.weight_col,
@@ -945,8 +866,8 @@ class MLPCVTrainer:
             self.features,
             self.target,
             self.num_idxs,
-            mean,
-            std,
+            self.mean,
+            self.std,
             fold_col=self.fold_col,
             include_fold=fold_idx,
             batch_size=self.params["batch_size"],
@@ -969,7 +890,7 @@ class MLPCVTrainer:
         )
 
         lf = pl.scan_parquet(self.train_paths)
-        val_y = (
+        y_val = (
             lf.filter(pl.col(self.fold_col) == fold_idx)
             .select(self.target)
             .collect(engine="streaming")
@@ -995,13 +916,13 @@ class MLPCVTrainer:
             eta_min=self.params["eta_min"]
         )
 
-        best_log_loss = float("inf")
+        best_logloss = float("inf")
         best_model_state = None
         best_epoch = 0
 
         history = {
-            "train": {"loss": [], "auc": []},
-            "valid": {"loss": [], "auc": []}
+            "train": {key: [] for key in self.metrics},
+            "valid": {key: [] for key in self.metrics}
         }
         extra_hist = {"lr": []}
 
@@ -1031,19 +952,14 @@ class MLPCVTrainer:
             # Validation
             model.eval()
             preds = []
+            train_pred = []
+            y_train = []
             with torch.no_grad():
                 for xb, yb in val_loader:
                     pred_logits = model(xb)
                     pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
                     preds.append(pred_probs)
-            val_pred = np.concatenate(preds)
-            val_log_loss = log_loss(val_y, val_pred)
-            scheduler.step()
-            lr = scheduler.get_last_lr()[0]
 
-            train_pred = []
-            train_y = []
-            with torch.no_grad():
                 for batch in train_loader:
                     if len(batch) == 3:
                         xb, yb, wb = batch
@@ -1055,30 +971,33 @@ class MLPCVTrainer:
                     pred_probs = torch.sigmoid(
                         pred_logits).cpu().numpy()
                     train_pred.append(pred_probs)
-                    train_y.append(yb.cpu().numpy())
+                    y_train.append(yb.cpu().numpy())
+
+            val_pred = np.concatenate(preds)
             train_pred = np.concatenate(train_pred)
-            train_y = np.concatenate(train_y)
+            y_train = np.concatenate(y_train)
 
-            train_log_loss = log_loss(train_y, train_pred)
-            train_auc = roc_auc_score(train_y, train_pred)
+            for name, metric_func in self.metrics.items():
+                train_score = metric_func(y_train, train_pred)
+                val_score = metric_func(y_val, val_pred)
 
-            history["train"]["loss"].append(train_log_loss)
-            history["train"]["auc"].append(train_auc)
+                history["train"][name].append(train_score)
+                history["valid"][name].append(val_score)
 
-            val_auc = roc_auc_score(val_y, val_pred)
-            history["valid"]["loss"].append(val_log_loss)
-            history["valid"]["auc"].append(val_auc)
-
+            lr = scheduler.get_last_lr()[0]
             extra_hist["lr"].append(lr)
+            scheduler.step()
 
+            logloss_train = history['train']['log_loss'][-1]
+            logloss_val = history['valid']['log_loss'][-1]
             print(
                 f"Epoch {epoch+1}: "
-                f"Train Logloss = {train_log_loss:.5f}, "
-                f"Val Logloss = {val_log_loss:.5f}"
+                f"Train LogLoss = {logloss_train:.5f}, "
+                f"Val LogLoss = {logloss_val:.5f}"
             )
 
-            if val_log_loss < best_log_loss:
-                best_log_loss = val_log_loss
+            if logloss_val < best_logloss:
+                best_logloss = logloss_val
                 best_model_state = {
                     k: v.cpu().clone() for k, v
                     in model.state_dict().items()
@@ -1086,14 +1005,14 @@ class MLPCVTrainer:
                 best_epoch = epoch + 1
                 print(
                     f"New best model saved at epoch {epoch+1}, "
-                    f"Logloss: {val_log_loss:.5f}")
+                    f"Logloss: {logloss_val:.5f}")
             elif (
                 (epoch - best_epoch >= self.params["early_stopping_rounds"])
                 and (epoch + 1 >= self.params["min_epochs"])
             ):
                 print(f"Early stopping at epoch {epoch+1}")
                 print(f"Loading best model from epoch {best_epoch} "
-                      f"with Logloss {best_log_loss:.5f}")
+                      f"with Logloss {logloss_val:.5f}")
                 break
 
         model.load_state_dict(
@@ -1114,23 +1033,17 @@ class MLPCVTrainer:
 
         val_preds = np.concatenate(val_preds).ravel()
 
-        best_auc = roc_auc_score(val_y, val_preds)
-
-        print(f"Best Logloss: {best_log_loss:.5f}")
-        print(f"Best AUC: {best_auc: .5f}")
+        for name, metric_func in self.metrics.items():
+            val_score = metric_func(y_val, val_preds)
+            print(f"{name.upper()} Valid: {val_score:.5f}")
+            fold_summary[name] = val_score
 
         t_total_end = now()
-        runtime = print_duration(
+        fold_summary["runtime"] = print_duration(
             t_total_start, t_total_end, "Total CV Runtime"
         )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        fold_summary = {
-            "loss": best_log_loss,
-            "auc": best_auc,
-            "runtime": runtime
-        }
 
         for lg in loggers:
             lg.on_fold_end(
@@ -1145,4 +1058,4 @@ class MLPCVTrainer:
         cp.get_default_memory_pool().free_all_blocks()
         self.pmp.free_all_blocks()
 
-        return best_auc
+        return fold_summary[self.rep_metric]

@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from time import perf_counter as now
 from typing import Optional
 
-import cudf
 import rmm
 import cupy as cp
 import numpy as np
@@ -24,22 +23,6 @@ from src.utils.mem_info import free_ram_gib, free_vram_gib
 
 @dataclass
 class RealMLPCVTrainer:
-    """
-    RFCを使ったGPUでのCVトレーナー。
-
-    Attributes
-    ----------
-    tr_df : pd.DataFrame
-        label付データ
-    test_df : pd.DataFrame, default None
-        labelなしデータ。CV学習はtest_df必須。
-    params : dict
-        RFCのパラメータ。
-    n_splits : int, default 5
-        KFoldの分割数。
-    seed : int, default 42
-        乱数シード。
-    """
     data_id: str
     train_paths: str | list[str]
     test_paths: str | list[str] | None = None
@@ -74,18 +57,47 @@ class RealMLPCVTrainer:
         self.lf_train = pl.scan_parquet(self.train_paths)
 
         default_params = {
+            'device': 'cuda',
+            'n_epochs': 10,
+            'random_state': 42,
+            'verbosity': 2,
+            'hidden_sizes': [64, 64, 64, 64, 64],
+            'max_one_hot_cat_size': 9,
+            'embedding_size': 8,
+            'weight_param': 'ntk',
+            'weight_init_mode': 'std',
+            'bias_init_mode': 'he+5',
+            'bias_lr_factor': 0.1,
+            'act': 'mish',
+            'use_parametric_act': True,
+            'act_lr_factor': 0.1,
+            'wd': 0.0,
+            'wd_sched': 'flat_cos',
+            'bias_wd_factor': 0.0,
+            'block_str': 'w-b-a-d',
+            'p_drop': 0.15,
+            'p_drop_sched': 'flat_cos',
+            'add_front_scale': False,
+            'scale_lr_factor': 6.0,
+            'tfms': [
+                'one_hot',
+                'median_center',
+                'robust_scale',
+                'smooth_clip',
+                'embedding'
+            ],
+            'num_emb_type': 'pbld',
+            'plr_sigma': 0.28992671701332556,
+            'plr_hidden_1': 16,
+            'plr_hidden_2': 4,
+            'plr_lr_factor': 0.1,
+            'clamp_output': True,
+            'normalize_output': True,
+            'lr': 0.1400853680319456,
+            'lr_sched': 'coslog4',
+            'opt': 'adam',
+            'sq_mom': 0.95,
         }
-        """
-            "device": "cuda",
-            "n_cv": 1,
-            "n_epochs": 50,
-            "batch_size": 64,
-            "predict_batch_size": 128,
-            "lr": 1e-3,
-            "p_drop": 0.2,
-            "use_early_stopping": True,
-            "early_stopping_additive_patience": 10,
-        """
 
         self.params = {**default_params, **self.params}
 
@@ -140,17 +152,7 @@ class RealMLPCVTrainer:
     def fit(
         self,
         loggers: list[CVLogger] | None = None
-    ):
-        """
-        CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
-
-        Returns
-        -------
-        oof_preds : ndarray
-            OOF予測配列
-        test_preds : ndarray
-            test_dfに対する予測配列
-        """
+    ) -> dict:
         if self.test_paths is None:
             raise ValueError("Please provide test_paths (got None).")
 
@@ -315,21 +317,9 @@ class RealMLPCVTrainer:
 
     def fit_one_fold(
         self,
-        fold_idx=0,
-        loggers=None
-    ):
-        """
-        指定した1つのfoldのみを用いてモデルを学習する。
-        主にOptunaによるハイパーパラメータ探索時に使用。
-
-        Parameters
-        ----------
-        fold : int
-            学習に使うfold番号。
-
-        Rerurn
-        ------
-        """
+        fold_idx: int = 0,
+        loggers: list[CVLogger] | None = None
+    ) -> float:
         t_total_start = now()
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
@@ -358,6 +348,7 @@ class RealMLPCVTrainer:
             train.filter(pl.col(self.fold_col) != fold_idx)
             .select(self.target)
             .to_numpy()
+            .ravel()
         )
 
         X_valid = (
@@ -375,7 +366,7 @@ class RealMLPCVTrainer:
         )
 
         model = RealMLP_TD_Classifier(**self.params)
-        model.fit(X_train, y_train)
+        model.fit(X_train, y_train, X_valid, y_valid, cat_col_names=self.cat_cols)
 
         pred = model.predict(X_valid)
 

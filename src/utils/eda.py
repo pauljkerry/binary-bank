@@ -6,7 +6,9 @@ import seaborn as sns
 from IPython.display import display
 
 
-def check_missing_info(df):
+def check_missing_info(
+    df: pd.DataFrame
+) -> None:
     """
     欠損値の情報を確認する関数。
 
@@ -53,7 +55,10 @@ def check_missing_info(df):
         print(missing_num)
 
 
-def plot_category_freq(df, cols=None):
+def plot_category_freq(
+    df: pd.DataFrame,
+    cols: list[str] | None = None
+) -> None:
     """
     カテゴリ変数の頻度を棒グラフと表形式で表示する関数。
 
@@ -114,7 +119,11 @@ def plot_category_freq(df, cols=None):
         display(summary_df_T)
 
 
-def plot_numerical_distribution(df, cols=None, bins=30):
+def plot_numerical_distribution(
+    df: pd.DataFrame,
+    cols: list[str] | None = None,
+    bins: int = 30
+):
     """
     数値変数の分布を表示する関数。
 
@@ -188,7 +197,11 @@ def plot_numerical_distribution(df, cols=None, bins=30):
     display(summary_df)
 
 
-def plot_kde_and_boxplot(df, num_cols=None, cat_cols=None):
+def plot_kde_and_boxplot(
+    df: pd.DataFrame,
+    num_cols: list[str] | None = None,
+    cat_cols: list[str] | None = None
+) -> None:
     """
     カテゴリ変数ごとの数値変数に対する分布を表示する関数。
 
@@ -259,7 +272,10 @@ def plot_kde_and_boxplot(df, num_cols=None, cat_cols=None):
     plt.show()
 
 
-def show_corr_heatmap(df, cols=None):
+def show_corr_heatmap(
+    df: pd.DataFrame,
+    cols: list[str] = None
+) -> None:
     """
     数値変数間の相関係数を表示する関数
 

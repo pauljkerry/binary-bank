@@ -11,7 +11,7 @@ def run_optuna_search(
     initial_params: dict | list[dict] = None,
     sampler: optuna.samplers.BaseSampler | None = None,
     pruner=None
-):
+) -> optuna.Study:
     """
     Optunaによるハイパーパラメータ探索を実行する関数。
 

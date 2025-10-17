@@ -10,7 +10,10 @@ import lightgbm as lgb
 import numpy as np
 import polars as pl
 
+from sklearn.metrics import log_loss
 from sklearn.metrics import roc_auc_score
+from sklearn.metrics import mean_squared_error as mse
+from sklearn.metrics import r2_score
 
 from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
@@ -19,12 +22,6 @@ from src.utils.mem_info import free_ram_gib, free_vram_gib
 
 @dataclass(eq=False)
 class LGBMCVTrainer:
-    """
-    LGBMを使ったCVトレーナー。
-
-    Attributes
-    ----------
-    """
     data_id: str
     train_paths: str | list[str]
     test_paths: str | list[str] | None = None
@@ -96,6 +93,19 @@ class LGBMCVTrainer:
 
         self.params = merged
 
+        self.rep_metric = "auc"
+        self.metrics = {
+            "rmse": lambda y, p: np.sqrt(mse(y, p)),
+            "r2": r2_score,
+            "mae": lambda y, p: np.mean(np.abs(y-p)),
+            # "mape": lambda y, p: np.mean(np.abs((y-p)/y)),
+            "accuracy": lambda y, p: np.mean(
+                [y_i == (1 if p_i > 0.5 else 0) for y_i, p_i in zip(y, p)]
+            ),
+            "log_loss": log_loss,
+            "auc": roc_auc_score
+        }
+
         hdr = pl.read_parquet(self.train_paths, n_rows=0)
         all_cols = hdr.columns
 
@@ -128,17 +138,7 @@ class LGBMCVTrainer:
     def fit(
         self,
         loggers: list[CVLogger] | None = None
-    ):
-        """
-        CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
-
-        Returns
-        -------
-        oof_preds : ndarray
-            OOF予測配列
-        test_preds : ndarray
-            test_dfに対する予測配列
-        """
+    ) -> dict:
         if self.test_paths is None:
             raise ValueError("Please provide test_paths (got None).")
 
@@ -172,8 +172,23 @@ class LGBMCVTrainer:
         test_pred = np.zeros(test_rows, dtype=np.float32)
 
         iteration_list = []
-        auc_scores = []
+        fold_scores = {name: [] for name in self.metrics.keys()}
         fi_fold_frames = []
+
+        test = (
+            self.lf_test
+            .select(self.features)
+            .collect(engine="streaming")
+            .to_numpy()
+            .astype(np.float32)
+        )
+
+        fold_df = (
+            pl.read_parquet(
+                self.train_paths,
+                columns=["row_id", self.fold_col]
+            )
+        )
 
         for i in range(self.n_folds):
             title = f" Fold {i + 1} / {self.n_folds} "
@@ -184,6 +199,7 @@ class LGBMCVTrainer:
             print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
             t_fold_start = now()
+            fold_summary = {}
 
             need_cols = self.features + [self.target, "row_id"]
             train = (
@@ -225,18 +241,11 @@ class LGBMCVTrainer:
                 .ravel()
             )
             val_idx = (
-                valid
-                .select("row_id")
-                .to_series()
+                fold_df
+                .filter(pl.col(self.fold_col) == i)
+                .get_column("row_id")
                 .to_numpy()
                 .astype(np.int32, copy=False)
-            )
-            test = (
-                self.lf_test
-                .select(self.features)
-                .collect(engine="streaming")
-                .to_numpy()
-                .astype(np.float32)
             )
 
             dtrain = lgb.Dataset(
@@ -268,16 +277,19 @@ class LGBMCVTrainer:
                 ]
             )
 
-            oof[val_idx] = model.predict(X_valid)
+            val_pred = model.predict(X_valid)
+            oof[val_idx] = val_pred
             test_pred += model.predict(test)
 
             best_iter = model.best_iteration
-            train_score = evals_result["train"]["auc"][best_iter-1]
-            eval_score = evals_result["eval"]["auc"][best_iter-1]
-            print(f"Train AUC: {train_score:.5f}")
-            print(f"Valid AUC: {eval_score:.5f}")
+            fold_summary["best_iter"] = best_iter
 
-            auc_scores.append(eval_score)
+            for name, metric_func in self.metrics.items():
+                val_score = metric_func(y_valid, val_pred)
+                print(f"{name.upper()} Valid: {val_score:.5f}")
+                fold_summary[name] = val_score
+                fold_scores[name].append(val_score)
+
             iteration_list.append(best_iter)
 
             importances = model.feature_importance(importance_type="gain")
@@ -293,13 +305,9 @@ class LGBMCVTrainer:
             fi_fold_frames.append(df)
 
             t_fold_end = now()
-            runtime = print_duration(
-                t_fold_start, t_fold_end, f"Fold {i+1} Runtime"
+            fold_summary["runtime"] = print_duration(
+                t_fold_start, t_fold_end, f"\nFold {i+1} Runtime"
             )
-            fold_summary = {
-                "auc": eval_score,
-                "runtime": runtime
-            }
 
             for lg in loggers:
                 lg.on_fold_end(
@@ -308,19 +316,30 @@ class LGBMCVTrainer:
                     evals_result=evals_result,
                     summary=fold_summary
                 )
-            del model, X_train, y_train, X_valid, y_valid, test
+            del model, X_train, y_train, X_valid, y_valid
             gc.collect()
 
-        print("\n=== CV Results ===")
         y = (
-            self.lf_train
-            .select(self.target)
-            .cast(pl.Float32)
-            .collect(engine="streaming")
-            .to_numpy()
-            .ravel()
+            pl.read_parquet(self.train_paths, columns=self.target)
+              .get_column(self.target)
+              .cast(pl.Float32)
+              .to_numpy()
         )
         test_pred /= self.n_folds
+
+        oofs = {
+            name: metric_func(y, oof)
+            for name, metric_func in self.metrics.items()
+        }
+
+        oof_stats = {
+            name: {
+                "oof": oofs[name],
+                "mean": np.mean(vals),
+                "std": np.std(vals)
+            }
+            for name, vals in fold_scores.items()
+        }
 
         all_fi = pl.concat(fi_fold_frames, how="vertical_relaxed")
         fi_mean = (
@@ -331,39 +350,39 @@ class LGBMCVTrainer:
             ])
         ).sort("Importance", descending=True)
 
-        oof_score = roc_auc_score(y, oof)
-
-        auc_mean = np.mean(auc_scores)
-        auc_std = np.std(auc_scores)
         iter_mean = np.mean(iteration_list)
 
-        print(f"OOF score: {oof_score:.5f}")
-        print(
-            f"Mean: {auc_mean:.5f}, "
-            f"Std: {auc_std:.5f}"
-        )
+        print(f"\n{' CV Results ':*^48}")
+        print("─" * 48)
+        print(f" {'Metric':^9}  {'OOF':>10}  {'Mean':>10} ± {'Std':<10} ")
+        print("-" * 48)
+        for name, stats in oof_stats.items():
+            print(f" {name.upper():^9} "
+                  f" {stats['oof']:>10.5f} "
+                  f" {stats['mean']:>10.5f} ± {stats['std']:<10.5f} ")
+        print("─" * 48)
         print(f"Avg best iteration: {iter_mean}")
 
-        t_total_end = now()
-        total_runtime = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
         result = {
             "oof": oof,
             "test_pred": test_pred,
-            "oof_score": oof_score,
+            "oof_score": oofs[self.rep_metric],
             "fi_mean": fi_mean
         }
-        overall_summary = {
-            "auc_oof": oof_score,
-            "auc_mean": auc_mean,
-            "auc_std": auc_std,
-            "iter_mean": iter_mean,
-            "total_runtime": total_runtime
-        }
+        overall_summary = {"iter_mean": iter_mean}
+        for name, stats in oof_stats.items():
+            overall_summary[f"{name}_mean"] = stats["mean"]
+            overall_summary[f"{name}_std"] = stats["std"]
+            overall_summary[f"{name}_oof"] = oofs[name]
+
+        t_total_end = now()
+        overall_summary["total_runtime"] = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
+
         for lg in loggers:
             lg.on_end(overall_summary)
 
@@ -372,17 +391,7 @@ class LGBMCVTrainer:
     def full_train(
         self,
         loggers: list[CVLogger] | None = None
-    ):
-        """
-        訓練データ全体でモデルを学習し、test_dfに対する予測結果をnpy形式で保存する。
-
-        Parameters
-        ----------
-        Returns
-        -------
-        test_preds : np.ndarray
-            test dataの予測値
-        """
+    ) -> dict:
         if self.test_paths is None:
             raise ValueError("Please provide test_paths (got None).")
 
@@ -476,24 +485,11 @@ class LGBMCVTrainer:
 
     def fit_one_fold(
         self,
-        fold_idx=0,
+        fold_idx: int = 0,
         loggers: list[CVLogger] | None = None
-    ):
-        """
-        指定した1つのfoldのみを用いてモデルを学習する。
-        主にOptunaによるハイパーパラメータ探索時に使用。
-
-        Parameters
-        ----------
-        fold : int
-            学習に使うfold番号。
-
-        Return
-        ------
-        eval_score : float
-            Score
-        """
+    ) -> float:
         t_total_start = now()
+        fold_summary = {}
 
         loggers = loggers or [NoOpLogger()]
         meta = {
@@ -578,26 +574,23 @@ class LGBMCVTrainer:
             ]
         )
 
-        best_iter = model.best_iteration
-        train_score = evals_result["train"]["auc"][best_iter-1]
-        eval_score = evals_result["valid"]["auc"][best_iter-1]
-        print(f"Train AUC: {train_score:.5f}")
-        print(f"Valid AUC: {eval_score:.5f}")
+        fold_summary["best_iter"] = model.best_iteration
+
+        val_pred = model.predict(X_valid)
+        for name, metric_func in self.metrics.items():
+            val_score = metric_func(y_valid, val_pred)
+            print(f"{name.upper()} Valid: {val_score:.5f}")
+            fold_summary[name] = val_score
 
         del model, X_train, y_train, X_valid, y_valid
         gc.collect()
 
         t_total_end = now()
-        total_runtime = print_duration(
+        fold_summary["runtime"] = print_duration(
             t_total_start, t_total_end, "Total CV Runtime"
         )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        fold_summary = {
-            "auc": eval_score,
-            "runtime": total_runtime
-        }
 
         for lg in loggers:
             lg.on_fold_end(
@@ -607,4 +600,4 @@ class LGBMCVTrainer:
                 summary=fold_summary
             )
 
-        return eval_score
+        return fold_summary[self.rep_metric]

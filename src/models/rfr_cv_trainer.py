@@ -17,7 +17,6 @@ from sklearn.metrics import mean_squared_error as mse
 from sklearn.metrics import r2_score
 from sklearn.metrics import roc_auc_score
 from sklearn.metrics import log_loss
-from sklearn.metrics import accuracy_score
 
 from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
@@ -26,22 +25,6 @@ from src.utils.mem_info import free_ram_gib, free_vram_gib
 
 @dataclass
 class RFRCVTrainer:
-    """
-    RFRを使ったGPUでのCVトレーナー。
-
-    Attributes
-    ----------
-    tr_df : pd.DataFrame
-        label付データ
-    test_df : pd.DataFrame, default None
-        labelなしデータ。CV学習はtest_df必須。
-    params : dict
-        RFRのパラメータ。
-    n_splits : int, default 5
-        KFoldの分割数。
-    seed : int, default 42
-        乱数シード。
-    """
     data_id: str
     train_paths: str | list[str]
     test_paths: str | list[str] | None = None
@@ -90,7 +73,9 @@ class RFRCVTrainer:
             "r2": r2_score,
             "mae": lambda y, p: np.mean(np.abs(y-p)),
             # "mape": lambda y, p: np.mean(np.abs((y-p)/y)),
-            # "accuracy": accuracy_score,
+            "accuracy": lambda y, p: np.mean(
+                [y_i == (1 if p_i > 0.5 else 0) for y_i, p_i in zip(y, p)]
+            ),
             # "log_loss": log_loss,
             "auc": roc_auc_score
         }
@@ -139,17 +124,7 @@ class RFRCVTrainer:
     def fit(
         self,
         loggers: list[CVLogger] | None = None
-    ):
-        """
-        CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
-
-        Returns
-        -------
-        oof_preds : ndarray
-            OOF予測配列
-        test_preds : ndarray
-            test_dfに対する予測配列
-        """
+    ) -> dict:
         if self.test_paths is None:
             raise ValueError("Please provide test_paths (got None).")
 
@@ -183,7 +158,14 @@ class RFRCVTrainer:
 
         fold_scores = {name: [] for name in self.metrics.keys()}
 
-        test = cudf.read_parquet(self.test_paths, columns=self.features)
+        test = cudf.read_parquet(self.test_paths, columns=self.features).to_cupy()
+
+        fold_df = (
+            pl.read_parquet(
+                self.train_paths,
+                columns=["row_id", self.fold_col]
+            )
+        )
 
         for i in range(self.n_folds):
             title = f" Fold {i + 1} / {self.n_folds} "
@@ -206,23 +188,16 @@ class RFRCVTrainer:
 
             X_valid = train[train[self.fold_col] == i][self.features].to_cupy()
             y_valid = (
-                self.lf_train
-                .filter(pl.col(self.fold_col) == i)
-                .select(self.target)
-                .collect(engine="streaming")
-                .to_numpy()
-                .ravel()
+                train[train[self.fold_col] == i]
+                [self.target].to_cupy().get()
             )
 
             val_idx = (
-                pl.scan_parquet(self.train_paths)
-                  .select(["row_id", self.fold_col])
-                  .filter(pl.col(self.fold_col) == i)
-                  .select("row_id")
-                  .collect()
-                  .get_column("row_id")
-                  .to_numpy()
-                  .astype(np.int32, copy=False)
+                fold_df
+                .filter(pl.col(self.fold_col) == i)
+                .get_column("row_id")
+                .to_numpy()
+                .astype(np.int32, copy=False)
             )
 
             model = RandomForestRegressor(**self.params)
@@ -314,23 +289,9 @@ class RFRCVTrainer:
 
     def fit_one_fold(
         self,
-        fold_idx=0,
-        loggers=None
+        fold_idx: int = 0,
+        loggers: list[CVLogger] | None = None
     ):
-        """
-        指定した1つのfoldのみを用いてモデルを学習する。
-        主にOptunaによるハイパーパラメータ探索時に使用。
-
-        Parameters
-        ----------
-        fold : int
-            学習に使うfold番号。
-
-        Rerurn
-        ------
-        rmse : float
-            Score
-        """
         t_total_start = now()
         fold_summary = {}
 
@@ -356,32 +317,23 @@ class RFRCVTrainer:
 
         X_valid = train[train[self.fold_col] == fold_idx][self.features].to_cupy()
         y_valid = (
-            self.lf_train
-            .filter(pl.col(self.fold_col) == fold_idx)
-            .select(self.target)
-            .collect(engine="streaming")
-            .to_numpy()
-            .ravel()
+            train[train[self.fold_col] == fold_idx]
+            [self.target].to_cupy().get()
         )
 
         model = RandomForestRegressor(**self.params)
         model.fit(X_train, y_train)
 
-        pred = model.predict(X_valid).get()
+        pred = model.predict_proba(X_valid).get()[:, 1]
 
         for name, metric_func in self.metrics.items():
             val_score = metric_func(y_valid, pred)
             print(f"{name.upper()} Valid: {val_score:.5f}")
             fold_summary[name] = val_score
 
-        del train, X_train, y_train, X_valid, y_valid
-        gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
-        self.pmp.free_all_blocks()
-
         t_total_end = now()
         fold_summary["runtime"] = print_duration(
-            t_total_start, t_total_end, "Total Runtime"
+            t_total_start, t_total_end, "Total CV Runtime"
         )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
@@ -392,5 +344,10 @@ class RFRCVTrainer:
                 "iter",
                 summary=fold_summary
             )
+
+        del train, X_train, y_train, X_valid, y_valid
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
+        self.pmp.free_all_blocks()
 
         return fold_summary[self.rep_metric]

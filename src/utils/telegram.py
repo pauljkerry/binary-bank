@@ -8,7 +8,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
-def send_message(message: str):
+def send_message(message: str) -> None:
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     try:
         r = requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=10)
@@ -21,7 +21,7 @@ def send_message(message: str):
         print(f"⚠️ Failed to send message: {e}")
 
 
-def send_document(path: str, caption: str = ""):
+def send_document(path: str, caption: str = "") -> None:
     url = f"https://api.telegram.org/bot{TOKEN}/sendDocument"
     with open(path, "rb") as f:
         files = {"document": (os.path.basename(path), f)}

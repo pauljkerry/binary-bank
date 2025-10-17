@@ -16,7 +16,10 @@ import pyarrow.parquet as pq
 import rmm.mr as mr
 from rmm.allocators.cupy import rmm_cupy_allocator
 import xgboost as xgb
+from sklearn.metrics import log_loss
 from sklearn.metrics import roc_auc_score
+from sklearn.metrics import mean_squared_error as mse
+from sklearn.metrics import r2_score
 
 from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
@@ -136,22 +139,6 @@ class ParquetIter(xgb.core.DataIter):
 
 @dataclass
 class XGBCVTrainer:
-    """
-    XGBを使ったCVトレーナー。
-
-    Attributes
-    ----------
-    data_id: str
-        使用するdata
-    params : dict
-        XGBのパラメータ。
-    early_stopping_rounds : int, default 100
-        早期停止ラウンド数。
-    num_boost_round : int, default 20000
-        iterationの最大値。
-    seed : int, default 42
-        乱数シード。
-    """
     data_id: str
     train_paths: str | list[str]
     test_paths: str | list[str] | None = None
@@ -223,6 +210,19 @@ class XGBCVTrainer:
         # train() の引数として取り出す
         self.params = merged
 
+        self.rep_metric = "auc"
+        self.metrics = {
+            "rmse": lambda y, p: np.sqrt(mse(y, p)),
+            "r2": r2_score,
+            "mae": lambda y, p: np.mean(np.abs(y-p)),
+            # "mape": lambda y, p: np.mean(np.abs((y-p)/y)),
+            "accuracy": lambda y, p: np.mean(
+                [y_i == (1 if p_i > 0.5 else 0) for y_i, p_i in zip(y, p)]
+            ),
+            "log_loss": log_loss,
+            "auc": roc_auc_score
+        }
+
         hdr = pl.read_parquet(self.train_paths, n_rows=0)
         all_cols = hdr.columns
 
@@ -267,17 +267,7 @@ class XGBCVTrainer:
     def fit(
         self,
         loggers: list[CVLogger] | None = None
-    ):
-        """
-        CVを用いてモデルを学習し、OOF予測とtest_dfの平均予測を返す。
-
-        Returns
-        -------
-        oof_pred : ndarray
-            OOF予測配列
-        test_pred : ndarray
-            test_dfに対する予測配列
-        """
+    ) -> dict:
         if self.test_paths is None:
             raise ValueError("Please provide test_paths (got None).")
 
@@ -310,8 +300,17 @@ class XGBCVTrainer:
         oof = np.zeros(train_rows, dtype=np.float32)
         test_pred = np.zeros(test_rows, dtype=np.float32)
 
+        test_it = ParquetIter(
+            paths=self.test_paths,
+            features=self.features,
+            target=self.target,
+            cat_cols=self.cat_cols,
+            predict_mode=True,
+            gpu=self.gpu
+        )
+
         iteration_list = []
-        auc_scores = []
+        fold_scores = {name: [] for name in self.metrics.keys()}
         fi_fold_frames = []
 
         for i in range(self.n_folds):
@@ -324,6 +323,7 @@ class XGBCVTrainer:
 
             t_fold_start = now()
             t_qdm_start = now()
+            fold_summary = {}
 
             train_it = ParquetIter(
                 paths=self.train_paths,
@@ -369,6 +369,16 @@ class XGBCVTrainer:
                 ref=dtrain
             )
 
+            y_valid = (
+                pl.read_parquet(
+                    self.train_paths, columns=[self.target, self.fold_col]
+                ).filter(pl.col(self.fold_col) == i)
+                .select(self.target)
+                .to_numpy()
+                .astype(np.int32)
+                .ravel()
+            )
+
             val_idx = (
                 pl.scan_parquet(self.train_paths)
                   .select(["row_id", self.fold_col])
@@ -383,6 +393,8 @@ class XGBCVTrainer:
             evals_result = {}
 
             t_qdm_end = now()
+            print_duration(t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time")
+
             t_fit_start = now()
 
             model = xgb.train(
@@ -395,32 +407,29 @@ class XGBCVTrainer:
                 evals_result=evals_result,
             )
 
-            oof[val_idx] = model.predict(
+            val_pred = model.predict(
                 dvalid, iteration_range=(0, model.best_iteration + 1)
             )
+            oof[val_idx] = val_pred
             test_pred += model.predict(
                 dtest,
                 iteration_range=(0, model.best_iteration + 1)
             )
 
             t_fit_end = now()
-            t_fold_end = now()
 
-            print_duration(t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time")
             print_duration(t_fit_start, t_fit_end)
-            runtime = print_duration(
-                t_fold_start, t_fold_end, f"Fold {i+1} Runtime"
-            )
 
-            best_iteration = model.best_iteration
-            auc_train = evals_result["train"]["auc"][best_iteration]
-            auc_valid = evals_result["valid"]["auc"][best_iteration]
+            best_iter = model.best_iteration
+            fold_summary["best_iter"] = best_iter
 
-            print(f"\nAUC Train: {auc_train:.5f}")
-            print(f"AUC Valid: {auc_valid:.5f}\n")
+            for name, metric_func in self.metrics.items():
+                val_score = metric_func(y_valid, val_pred)
+                print(f"{name.upper()} Valid: {val_score:.5f}")
+                fold_summary[name] = val_score
+                fold_scores[name].append(val_score)
 
-            iteration_list.append(best_iteration)
-            auc_scores.append(auc_valid)
+            iteration_list.append(best_iter)
 
             importances = model.get_score(importance_type="total_gain")
             total_gain = float(sum(importances.values()))
@@ -435,11 +444,10 @@ class XGBCVTrainer:
             )
             fi_fold_frames.append(df)
 
-            fold_summary = {
-                "auc": auc_valid,
-                "best_iter": best_iteration,
-                "runtime": runtime
-            }
+            t_fold_end = now()
+            fold_summary["runtime"] = print_duration(
+                t_fold_start, t_fold_end, f"\nFold {i+1} Runtime"
+            )
 
             for lg in loggers:
                 lg.on_fold_end(
@@ -460,8 +468,21 @@ class XGBCVTrainer:
               .cast(pl.Float32)
               .to_numpy()
         )
-
         test_pred /= self.n_folds
+
+        oofs = {
+            name: metric_func(y, oof)
+            for name, metric_func in self.metrics.items()
+        }
+
+        oof_stats = {
+            name: {
+                "oof": oofs[name],
+                "mean": np.mean(vals),
+                "std": np.std(vals)
+            }
+            for name, vals in fold_scores.items()
+        }
 
         all_fi = pl.concat(fi_fold_frames, how="vertical_relaxed")
         fi_mean = (
@@ -472,41 +493,38 @@ class XGBCVTrainer:
             ])
         ).sort("Importance", descending=True)
 
-        auc_oof = roc_auc_score(y, oof)
-        auc_mean = np.mean(auc_scores)
-        auc_std = np.std(auc_scores)
+        iter_mean = np.mean(iteration_list)
 
         print(f"\n{' CV Results ':*^48}")
         print("─" * 48)
         print(f" {'Metric':^9}  {'OOF':>10}  {'Mean':>10} ± {'Std':<10} ")
         print("-" * 48)
-        print(f" {'AUC':^9} "
-              f" {auc_oof:>10.5f} "
-              f" {auc_mean:>10.5f} ± {auc_std:<10.5f} ")
+        for name, stats in oof_stats.items():
+            print(f" {name.upper():^9} "
+                  f" {stats['oof']:>10.5f} "
+                  f" {stats['mean']:>10.5f} ± {stats['std']:<10.5f} ")
         print("─" * 48)
+        print(f"Avg best iteration: {iter_mean}")
 
-        print(f"Avg best iteration: {np.mean(iteration_list)}")
-
-        t_total_end = now()
-        total_runtime = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
         print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
         print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
         result = {
             "oof": oof,
             "test_pred": test_pred,
-            "oof_score": auc_oof,
+            "oof_score": oofs[self.rep_metric],
             "fi_mean": fi_mean
         }
-        overall_summary = {
-            "auc_oof": auc_oof,
-            "auc_mean": auc_mean,
-            "auc_std": auc_std,
-            "iter_mean": np.mean(iteration_list),
-            "total_runtime": total_runtime
-        }
+        overall_summary = {"iter_mean": iter_mean}
+        for name, stats in oof_stats.items():
+            overall_summary[f"{name}_mean"] = stats["mean"]
+            overall_summary[f"{name}_std"] = stats["std"]
+            overall_summary[f"{name}_oof"] = oofs[name]
+
+        t_total_end = now()
+        overall_summary["total_runtime"] = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
 
         for lg in loggers:
             lg.on_end(overall_summary)
@@ -516,21 +534,19 @@ class XGBCVTrainer:
     def full_train(
         self,
         loggers: list[CVLogger] | None = None
-    ):
-        """
-        訓練データ全体でモデルを学習し、test_dfに対する予測結果をnpy形式で返す
-
-        Parameters
-        ----------
-        iterations : int
-            学習の繰り返し回数。
-
-        Returns
-        -------
-        test_prads : np.ndarray
-            test dataの予測値
-        """
+    ) -> dict:
         t_total_start = now()
+
+        loggers = loggers or [NoOpLogger()]
+        meta = {
+            "data_id": self.data_id,
+            "seed": self.seed,
+            "n_folds": self.n_folds,
+            "early_stopping_rounds": self.early_stopping_rounds,
+            **self.params
+        }
+        for lg in loggers:
+            lg.on_start(meta)
 
         test_rows = pq.ParquetFile(self.test_path).metadata.num_rows
         test_pred = np.zeros(test_rows, dtype=np.float32)
@@ -561,9 +577,18 @@ class XGBCVTrainer:
             gpu=self.gpu
         )
 
-        dtrain = xgb.QuantileDMatrix(train_it, enable_categorical=True)
-        dtest = xgb.QuantileDMatrix(test_it, enable_categorical=True, ref=dtrain)
+        dtrain = xgb.QuantileDMatrix(
+            train_it,
+            enable_categorical=True
+        )
+        dtest = xgb.QuantileDMatrix(
+            test_it,
+            enable_categorical=True,
+            ref=dtrain
+        )
         t_qdm_end = now()
+        print_duration(t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time")
+
         t_fit_start = now()
 
         model = xgb.train(
@@ -574,38 +599,37 @@ class XGBCVTrainer:
         )
         t_fit_end = now()
 
-        print_duration(t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time")
         print_duration(t_fit_start, t_fit_end)
 
         test_pred = model.predict(dtest)
 
         t_total_end = now()
-        print_duration(t_total_start, t_total_end, "Total CV Runtime")
+        total_runtime = print_duration(
+            t_total_start, t_total_end, "Total Runtime"
+        )
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-        return test_pred
+        result = {
+            "oof": None,
+            "test_pred": test_pred,
+            "oof_score": None
+        }
+        overall_summary = {
+            "total_runtime": total_runtime
+        }
+        for lg in loggers:
+            lg.on_end(overall_summary)
+
+        return result
 
     def fit_one_fold(
         self,
-        fold_idx=0,
-        loggers=None
-    ):
-        """
-        指定した1つのfoldのみを用いてモデルを学習する。
-        主にOptunaによるハイパーパラメータ探索時に使用。
-
-        Parameters
-        ----------
-        fold : int
-            学習に使うfold番号。
-
-        Rerurn
-        ------
-        score : float
-            Score
-        """
+        fold_idx: int = 0,
+        loggers: bool = None
+    ) -> float:
         t_total_start = now()
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
+        fold_summary = {}
 
         loggers = loggers or [NoOpLogger()]
         meta = {
@@ -617,6 +641,9 @@ class XGBCVTrainer:
         }
         for lg in loggers:
             lg.on_start(meta)
+
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
         evals_result = {}
 
@@ -653,7 +680,19 @@ class XGBCVTrainer:
             ref=dtrain
         )
 
+        y_valid = (
+            pl.read_parquet(
+                self.train_paths, columns=[self.target, self.fold_col]
+            ).filter(pl.col(self.fold_col) == fold_idx)
+            .select(self.target)
+            .to_numpy()
+            .astype(np.int32)
+            .ravel()
+        )
+
         t_qdm_end = now()
+        print_duration(t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time")
+
         t_fit_start = now()
 
         model = xgb.train(
@@ -667,25 +706,30 @@ class XGBCVTrainer:
         )
 
         t_fit_end = now()
-        print_duration(t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time")
         print_duration(t_fit_start, t_fit_end)
 
-        best_iteration = model.best_iteration
+        fold_summary["best_iter"] = model.best_iteration
 
-        auc_train = evals_result["train"]["auc"][best_iteration]
-        auc_valid = evals_result["valid"]["auc"][best_iteration]
+        val_pred = model.predict(
+            dvalid, iteration_range=(0, model.best_iteration + 1)
+        )
+        for name, metric_func in self.metrics.items():
+            val_score = metric_func(y_valid, val_pred)
+            print(f"{name.upper()} Valid: {val_score:.5f}")
+            fold_summary[name] = val_score
 
-        print(f"\nAUC Train: {auc_train:.5f}")
-        print(f"AUC Valid: {auc_valid:.5f}")
+        del train_it, valid_it, dtrain, dvalid, y_valid, model
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
+        self.pmp.free_all_blocks()
 
         t_total_end = now()
-        runtime = print_duration(t_total_start, t_total_end, "Total Runtime")
+        fold_summary["runtime"] = print_duration(
+            t_total_start, t_total_end, "Total CV Runtime"
+        )
+        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
+        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
 
-        fold_summary = {
-            "auc": auc_valid,
-            "best_iter": best_iteration,
-            "runtime": runtime
-        }
         for lg in loggers:
             lg.on_fold_end(
                 fold_idx,
@@ -694,12 +738,4 @@ class XGBCVTrainer:
                 summary=fold_summary
             )
 
-        del train_it, valid_it, dtrain, dvalid, model
-        gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
-        self.pmp.free_all_blocks()
-
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        return auc_valid
+        return fold_summary[self.rep_metric]

@@ -1,7 +1,10 @@
 import cupy as cp
 
 
-def multiple_auc_scores(y_true, y_scores):
+def multiple_auc_scores(
+    y_true: cp.ndarray,
+    y_scores: cp.ndarray
+) -> float:
     """
     Parameters
     ----------
