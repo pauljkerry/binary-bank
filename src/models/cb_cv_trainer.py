@@ -136,11 +136,9 @@ class CBCVTrainer:
 
     def fit(
         self,
-        loggers: list[CVLogger] | None = None
+        loggers: list[CVLogger] | None = None,
+        one_fold: bool = False
     ) -> dict:
-        if self.test_paths is None:
-            raise ValueError("Please provide test_paths (got None).")
-
         t_total_start = now()
 
         loggers = loggers or [NoOpLogger()]
@@ -153,32 +151,33 @@ class CBCVTrainer:
         for lg in loggers:
             lg.on_start(meta)
 
-        train_rows = (
-            pl.scan_parquet(self.train_paths)
-              .select(pl.len())
-              .collect()
-              .item()
-        )
-        test_rows = (
-            pl.scan_parquet(self.test_paths)
-              .select(pl.len())
-              .collect()
-              .item()
-        )
+        if not one_fold:
+            train_rows = (
+                pl.scan_parquet(self.train_paths)
+                  .select(pl.len())
+                  .collect()
+                  .item()
+            )
+            test_rows = (
+                pl.scan_parquet(self.test_paths)
+                  .select(pl.len())
+                  .collect()
+                  .item()
+            )
 
-        oof = np.zeros(train_rows, dtype=np.float32)
-        test_pred = np.zeros(test_rows, dtype=np.float32)
+            oof = np.zeros(train_rows, dtype=np.float32)
+            test_pred = np.zeros(test_rows, dtype=np.float32)
+
+            test = (
+                self.lf_test
+                .select(self.features)
+                .collect(engine="streaming")
+                .to_numpy()
+                .astype(np.float32)
+            )
 
         iteration_list = []
         fold_scores = {name: [] for name in self.metrics.keys()}
-
-        test = (
-            self.lf_test
-            .select(self.features)
-            .collect(engine="streaming")
-            .to_numpy()
-            .astype(np.float32)
-        )
 
         fold_df = (
             pl.read_parquet(
@@ -268,9 +267,6 @@ class CBCVTrainer:
             fold_summary["best_iter"] = best_iter
 
             val_pred = model.predict_proba(X_valid, ntree_end=best_iter)[:, 1]
-            oof[val_idx] = val_pred
-
-            test_pred += model.predict_proba(test)[:, 1]
 
             for name, metric_func in self.metrics.items():
                 val_score = metric_func(y_valid, val_pred)
@@ -291,10 +287,24 @@ class CBCVTrainer:
                     axis_name="iter",
                     summary=fold_summary
                 )
+
+            if one_fold:
+                result = {
+                    "oof": None,
+                    "test_pred": None,
+                    "oof_score": fold_scores[self.rep_metric][0]
+                }
+            else:
+                oof[val_idx] = val_pred
+                test_pred += model.predict_proba(test)[:, 1]
+
             del model, X_train, y_train, X_valid, y_valid
             gc.collect()
             cp.get_default_memory_pool().free_all_blocks()
             self.pmp.free_all_blocks()
+
+            if one_fold:
+                return result
 
         y = (
             pl.read_parquet(self.train_paths, columns=self.target)
@@ -447,112 +457,3 @@ class CBCVTrainer:
             lg.on_end(overall_summary)
 
         return result
-
-    def fit_one_fold(
-        self,
-        fold_idx: int = 0,
-        loggers: list[CVLogger] | None = None
-    ) -> float:
-        t_total_start = now()
-        fold_summary = {}
-
-        loggers = loggers or [NoOpLogger()]
-        meta = {
-            "data_id": self.data_id,
-            "seed": self.seed,
-            "n_folds": self.n_folds,
-            **self.params
-        }
-        for lg in loggers:
-            lg.on_start(meta)
-
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        need_cols = self.features + [self.target, "row_id"]
-        train = (
-            self.lf_train
-            .filter(pl.col(self.fold_col) != fold_idx)
-            .select(need_cols)
-            .collect(engine="streaming")
-        )
-        valid = (
-            self.lf_train
-            .filter(pl.col(self.fold_col) == fold_idx)
-            .select(need_cols)
-            .collect(engine="streaming")
-        )
-        X_train = (
-            train
-            .select(self.features)
-            .to_numpy()
-            .astype(np.float32)
-        )
-        y_train = (
-            train
-            .select(self.target)
-            .to_numpy()
-            .astype(np.int32)
-            .ravel()
-        )
-        X_valid = (
-            valid
-            .select(self.features)
-            .to_numpy()
-            .astype(np.float32)
-        )
-        y_valid = (
-            valid
-            .select(self.target)
-            .to_numpy()
-            .astype(np.int32)
-            .ravel()
-        )
-
-        train_pool = Pool(
-            X_train,
-            y_train,
-            cat_features=self.cat_cols
-        )
-        valid_pool = Pool(
-            X_valid,
-            y_valid,
-            cat_features=self.cat_cols
-        )
-
-        model = CatBoostClassifier(**self.params)
-
-        model.fit(
-            train_pool, eval_set=valid_pool, use_best_model=True,
-        )
-
-        fold_summary["best_iter"] = model.best_iteration_
-
-        val_pred = model.predict_proba(X_valid)[:, 1]
-
-        val_pred = model.predict(X_valid)
-        for name, metric_func in self.metrics.items():
-            val_score = metric_func(y_valid, val_pred)
-            print(f"{name.upper()} Valid: {val_score:.5f}")
-            fold_summary[name] = val_score
-
-        del model, X_train, y_train, X_valid, y_valid
-        gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
-        self.pmp.free_all_blocks()
-
-        t_total_end = now()
-        fold_summary["runtime"] = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        for lg in loggers:
-            lg.on_fold_end(
-                fold_idx,
-                axis_name="iter",
-                summary=fold_summary
-            )
-
-        return fold_summary[self.rep_metric]

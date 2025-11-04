@@ -22,7 +22,7 @@ SearchSpace = Callable[[optuna.trial.Trial], dict[str, Any]]
 
 def space_xgb(t: optuna.trial.Trial) -> dict[str, Any]:
     return {
-        "learning_rate": t.suggest_float("learning_rate", 0.01, 0.01),
+        "learning_rate": t.suggest_float("learning_rate", 0.1, 0.1),
         "max_depth": t.suggest_int("max_depth", 6, 13),
         "min_child_weight": t.suggest_float("min_child_weight", 0.0, 100.0),
         "colsample_bytree": t.suggest_float("colsample_bytree", 0.3, 0.7),
@@ -48,7 +48,7 @@ def space_lgbm(t: optuna.trial.Trial) -> dict[str, Any]:
 
 def space_cb(t: optuna.trial.Trial) -> dict[str, Any]:
     return {
-        "learning_rate": t.suggest_float("learning_rate", 0.02, 0.02),
+        "learning_rate": t.suggest_float("learning_rate", 0.1, 0.1),
         "depth": t.suggest_int("depth", 6, 16),
         "min_data_in_leaf": t.suggest_int("min_data_in_leaf", 1, 100),
         "random_strength": t.suggest_float("random_strength", 1, 80),
@@ -175,7 +175,6 @@ def create_objective(
     data_id: int,
     seed: int = 42,
     n_folds: int = 5,
-    fold_idx: int = 0,
     wandb_project: str = "project",
     study_name: str = "study",
     opts: dict | None = None
@@ -221,9 +220,9 @@ def create_objective(
                 opts=opts
             )
 
-            score = trainer.fit_one_fold(
-                fold_idx,
-                loggers=[WandbLogger(run=run)]
+            result = trainer.fit(
+                loggers=[WandbLogger(run=run)],
+                one_fold=True
             )
 
             path = optuna_dir / f"{study_name}/trl{trial.number}.json"
@@ -231,16 +230,15 @@ def create_objective(
                 "params": params,
                 "n_folds": n_folds,
                 "seed": seed,
-                "fold_idx": fold_idx,
                 "wandb_id": run.id,
                 "wandb_url": run.url,
                 "opts": opts,
-                "score": float(score)
+                "score": float(result["oof_score"])
             }
             with open(path, "w") as f:
                 json.dump(manifest, f, indent=4)
 
-            return score
+            return result["oof_score"]
         except RuntimeError as e:
             msg = str(e)
             if "CUDA out of memory" in msg:

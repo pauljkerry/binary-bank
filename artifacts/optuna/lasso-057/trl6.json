@@ -1,0 +1,11 @@
+{
+    "params": {
+        "alpha": 0.042070539502879395
+    },
+    "n_folds": 5,
+    "seed": 42,
+    "wandb_id": "zte41t08",
+    "wandb_url": "https://wandb.ai/kaitookano-waseda-university/playground-series-s5e8/runs/zte41t08",
+    "opts": {},
+    "score": 0.962226112891055
+}

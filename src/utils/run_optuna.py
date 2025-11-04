@@ -12,31 +12,6 @@ def run_optuna_search(
     sampler: optuna.samplers.BaseSampler | None = None,
     pruner=None
 ) -> optuna.Study:
-    """
-    Optunaによるハイパーパラメータ探索を実行する関数。
-
-    Parameters
-    ----------
-    objective : function
-        Optunaの目的関数。
-    n_trials : int, default 50
-        試行回数。
-    direction : str, default "minimize"
-        Optunaの探索方向。
-    study_name : str or None, default "study"
-        StudyName。
-    storage : str or None, default None
-        保存先URL。
-    initial_params : dict, list[dict] or None, default None
-        初期の試行パラメータ。
-    sampler : optuna.samplers.BaseSampler or None, default TPESampler
-        使用するSampler。
-
-    Returns
-    -------
-    study : optuna.Study
-        探索結果のStudyオブジェクト。
-    """
     study = optuna.create_study(
         direction=direction,
         study_name=study_name,

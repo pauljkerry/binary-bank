@@ -266,11 +266,9 @@ class XGBCVTrainer:
 
     def fit(
         self,
-        loggers: list[CVLogger] | None = None
+        loggers: list[CVLogger] | None = None,
+        one_fold: bool = False
     ) -> dict:
-        if self.test_paths is None:
-            raise ValueError("Please provide test_paths (got None).")
-
         t_total_start = now()
 
         loggers = loggers or [NoOpLogger()]
@@ -284,30 +282,31 @@ class XGBCVTrainer:
         for lg in loggers:
             lg.on_start(meta)
 
-        train_rows = (
-            pl.scan_parquet(self.train_paths)
-              .select(pl.len())
-              .collect()
-              .item()
-        )
-        test_rows = (
-            pl.scan_parquet(self.test_paths)
-              .select(pl.len())
-              .collect()
-              .item()
-        )
+        if not one_fold:
+            train_rows = (
+                pl.scan_parquet(self.train_paths)
+                  .select(pl.len())
+                  .collect()
+                  .item()
+            )
+            test_rows = (
+                pl.scan_parquet(self.test_paths)
+                  .select(pl.len())
+                  .collect()
+                  .item()
+            )
 
-        oof = np.zeros(train_rows, dtype=np.float32)
-        test_pred = np.zeros(test_rows, dtype=np.float32)
+            oof = np.zeros(train_rows, dtype=np.float32)
+            test_pred = np.zeros(test_rows, dtype=np.float32)
 
-        test_it = ParquetIter(
-            paths=self.test_paths,
-            features=self.features,
-            target=self.target,
-            cat_cols=self.cat_cols,
-            predict_mode=True,
-            gpu=self.gpu
-        )
+            test_it = ParquetIter(
+                paths=self.test_paths,
+                features=self.features,
+                target=self.target,
+                cat_cols=self.cat_cols,
+                predict_mode=True,
+                gpu=self.gpu
+            )
 
         iteration_list = []
         fold_scores = {name: [] for name in self.metrics.keys()}
@@ -345,14 +344,6 @@ class XGBCVTrainer:
                 weight_col=self.weight_col,
                 gpu=self.gpu
             )
-            test_it = ParquetIter(
-                paths=self.test_paths,
-                features=self.features,
-                target=self.target,
-                cat_cols=self.cat_cols,
-                predict_mode=True,
-                gpu=self.gpu
-            )
 
             dtrain = xgb.QuantileDMatrix(
                 train_it,
@@ -363,11 +354,13 @@ class XGBCVTrainer:
                 enable_categorical=True,
                 ref=dtrain
             )
-            dtest = xgb.QuantileDMatrix(
-                test_it,
-                enable_categorical=True,
-                ref=dtrain
-            )
+
+            if not one_fold:
+                dtest = xgb.QuantileDMatrix(
+                    test_it,
+                    enable_categorical=True,
+                    ref=dtrain
+                )
 
             y_valid = (
                 pl.read_parquet(
@@ -410,11 +403,12 @@ class XGBCVTrainer:
             val_pred = model.predict(
                 dvalid, iteration_range=(0, model.best_iteration + 1)
             )
-            oof[val_idx] = val_pred
-            test_pred += model.predict(
-                dtest,
-                iteration_range=(0, model.best_iteration + 1)
-            )
+            if not one_fold:
+                oof[val_idx] = val_pred
+                test_pred += model.predict(
+                    dtest,
+                    iteration_range=(0, model.best_iteration + 1)
+                )
 
             t_fit_end = now()
 
@@ -457,10 +451,23 @@ class XGBCVTrainer:
                     summary=fold_summary
                 )
 
-            del train_it, valid_it, test_it, dtrain, dvalid, dtest, model, val_idx
+            if one_fold:
+                result = {
+                    "oof": None,
+                    "test_pred": None,
+                    "oof_score": fold_scores[self.rep_metric][0],
+                    "fi_mean": df
+                }
+            else:
+                del dtest
+
+            del model, train_it, valid_it, dtrain, dvalid, val_idx
             gc.collect()
             cp.get_default_memory_pool().free_all_blocks()
             self.pmp.free_all_blocks()
+
+            if one_fold:
+                return result
 
         y = (
             pl.read_parquet(self.train_paths, columns=self.target)

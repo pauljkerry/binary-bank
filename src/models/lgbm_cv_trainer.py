@@ -137,11 +137,9 @@ class LGBMCVTrainer:
 
     def fit(
         self,
-        loggers: list[CVLogger] | None = None
+        loggers: list[CVLogger] | None = None,
+        one_fold: bool = True
     ) -> dict:
-        if self.test_paths is None:
-            raise ValueError("Please provide test_paths (got None).")
-
         t_total_start = now()
 
         loggers = loggers or [NoOpLogger()]
@@ -155,33 +153,34 @@ class LGBMCVTrainer:
         for lg in loggers:
             lg.on_start(meta)
 
-        train_rows = (
-            pl.scan_parquet(self.train_paths)
-              .select(pl.len())
-              .collect()
-              .item()
-        )
-        test_rows = (
-            pl.scan_parquet(self.test_paths)
-              .select(pl.len())
-              .collect()
-              .item()
-        )
+        if not one_fold:
+            train_rows = (
+                pl.scan_parquet(self.train_paths)
+                  .select(pl.len())
+                  .collect()
+                  .item()
+            )
+            test_rows = (
+                pl.scan_parquet(self.test_paths)
+                  .select(pl.len())
+                  .collect()
+                  .item()
+            )
 
-        oof = np.zeros(train_rows, dtype=np.float32)
-        test_pred = np.zeros(test_rows, dtype=np.float32)
+            oof = np.zeros(train_rows, dtype=np.float32)
+            test_pred = np.zeros(test_rows, dtype=np.float32)
+
+            test = (
+                self.lf_test
+                .select(self.features)
+                .collect(engine="streaming")
+                .to_numpy()
+                .astype(np.float32)
+            )
 
         iteration_list = []
         fold_scores = {name: [] for name in self.metrics.keys()}
         fi_fold_frames = []
-
-        test = (
-            self.lf_test
-            .select(self.features)
-            .collect(engine="streaming")
-            .to_numpy()
-            .astype(np.float32)
-        )
 
         fold_df = (
             pl.read_parquet(
@@ -278,8 +277,6 @@ class LGBMCVTrainer:
             )
 
             val_pred = model.predict(X_valid)
-            oof[val_idx] = val_pred
-            test_pred += model.predict(test)
 
             best_iter = model.best_iteration
             fold_summary["best_iter"] = best_iter
@@ -316,8 +313,22 @@ class LGBMCVTrainer:
                     evals_result=evals_result,
                     summary=fold_summary
                 )
+
+            if one_fold:
+                result = {
+                    "oof": None,
+                    "test_pred": None,
+                    "oof_score": fold_scores[self.rep_metric][0]
+                }
+            else:
+                oof[val_idx] = val_pred
+                test_pred += model.predict(test)
+
             del model, X_train, y_train, X_valid, y_valid
             gc.collect()
+
+            if one_fold:
+                return result
 
         y = (
             pl.read_parquet(self.train_paths, columns=self.target)
@@ -482,122 +493,3 @@ class LGBMCVTrainer:
             lg.on_end(overall_summary)
 
         return result
-
-    def fit_one_fold(
-        self,
-        fold_idx: int = 0,
-        loggers: list[CVLogger] | None = None
-    ) -> float:
-        t_total_start = now()
-        fold_summary = {}
-
-        loggers = loggers or [NoOpLogger()]
-        meta = {
-            "data_id": self.data_id,
-            "seed": self.seed,
-            "n_folds": self.n_folds,
-            "early_stopping_rounds": self.early_stopping_rounds,
-            **self.params
-        }
-        for lg in loggers:
-            lg.on_start(meta)
-
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        need_cols = self.features + [self.target, "row_id"]
-        train = (
-            self.lf_train
-            .filter(pl.col(self.fold_col) != fold_idx)
-            .select(need_cols)
-            .collect(engine="streaming")
-        )
-        valid = (
-            self.lf_train
-            .filter(pl.col(self.fold_col) == fold_idx)
-            .select(need_cols)
-            .collect(engine="streaming")
-        )
-        X_train = (
-            train
-            .select(self.features)
-            .to_numpy()
-            .astype(np.float32)
-        )
-        y_train = (
-            train
-            .select(self.target)
-            .to_numpy()
-            .astype(np.int32)
-            .ravel()
-        )
-        X_valid = (
-            valid
-            .select(self.features)
-            .to_numpy()
-            .astype(np.float32)
-        )
-        y_valid = (
-            valid
-            .select(self.target)
-            .to_numpy()
-            .astype(np.int32)
-            .ravel()
-        )
-
-        dtrain = lgb.Dataset(
-            X_train,
-            label=y_train,
-            feature_name=self.features,
-            categorical_feature=self.cat_cols,
-        )
-
-        dvalid = lgb.Dataset(
-            X_valid,
-            label=y_valid,
-            feature_name=self.features,
-            reference=dtrain
-        )
-
-        evals_result = {}
-
-        model = lgb.train(
-            self.params,
-            dtrain,
-            num_boost_round=self.num_boost_round,
-            valid_sets=[dtrain, dvalid],
-            valid_names=["train", "valid"],
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=self.early_stopping_rounds),
-                lgb.record_evaluation(evals_result),
-                lgb.log_evaluation(period=100)
-            ]
-        )
-
-        fold_summary["best_iter"] = model.best_iteration
-
-        val_pred = model.predict(X_valid)
-        for name, metric_func in self.metrics.items():
-            val_score = metric_func(y_valid, val_pred)
-            print(f"{name.upper()} Valid: {val_score:.5f}")
-            fold_summary[name] = val_score
-
-        del model, X_train, y_train, X_valid, y_valid
-        gc.collect()
-
-        t_total_end = now()
-        fold_summary["runtime"] = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        for lg in loggers:
-            lg.on_fold_end(
-                fold_idx,
-                axis_name="iter",
-                evals_result=evals_result,
-                summary=fold_summary
-            )
-
-        return fold_summary[self.rep_metric]

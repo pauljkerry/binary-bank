@@ -118,11 +118,9 @@ class RFCCVTrainer:
 
     def fit(
         self,
-        loggers: list[CVLogger] | None = None
+        loggers: list[CVLogger] | None = None,
+        one_fold: bool = False
     ) -> dict:
-        if self.test_paths is None:
-            raise ValueError("Please provide test_paths (got None).")
-
         t_total_start = now()
 
         loggers = loggers or [NoOpLogger()]
@@ -135,25 +133,28 @@ class RFCCVTrainer:
         for lg in loggers:
             lg.on_start(meta)
 
-        train_rows = (
-            self.lf_train
-            .select(pl.len())
-            .collect()
-            .item()
-        )
-        test_rows = (
-            pl.scan_parquet(self.test_paths)
-              .select(pl.len())
-              .collect()
-              .item()
-        )
+        if not one_fold:
+            train_rows = (
+                self.lf_train
+                .select(pl.len())
+                .collect()
+                .item()
+            )
+            test_rows = (
+                pl.scan_parquet(self.test_paths)
+                  .select(pl.len())
+                  .collect()
+                  .item()
+            )
 
-        oof = np.zeros(train_rows, dtype=np.float32)
-        test_pred = np.zeros(test_rows, dtype=np.float32)
+            oof = np.zeros(train_rows, dtype=np.float32)
+            test_pred = np.zeros(test_rows, dtype=np.float32)
+
+            test = cudf.read_parquet(
+                self.test_paths, columns=self.features
+            ).to_cupy()
 
         fold_scores = {name: [] for name in self.metrics.keys()}
-
-        test = cudf.read_parquet(self.test_paths, columns=self.features).to_cupy()
 
         fold_df = (
             pl.read_parquet(
@@ -198,12 +199,10 @@ class RFCCVTrainer:
             model = RandomForestClassifier(**self.params)
             model.fit(X_train, y_train)
 
-            pred = model.predict(X_valid).get()
-            oof[val_idx] = pred
-            test_pred += model.predict(test).get()
+            val_pred = model.predict_proba(X_valid)[:, 1].get()
 
             for name, metric_func in self.metrics.items():
-                val_score = metric_func(y_valid, pred)
+                val_score = metric_func(y_valid, val_pred)
                 print(f"{name.upper()} Valid: {val_score:.5f}")
                 fold_summary[name] = val_score
                 fold_scores[name].append(val_score)
@@ -221,10 +220,23 @@ class RFCCVTrainer:
                     summary=fold_summary
                 )
 
-            del X_train, y_train, X_valid, y_valid
+            if one_fold:
+                result = {
+                    "oof": None,
+                    "test_pred": None,
+                    "oof_score": fold_scores[self.rep_metric][0]
+                }
+            else:
+                oof[val_idx] = val_pred
+                test_pred += model.predict_proba(test)[:, 1].get()
+
+            del model, X_train, y_train, X_valid, y_valid
             gc.collect()
             cp.get_default_memory_pool().free_all_blocks()
             self.pmp.free_all_blocks()
+
+            if one_fold:
+                return result
 
         y = (
             pl.read_parquet(self.train_paths, columns=self.target)
@@ -281,69 +293,3 @@ class RFCCVTrainer:
             lg.on_end(overall_summary)
 
         return result
-
-    def fit_one_fold(
-        self,
-        fold_idx: int = 0,
-        loggers: list[CVLogger] | None = None
-    ) -> float:
-        t_total_start = now()
-        fold_summary = {}
-
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        loggers = loggers or [NoOpLogger()]
-        meta = {
-            "data_id": self.data_id,
-            "seed": self.seed,
-            "n_folds": self.n_folds,
-            **self.params
-        }
-        for lg in loggers:
-            lg.on_start(meta)
-
-        train = cudf.read_parquet(
-            self.train_paths,
-            columns=self.features + [self.target, self.fold_col]
-        )
-
-        X_train = train[train[self.fold_col] != fold_idx][self.features].to_cupy()
-        y_train = train[train[self.fold_col] != fold_idx][self.target].to_cupy()
-
-        X_valid = train[train[self.fold_col] == fold_idx][self.features].to_cupy()
-        y_valid = (
-            train[train[self.fold_col] == fold_idx]
-            [self.target].to_cupy().get().astype(cp.float32)
-        )
-
-        model = RandomForestClassifier(**self.params)
-        model.fit(X_train, y_train)
-
-        pred = model.predict(X_valid).get()
-
-        for name, metric_func in self.metrics.items():
-            val_score = metric_func(y_valid, pred)
-            print(f"{name.upper()} Valid: {val_score:.5f}")
-            fold_summary[name] = val_score
-
-        t_total_end = now()
-        fold_summary["runtime"] = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        for lg in loggers:
-            lg.on_fold_end(
-                fold_idx,
-                "iter",
-                summary=fold_summary
-            )
-
-        del train, X_train, y_train, X_valid, y_valid
-        gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
-        self.pmp.free_all_blocks()
-
-        return fold_summary[self.rep_metric]

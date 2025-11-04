@@ -476,11 +476,9 @@ class MLPCVTrainer:
 
     def fit(
         self,
-        loggers: list[CVLogger] | None = None
+        loggers: list[CVLogger] | None = None,
+        one_fold: bool = True
     ) -> dict:
-        if self.test_paths is None:
-            raise ValueError("Please provide test_paths (got None).")
-
         t_total_start = now()
 
         loggers = loggers or [NoOpLogger()]
@@ -493,11 +491,12 @@ class MLPCVTrainer:
         for lg in loggers:
             lg.on_start(meta)
 
-        train_rows = pq.ParquetFile(self.train_paths[0]).metadata.num_rows
-        test_rows = pq.ParquetFile(self.test_paths[0]).metadata.num_rows
+        if not one_fold:
+            train_rows = pq.ParquetFile(self.train_paths[0]).metadata.num_rows
+            test_rows = pq.ParquetFile(self.test_paths[0]).metadata.num_rows
 
-        oof = np.zeros(train_rows, dtype=np.float32)
-        test_pred = np.zeros(test_rows, dtype=np.float32)
+            oof = np.zeros(train_rows, dtype=np.float32)
+            test_pred = np.zeros(test_rows, dtype=np.float32)
 
         epoch_list = []
         fold_scores = {name: [] for name in self.metrics.keys()}
@@ -549,20 +548,6 @@ class MLPCVTrainer:
                 seed=self.seed,
                 shuffle=False
             )
-            test_ds = ParquetStream(
-                self.test_paths,
-                self.features,
-                self.target,
-                self.num_idxs,
-                self.mean,
-                self.std,
-                fold_col=self.fold_col,
-                batch_size=self.params["batch_size"],
-                predict_mode=True,
-                seed=self.seed,
-                shuffle=False
-            )
-
             train_loader = DataLoader(
                 train_ds,
                 batch_size=None,
@@ -575,12 +560,27 @@ class MLPCVTrainer:
                 num_workers=0,
                 shuffle=False
             )
-            test_loader = DataLoader(
-                test_ds,
-                batch_size=None,
-                num_workers=0,
-                shuffle=False
-            )
+
+            if not one_fold:
+                test_ds = ParquetStream(
+                    self.test_paths,
+                    self.features,
+                    self.target,
+                    self.num_idxs,
+                    self.mean,
+                    self.std,
+                    fold_col=self.fold_col,
+                    batch_size=self.params["batch_size"],
+                    predict_mode=True,
+                    seed=self.seed,
+                    shuffle=False
+                )
+                test_loader = DataLoader(
+                    test_ds,
+                    batch_size=None,
+                    num_workers=0,
+                    shuffle=False
+                )
 
             lf = pl.scan_parquet(self.train_paths)
             y_val = (
@@ -651,14 +651,14 @@ class MLPCVTrainer:
 
                 # Validation
                 model.eval()
-                preds = []
+                val_pred = []
                 train_pred = []
                 y_train = []
                 with torch.no_grad():
                     for xb, yb in val_loader:
                         pred_logits = model(xb)
                         pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
-                        preds.append(pred_probs)
+                        val_pred.append(pred_probs)
 
                     for batch in train_loader:
                         if len(batch) == 3:
@@ -673,7 +673,7 @@ class MLPCVTrainer:
                         train_pred.append(pred_probs)
                         y_train.append(yb.cpu().numpy())
 
-                val_pred = np.concatenate(preds)
+                val_pred = np.concatenate(val_pred)
                 train_pred = np.concatenate(train_pred)
                 y_train = np.concatenate(y_train)
 
@@ -722,27 +722,26 @@ class MLPCVTrainer:
             )
 
             model.eval()
-            val_preds = []
-            fold_test_preds = []
+            val_pred = []
+            fold_test_pred = []
             with torch.no_grad():
                 for xb, _ in val_loader:
                     xb = xb.to(self.params["device"])
                     val_logits = model(xb)
                     val_probs = torch.sigmoid(val_logits).cpu().numpy()
-                    val_preds.append(val_probs)
+                    val_pred.append(val_probs)
 
-                for xb in test_loader:
-                    xb = xb.to(self.params["device"])
-                    test_logits = model(xb)
-                    test_probs = torch.sigmoid(test_logits).cpu().numpy()
-                    fold_test_preds.append(test_probs)
+                if not one_fold:
+                    for xb in test_loader:
+                        xb = xb.to(self.params["device"])
+                        test_logits = model(xb)
+                        test_probs = torch.sigmoid(test_logits).cpu().numpy()
+                        fold_test_pred.append(test_probs)
 
-            val_preds = np.concatenate(val_preds).ravel()
-            oof[val_idx] = val_preds
-            test_pred += np.concatenate(fold_test_preds).ravel()
+            val_pred = np.concatenate(val_pred).ravel()
 
             for name, metric_func in self.metrics.items():
-                val_score = metric_func(y_val, val_preds)
+                val_score = metric_func(y_val, val_pred)
                 print(f"{name.upper()} Valid: {val_score:.5f}")
                 fold_summary[name] = val_score
                 fold_scores[name].append(val_score)
@@ -760,10 +759,24 @@ class MLPCVTrainer:
                     extra_hist,
                     fold_summary
                 )
+
+            if one_fold:
+                result = {
+                    "oof": None,
+                    "test_pred": None,
+                    "oof_score": fold_scores[self.rep_metric][0]
+                }
+            else:
+                oof[val_idx] = val_pred
+                test_pred += np.concatenate(fold_test_pred).ravel()
+
             del model
             gc.collect()
             cp.get_default_memory_pool().free_all_blocks()
             self.pmp.free_all_blocks()
+
+            if one_fold:
+                return result
 
         y = (
             pl.read_parquet(self.train_paths, columns=self.target)
@@ -824,238 +837,3 @@ class MLPCVTrainer:
             lg.on_end(overall_summary)
 
         return result
-
-    def fit_one_fold(
-        self,
-        fold_idx: int = 0,
-        loggers: list[CVLogger] | None = None
-    ) -> float:
-        t_total_start = now()
-        fold_summary = {}
-
-        loggers = loggers or [NoOpLogger()]
-        meta = {
-            "data_id": self.data_id,
-            "seed": self.seed,
-            "n_folds": self.n_folds,
-            **self.params
-        }
-        for lg in loggers:
-            lg.on_start(meta)
-
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        train_ds = ParquetStream(
-            self.train_paths,
-            self.features,
-            self.target,
-            self.num_idxs,
-            self.mean,
-            self.std,
-            fold_col=self.fold_col,
-            exclude_fold=fold_idx,
-            weight_col=self.weight_col,
-            batch_size=self.params["batch_size"],
-            predict_mode=False,
-            seed=self.seed,
-            shuffle=True
-        )
-        valid_ds = ParquetStream(
-            self.train_paths,
-            self.features,
-            self.target,
-            self.num_idxs,
-            self.mean,
-            self.std,
-            fold_col=self.fold_col,
-            include_fold=fold_idx,
-            batch_size=self.params["batch_size"],
-            predict_mode=False,
-            seed=self.seed,
-            shuffle=False
-        )
-
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=None,
-            num_workers=0,
-            shuffle=False
-        )
-        val_loader = DataLoader(
-            valid_ds,
-            batch_size=None,
-            num_workers=0,
-            shuffle=False
-        )
-
-        lf = pl.scan_parquet(self.train_paths)
-        y_val = (
-            lf.filter(pl.col(self.fold_col) == fold_idx)
-            .select(self.target)
-            .collect(engine="streaming")
-            .to_series()
-            .to_numpy()
-            .astype("float32")
-        )
-
-        model = SimpleMLP(
-            input_dim=len(self.features),
-            hidden_dims=self.params["hidden_dims"],
-            dropout_rate=self.params["dropout_rate"],
-            activation=self.params["activation"],
-            num_idxs=self.num_idxs,
-            cat_idxs=self.cat_idxs,
-            cat_dims=self.cat_dims
-        ).to(self.params["device"])
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.params["lr"])
-        scheduler = CosineAnnealingLR(
-            optimizer,
-            T_max=self.params["t_max"],
-            eta_min=self.params["eta_min"]
-        )
-
-        best_logloss = float("inf")
-        best_model_state = None
-        best_epoch = 0
-
-        history = {
-            "train": {key: [] for key in self.metrics},
-            "valid": {key: [] for key in self.metrics}
-        }
-        extra_hist = {"lr": []}
-
-        for epoch in range(self.params["max_epochs"]):
-            model.train()
-            for batch in train_loader:
-                if len(batch) == 3:
-                    xb, yb, wb = batch
-                else:
-                    xb, yb = batch
-                    wb = None
-
-                preds = model(xb)
-
-                if wb is None:
-                    loss = F.binary_cross_entropy_with_logits(
-                        preds, yb, reduction="mean"
-                    )
-                else:
-                    loss = F.binary_cross_entropy_with_logits(
-                        preds, yb, weight=wb, reduction="mean"
-                    )
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-            # Validation
-            model.eval()
-            preds = []
-            train_pred = []
-            y_train = []
-            with torch.no_grad():
-                for xb, yb in val_loader:
-                    pred_logits = model(xb)
-                    pred_probs = torch.sigmoid(pred_logits).cpu().numpy()
-                    preds.append(pred_probs)
-
-                for batch in train_loader:
-                    if len(batch) == 3:
-                        xb, yb, wb = batch
-                    else:
-                        xb, yb = batch
-                        wb = None
-                    xb = xb.to(self.params["device"])
-                    pred_logits = model(xb)
-                    pred_probs = torch.sigmoid(
-                        pred_logits).cpu().numpy()
-                    train_pred.append(pred_probs)
-                    y_train.append(yb.cpu().numpy())
-
-            val_pred = np.concatenate(preds)
-            train_pred = np.concatenate(train_pred)
-            y_train = np.concatenate(y_train)
-
-            for name, metric_func in self.metrics.items():
-                train_score = metric_func(y_train, train_pred)
-                val_score = metric_func(y_val, val_pred)
-
-                history["train"][name].append(train_score)
-                history["valid"][name].append(val_score)
-
-            lr = scheduler.get_last_lr()[0]
-            extra_hist["lr"].append(lr)
-            scheduler.step()
-
-            logloss_train = history['train']['log_loss'][-1]
-            logloss_val = history['valid']['log_loss'][-1]
-            print(
-                f"Epoch {epoch+1}: "
-                f"Train LogLoss = {logloss_train:.5f}, "
-                f"Val LogLoss = {logloss_val:.5f}"
-            )
-
-            if logloss_val < best_logloss:
-                best_logloss = logloss_val
-                best_model_state = {
-                    k: v.cpu().clone() for k, v
-                    in model.state_dict().items()
-                }
-                best_epoch = epoch + 1
-                print(
-                    f"New best model saved at epoch {epoch+1}, "
-                    f"Logloss: {logloss_val:.5f}")
-            elif (
-                (epoch - best_epoch >= self.params["early_stopping_rounds"])
-                and (epoch + 1 >= self.params["min_epochs"])
-            ):
-                print(f"Early stopping at epoch {epoch+1}")
-                print(f"Loading best model from epoch {best_epoch} "
-                      f"with Logloss {logloss_val:.5f}")
-                break
-
-        model.load_state_dict(
-            {
-                k: v.to(self.params["device"])
-                for k, v in best_model_state.items()
-            }
-        )
-
-        model.eval()
-        val_preds = []
-        with torch.no_grad():
-            for xb, _ in val_loader:
-                xb = xb.to(self.params["device"])
-                val_logits = model(xb)
-                val_probs = torch.sigmoid(val_logits).cpu().numpy()
-                val_preds.append(val_probs)
-
-        val_preds = np.concatenate(val_preds).ravel()
-
-        for name, metric_func in self.metrics.items():
-            val_score = metric_func(y_val, val_preds)
-            print(f"{name.upper()} Valid: {val_score:.5f}")
-            fold_summary[name] = val_score
-
-        t_total_end = now()
-        fold_summary["runtime"] = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        for lg in loggers:
-            lg.on_fold_end(
-                fold_idx,
-                "epoch",
-                history,
-                extra_hist,
-                fold_summary
-            )
-        del model
-        gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
-        self.pmp.free_all_blocks()
-
-        return fold_summary[self.rep_metric]

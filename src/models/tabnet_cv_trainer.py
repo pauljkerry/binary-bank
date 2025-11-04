@@ -181,11 +181,9 @@ class TabNetCVTrainer:
 
     def fit(
         self,
-        loggers: list[CVLogger] | None = None
+        loggers: list[CVLogger] | None = None,
+        one_fold: bool = True
     ) -> dict:
-        if self.test_paths is None:
-            raise ValueError("Please provide test_paths (got None).")
-
         t_total_start = now()
 
         loggers = loggers or [NoOpLogger()]
@@ -198,21 +196,34 @@ class TabNetCVTrainer:
         for lg in loggers:
             lg.on_start(meta)
 
-        train_rows = (
-            self.lf_train
-                .select(pl.len())
-                .collect()
-                .item()
-        )
-        test_rows = (
-            self.lf_test
-                .select(pl.len())
-                .collect()
-                .item()
-        )
+        if not one_fold:
+            train_rows = (
+                self.lf_train
+                    .select(pl.len())
+                    .collect()
+                    .item()
+            )
+            test_rows = (
+                self.lf_test
+                    .select(pl.len())
+                    .collect()
+                    .item()
+            )
 
-        oof = np.zeros(train_rows, dtype=np.float32)
-        test_pred = np.zeros(test_rows, dtype=np.float32)
+            oof = np.zeros(train_rows, dtype=np.float32)
+            test_pred = np.zeros(test_rows, dtype=np.float32)
+
+            test = (
+                self.lf_test
+                .select(self.features)
+                .collect(streaming=True)
+                .to_numpy()
+                .astype(np.float32)
+            )
+            test[:, self.num_idxs] = (
+                (test[:, self.num_idxs] - self.mean)
+                / self.std
+            )
 
         epoch_list = []
         fold_scores = {name: [] for name in self.metrics.keys()}
@@ -272,13 +283,6 @@ class TabNetCVTrainer:
                 .to_numpy()
                 .astype(np.int32, copy=False)
             )
-            test = (
-                self.lf_test
-                .select(self.features)
-                .collect(streaming=True)
-                .to_numpy()
-                .astype(np.float32)
-            )
 
             X_train[:, self.num_idxs] = (
                 (X_train[:, self.num_idxs] - self.mean)
@@ -286,10 +290,6 @@ class TabNetCVTrainer:
             )
             X_valid[:, self.num_idxs] = (
                 (X_valid[:, self.num_idxs] - self.mean)
-                / self.std
-            )
-            test[:, self.num_idxs] = (
-                (test[:, self.num_idxs] - self.mean)
                 / self.std
             )
 
@@ -338,8 +338,6 @@ class TabNetCVTrainer:
             )
 
             val_pred = model.predict_proba(X_valid)[:, 1]
-            oof[val_idx] = val_pred
-            test_pred += model.predict_proba(test)[:, 1]
 
             for name, metric_func in self.metrics.items():
                 val_score = metric_func(y_valid, val_pred)
@@ -361,8 +359,21 @@ class TabNetCVTrainer:
                     extra_hist,
                     fold_summary
                 )
-            del model, X_train, y_train, X_valid, y_valid, test
+            if one_fold:
+                result = {
+                    "oof": None,
+                    "test_pred": None,
+                    "oof_score": fold_scores[self.rep_metric][0]
+                }
+            else:
+                oof[val_idx] = val_pred
+                test_pred += model.predict_proba(test)[:, 1]
+
+            del model, X_train, y_train, X_valid, y_valid
             gc.collect()
+
+            if one_fold:
+                return result
 
         y = (
             pl.read_parquet(self.train_paths, columns=self.target)
@@ -423,139 +434,3 @@ class TabNetCVTrainer:
             lg.on_end(overall_summary)
 
         return result
-
-    def fit_one_fold(
-        self,
-        fold_idx: int = 0,
-        loggers: list[CVLogger] | None = None
-    ) -> float:
-        t_total_start = now()
-        fold_summary = {}
-
-        loggers = loggers or [NoOpLogger()]
-        meta = {
-            "data_id": self.data_id,
-            "seed": self.seed,
-            "n_fold": self.n_fold,
-            **self.params
-        }
-        for lg in loggers:
-            lg.on_start(meta)
-
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        need_cols = self.features + [self.target, "row_id"]
-        train = (
-            self.lf_train
-            .filter(pl.col(self.fold_col) != fold_idx)
-            .select(need_cols)
-            .collect(engine="streaming")
-        )
-        valid = (
-            self.lf_train
-            .filter(pl.col(self.fold_col) == fold_idx)
-            .select(need_cols)
-            .collect(engine="streaming")
-        )
-        X_train = (
-            train
-            .select(self.features)
-            .to_numpy()
-            .astype(np.float32)
-        )
-        y_train = (
-            train
-            .select(self.target)
-            .to_numpy()
-            .astype(np.int64)
-        )
-        X_valid = (
-            valid
-            .select(self.features)
-            .to_numpy()
-            .astype(np.float32)
-        )
-        y_valid = (
-            valid
-            .select(self.target)
-            .to_numpy()
-            .astype(np.int64)
-        )
-
-        X_train[:, self.num_idxs] = (
-            (X_train[:, self.num_idxs] - self.mean) / self.std
-        )
-        X_valid[:, self.num_idxs] = (
-            (X_valid[:, self.num_idxs] - self.mean) / self.std
-        )
-
-        history = {
-            "train": {key: [] for key in self.metrics},
-            "valid": {key: [] for key in self.metrics}
-        }
-        extra_hist = {"lr": []}
-
-        model = TabNetClassifier(
-            cat_idxs=self.cat_idxs,
-            cat_dims=self.cat_dims,
-            cat_emb_dim=self.embedding_dims,
-            n_d=self.params["n_d"],
-            n_a=self.params["n_a"],
-            n_steps=self.params["n_steps"],
-            gamma=self.params["gamma"],
-            n_independent=self.params["n_independent"],
-            n_shared=self.params["n_shared"],
-            momentum=self.params["momentum"],
-            lambda_sparse=self.params["lambda_sparse"],
-            optimizer_fn=torch.optim.Adam,
-            optimizer_params=dict(lr=self.params["lr"], weight_decay=1e-5),
-            scheduler_params={
-                "T_max": self.params["t_max"],
-                "eta_min": self.params["eta_min"]
-            },
-            scheduler_fn=torch.optim.lr_scheduler.CosineAnnealingLR,
-            mask_type=self.params["mask_type"],
-            verbose=1,
-            seed=self.seed,
-            device_name=self.params["device"]
-        )
-
-        model.fit(
-            X_train=X_train,
-            y_train=y_train.flatten(),
-            eval_set=[(X_valid, y_valid.flatten())],
-            eval_metric=self.params["eval_metric"],
-            max_epochs=self.params["max_epochs"],
-            patience=self.params["patience"],
-            batch_size=self.params["batch_size"],
-            virtual_batch_size=self.params["virtual_batch_size"],
-            num_workers=0,
-            drop_last=False
-        )
-
-        pred = model.predict_proba(X_valid).get()[:, 1]
-
-        for name, metric_func in self.metrics.items():
-            val_score = metric_func(y_valid, pred)
-            print(f"{name.upper()} Valid: {val_score:.5f}")
-            fold_summary[name] = val_score
-
-        t_total_end = now()
-        fold_summary["runtime"] = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        for lg in loggers:
-            lg.on_fold_end(
-                fold_idx,
-                "epoch",
-                summary=fold_summary
-            )
-
-        del train, X_train, y_train, X_valid, y_valid
-        gc.collect()
-
-        return fold_summary[self.rep_metric]
