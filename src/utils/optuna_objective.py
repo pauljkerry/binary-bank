@@ -203,8 +203,6 @@ def create_objective(
                 "n_folds": n_folds,
                 "level": level,
                 "model": model_type,
-                **params,
-                **opts
             },
             tags=[model_type, level],
             reinit="finish_previous",

@@ -137,7 +137,8 @@ class BaseCVTrainer(ABC):
             "data_id": self.data_id,
             "seed": self.seed,
             "n_folds": self.n_folds,
-            **self.params
+            **self.params,
+            **self.opts
         }
         for lg in loggers:
             lg.on_start(meta)
