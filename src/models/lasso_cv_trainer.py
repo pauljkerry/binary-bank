@@ -1,33 +1,11 @@
-import re
 from dataclasses import dataclass
 
 import cudf
 import cupy as cp
-import numpy as np
-import polars as pl
 from cuml.linear_model import Lasso
 
-from src.models.base_cv_trainer import BaseCVTrainer
-
-
-def compute_feature_stats(
-    paths: list[str],
-    features: list[str],
-    num_cols: list[str]
-) -> (float, float):
-    lf = pl.scan_parquet(paths, low_memory=True)
-
-    exprs = []
-    for c in num_cols:
-        exprs += [pl.col(c).cast(pl.Float32).mean().alias(f"{c}_mean"),
-                  pl.col(c).cast(pl.Float32).std(ddof=0).alias(f"{c}_std")]
-    out = lf.select(exprs).collect(streaming=True)
-    mean = out.select(
-        [f"{c}_mean" for c in num_cols]).to_numpy().ravel().astype(np.float32)
-    std = out.select(
-        [f"{c}_std" for c in num_cols]).to_numpy().ravel().astype(np.float32)
-    std[std == 0] = 1.0
-    return cp.asarray(mean, dtype=cp.float32), cp.asarray(std, dtype=cp.float32)
+from src.models.base_cv_trainer import BaseCVTrainer, TrainResult
+from src.utils.compute_feature_stats import compute_feature_stats
 
 
 @dataclass
@@ -43,25 +21,16 @@ class LassoCVTrainer(BaseCVTrainer):
         }
         self.params = {**default_params, **self.params}
 
-        if self.features is None:
-            meta = {
-                c
-                for c in ("row_id", self.target, self.weight_col, self.fold_col)
-                if c and c in self.all_cols
-            }
-            if self.cat_cols:
-                meta |= self.cat_cols
-            pat = re.compile(r"^\d+fold(?:-[A-Za-z0-9]+)?$")
-            self.features = [
-                c for c in self.all_cols
-                if c not in meta and not pat.fullmatch(c)
-            ]
+        # Cat colsを除外
+        self.features = [c for c in self.features if c not in self.cat_cols]
 
         self.mean, self.std = compute_feature_stats(
             self.train_paths,
             self.features,
             self.features,
         )
+        self.mean = cp.asarray(self.mean, dtype=cp.float32)
+        self.std = cp.asarray(self.mean, dtype=cp.float32)
 
     def train_model(self, fold):
         train = cudf.read_parquet(
@@ -92,8 +61,14 @@ class LassoCVTrainer(BaseCVTrainer):
         model = Lasso(**self.params)
         model.fit(X_train, y_train)
 
-        pred = model.predict_proba(X_valid).get()[:, 1]
-        return model, pred, None, None
+        return TrainResult(
+            model=model,
+            val_pred=model.predict(X_valid).get(),
+            evals_result=None,
+            extra=None,
+            fi=None,
+            best_iteration=None
+        )
 
     def predict_test(self, model):
         test = cudf.read_parquet(
@@ -102,5 +77,7 @@ class LassoCVTrainer(BaseCVTrainer):
 
         test -= self.mean
         test /= (self.std + 1e-8)
-        pred = model.predict_proba(test).get()[:, 1]
-        return pred
+        return model.predict(test).get()
+
+    def train_on_all_data(self):
+        pass

@@ -1,5 +1,4 @@
 import math
-import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -49,18 +48,6 @@ class LGBMCVTrainer(BaseCVTrainer):
             self.early_stopping_rounds = max(50, int(math.ceil(10.0 / lr)))
 
         self.params = merged
-
-        if self.features is None:
-            meta = {
-                c
-                for c in ("row_id", self.target, self.weight_col, self.fold_col)
-                if c and c in self.all_cols
-            }
-            pat = re.compile(r"^\d+fold(?:-[A-Za-z0-9]+)?$")
-            self.features = [
-                c for c in self.all_cols
-                if c not in meta and not pat.fullmatch(c)
-            ]
 
     def train_model(self, fold) -> TrainResult:
         need_cols = self.features + [self.target, "row_id"]
@@ -202,5 +189,5 @@ class LGBMCVTrainer(BaseCVTrainer):
             evals_result=None,
             extra=None,
             fi=None,
-            best_iteration=self.num_boost_round
+            best_iteration=model.best_iteration
         )

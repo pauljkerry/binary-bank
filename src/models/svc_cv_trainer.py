@@ -1,26 +1,28 @@
 from dataclasses import dataclass
-
 import cudf
+from cuml.svm import SVC
 import cupy as cp
-from cuml.linear_model import LogisticRegression
 
 from src.models.base_cv_trainer import BaseCVTrainer, TrainResult
 from src.utils.compute_feature_stats import compute_feature_stats
 
 
 @dataclass
-class LogRegCVTrainer(BaseCVTrainer):
+class SVCCVTrainer(BaseCVTrainer):
     def __post_init__(self):
         super().__post_init__()
         self.log_axis_name = "iter"
 
         default_params = {
-            "C": 1.0,
-            "penalty": "l2",
-            "solver": "qn",
-            "max_iter": 3000,
-            "class_weight": None
+            "c": 3.0,
+            "gamma": "scale",
+            "kernel": "rbf",
+            "cache_size": 1024,
+            "max_iter": -1,
+            "tol": 1e-3,
+            "probability": False
         }
+
         self.params = {**default_params, **self.params}
 
         # Cat colsを除外
@@ -40,19 +42,10 @@ class LogRegCVTrainer(BaseCVTrainer):
             columns=self.features + [self.target, self.fold_col]
         )
 
-        X_train = (
-            train[train[self.fold_col] != fold]
-            [self.features].to_cupy().astype(cp.float32)
-        )
-        y_train = (
-            train[train[self.fold_col] != fold]
-            [self.target].to_cupy().astype(cp.float32)
-        )
+        X_train = train[train[self.fold_col] != fold][self.features].to_cupy()
+        y_train = train[train[self.fold_col] != fold][self.target].to_cupy()
 
-        X_valid = (
-            train[train[self.fold_col] == fold]
-            [self.features].to_cupy().astype(cp.float32)
-        )
+        X_valid = train[train[self.fold_col] == fold][self.features].to_cupy()
 
         X_train -= self.mean
         X_train /= (self.std + 1e-8)
@@ -60,12 +53,12 @@ class LogRegCVTrainer(BaseCVTrainer):
         X_valid -= self.mean
         X_valid /= (self.std + 1e-8)
 
-        model = LogisticRegression(**self.params)
+        model = SVC(**self.params)
         model.fit(X_train, y_train)
 
         return TrainResult(
             model=model,
-            val_pred=model.predict_proba(X_valid).get()[:, 1],
+            val_pred=model.predict_proba(X_valid)[:, 1].get(),
             evals_result=None,
             extra=None,
             fi=None,
@@ -79,8 +72,7 @@ class LogRegCVTrainer(BaseCVTrainer):
 
         test -= self.mean
         test /= (self.std + 1e-8)
-        pred = model.predict_proba(test).get()[:, 1]
-        return pred
+        return model.predict_proba(test)[:, 1].get()
 
     def train_on_all_data(self):
         pass

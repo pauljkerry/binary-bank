@@ -1,34 +1,19 @@
 from __future__ import annotations
 import gc
-import os
 import re
 import math
 from dataclasses import dataclass, field
-from time import perf_counter as now
 from typing import Any, Iterable, Optional, List
 
 import cudf
-import rmm
-import cupy as cp
-import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
-import rmm.mr as mr
-from rmm.allocators.cupy import rmm_cupy_allocator
 import xgboost as xgb
-from sklearn.metrics import log_loss
-from sklearn.metrics import roc_auc_score
-from sklearn.metrics import mean_squared_error as mse
-from sklearn.metrics import r2_score
-
-from src.utils.loggers import CVLogger, NoOpLogger
-from src.utils.print_duration import print_duration
-from src.utils.mem_info import free_ram_gib, free_vram_gib
+from src.models.base_cv_trainer import BaseCVTrainer, TrainResult
 
 
 @dataclass(eq=False)
 class ParquetIter(xgb.core.DataIter):
-    # === 引数（元 __init__ のシグネチャ） ===
     paths: list[str]
 
     features: list[str] = None
@@ -138,37 +123,10 @@ class ParquetIter(xgb.core.DataIter):
 
 
 @dataclass
-class XGBCVTrainer:
-    data_id: str
-    train_paths: str | list[str]
-    test_paths: str | list[str] | None = None
-
-    features: Optional[list[str]] = None
-
-    target: str = "target"
-    fold_col: Optional[str] = None
-    weight_col: Optional[str] = None
-    cat_cols: Optional[list[str]] = None
-
-    params: dict = field(default_factory=dict)
-
-    n_folds: int = 5
-    seed: int = 42
-    gpu: bool = True
-
-    opts: dict = field(init=True, default_factory=dict)
-
+class XGBCVTrainer(BaseCVTrainer):
     def __post_init__(self):
-        if isinstance(self.train_paths, (str, os.PathLike)):
-            self.train_paths = [str(self.train_paths)]
-        else:
-            self.train_paths = [str(p) for p in self.train_paths]
-
-        if self.test_paths:
-            if isinstance(self.test_paths, (str, os.PathLike)):
-                self.test_paths = [str(self.test_paths)]
-            else:
-                self.test_paths = [str(p) for p in self.test_paths]
+        super().__post_init__()
+        self.log_axis_name = "iter"
 
         default_params = {
             "objective": "binary:logistic",
@@ -210,461 +168,16 @@ class XGBCVTrainer:
         # train() の引数として取り出す
         self.params = merged
 
-        self.rep_metric = "auc"
-        self.metrics = {
-            "rmse": lambda y, p: np.sqrt(mse(y, p)),
-            "r2": r2_score,
-            "mae": lambda y, p: np.mean(np.abs(y-p)),
-            # "mape": lambda y, p: np.mean(np.abs((y-p)/y)),
-            "accuracy": lambda y, p: np.mean(
-                [y_i == (1 if p_i > 0.5 else 0) for y_i, p_i in zip(y, p)]
-            ),
-            "log_loss": log_loss,
-            "auc": roc_auc_score
-        }
-
-        hdr = pl.read_parquet(self.train_paths, n_rows=0)
-        all_cols = hdr.columns
-
-        if self.fold_col is None:
-            self.fold_col = f"{self.n_folds}fold-s{self.seed}"
-
-        if self.cat_cols is None:
-            self.cat_cols = [
-                c for c, dt in zip(hdr.columns, hdr.dtypes)
-                if dt == pl.Categorical
-            ]
-
-        if self.fold_col not in all_cols:
-            raise ValueError(f"fold_col not found in dataset: {self.fold_col}")
-        else:
-            print(f"Fold Col: {self.fold_col}")
-
-        if self.features is None:
-            meta = {
-                c
-                for c in ("row_id", self.target, self.weight_col, self.fold_col)
-                if c and c in all_cols
-            }
-            pat = re.compile(r"^\d+fold(?:-[A-Za-z0-9]+)?$")
-            self.features = [
-                c for c in all_cols
-                if c not in meta and not pat.fullmatch(c)
-            ]
-
-        dev_mr = mr.CudaAsyncMemoryResource()
-        mr.set_current_device_resource(dev_mr)
-        rmm.reinitialize(
-            managed_memory=False,
-            initial_pool_size=None,
-        )
-        cp.cuda.set_allocator(rmm_cupy_allocator)
-
-        cp.get_default_memory_pool().set_limit(4 * 1024**3)
-        self.pmp = cp.cuda.PinnedMemoryPool()
-        cp.cuda.set_pinned_memory_allocator(self.pmp.malloc)
-
-    def fit(
-        self,
-        loggers: list[CVLogger] | None = None,
-        one_fold: bool = False
-    ) -> dict:
-        t_total_start = now()
-
-        loggers = loggers or [NoOpLogger()]
-        meta = {
-            "data_id": self.data_id,
-            "seed": self.seed,
-            "n_folds": self.n_folds,
-            "early_stopping_rounds": self.early_stopping_rounds,
-            **self.params
-        }
-        for lg in loggers:
-            lg.on_start(meta)
-
-        if not one_fold:
-            train_rows = (
-                pl.scan_parquet(self.train_paths)
-                  .select(pl.len())
-                  .collect()
-                  .item()
-            )
-            test_rows = (
-                pl.scan_parquet(self.test_paths)
-                  .select(pl.len())
-                  .collect()
-                  .item()
-            )
-
-            oof = np.zeros(train_rows, dtype=np.float32)
-            test_pred = np.zeros(test_rows, dtype=np.float32)
-
-            test_it = ParquetIter(
-                paths=self.test_paths,
-                features=self.features,
-                target=self.target,
-                cat_cols=self.cat_cols,
-                predict_mode=True,
-                gpu=self.gpu
-            )
-
-        iteration_list = []
-        fold_scores = {name: [] for name in self.metrics.keys()}
-        fi_fold_frames = []
-
-        for i in range(self.n_folds):
-            title = f" Fold {i + 1} / {self.n_folds} "
-            print("=" * 48)
-            print(f"{title:=^48}")
-            print("=" * 48)
-            print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-            print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-            t_fold_start = now()
-            t_qdm_start = now()
-            fold_summary = {}
-
-            train_it = ParquetIter(
-                paths=self.train_paths,
-                features=self.features,
-                target=self.target,
-                cat_cols=self.cat_cols,
-                fold_col=self.fold_col,
-                exclude_fold=i,
-                weight_col=self.weight_col,
-                gpu=True
-            )
-            valid_it = ParquetIter(
-                paths=self.train_paths,
-                features=self.features,
-                target=self.target,
-                cat_cols=self.cat_cols,
-                fold_col=self.fold_col,
-                include_fold=i,
-                weight_col=self.weight_col,
-                gpu=self.gpu
-            )
-
-            dtrain = xgb.QuantileDMatrix(
-                train_it,
-                enable_categorical=True
-            )
-            dvalid = xgb.QuantileDMatrix(
-                valid_it,
-                enable_categorical=True,
-                ref=dtrain
-            )
-
-            if not one_fold:
-                dtest = xgb.QuantileDMatrix(
-                    test_it,
-                    enable_categorical=True,
-                    ref=dtrain
-                )
-
-            y_valid = (
-                pl.read_parquet(
-                    self.train_paths, columns=[self.target, self.fold_col]
-                ).filter(pl.col(self.fold_col) == i)
-                .select(self.target)
-                .to_numpy()
-                .astype(np.int32)
-                .ravel()
-            )
-
-            val_idx = (
-                pl.scan_parquet(self.train_paths)
-                  .select(["row_id", self.fold_col])
-                  .filter(pl.col(self.fold_col) == i)
-                  .select("row_id")
-                  .collect()
-                  .get_column("row_id")
-                  .to_numpy()
-                  .astype(np.int32, copy=False)
-            )
-
-            evals_result = {}
-
-            t_qdm_end = now()
-            print_duration(t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time")
-
-            t_fit_start = now()
-
-            model = xgb.train(
-                self.params,
-                dtrain,
-                num_boost_round=self.num_boost_round,
-                evals=[(dtrain, "train"), (dvalid, "valid")],
-                early_stopping_rounds=self.early_stopping_rounds,
-                verbose_eval=100,
-                evals_result=evals_result,
-            )
-
-            val_pred = model.predict(
-                dvalid, iteration_range=(0, model.best_iteration + 1)
-            )
-            if not one_fold:
-                oof[val_idx] = val_pred
-                test_pred += model.predict(
-                    dtest,
-                    iteration_range=(0, model.best_iteration + 1)
-                )
-
-            t_fit_end = now()
-
-            print_duration(t_fit_start, t_fit_end)
-
-            best_iter = model.best_iteration
-            fold_summary["best_iter"] = best_iter
-
-            for name, metric_func in self.metrics.items():
-                val_score = metric_func(y_valid, val_pred)
-                print(f"{name.upper()} Valid: {val_score:.5f}")
-                fold_summary[name] = val_score
-                fold_scores[name].append(val_score)
-
-            iteration_list.append(best_iter)
-
-            importances = model.get_score(importance_type="total_gain")
-            total_gain = float(sum(importances.values()))
-            df = pl.DataFrame(
-                {
-                    "Feature": list(importances.keys()),
-                    "Importance": [
-                        ((v/total_gain)*100.0)/self.n_folds
-                        for v in importances.values()
-                    ],
-                }
-            )
-            fi_fold_frames.append(df)
-
-            t_fold_end = now()
-            fold_summary["runtime"] = print_duration(
-                t_fold_start, t_fold_end, f"\nFold {i+1} Runtime"
-            )
-
-            for lg in loggers:
-                lg.on_fold_end(
-                    i,
-                    "iter",
-                    evals_result,
-                    summary=fold_summary
-                )
-
-            if one_fold:
-                result = {
-                    "oof": None,
-                    "test_pred": None,
-                    "oof_score": fold_scores[self.rep_metric][0],
-                    "fi_mean": df
-                }
-            else:
-                del dtest
-
-            del model, train_it, valid_it, dtrain, dvalid, val_idx
-            gc.collect()
-            cp.get_default_memory_pool().free_all_blocks()
-            self.pmp.free_all_blocks()
-
-            if one_fold:
-                return result
-
-        y = (
-            pl.read_parquet(self.train_paths, columns=self.target)
-              .get_column(self.target)
-              .cast(pl.Float32)
-              .to_numpy()
-        )
-        test_pred /= self.n_folds
-
-        oofs = {
-            name: metric_func(y, oof)
-            for name, metric_func in self.metrics.items()
-        }
-
-        oof_stats = {
-            name: {
-                "oof": oofs[name],
-                "mean": np.mean(vals),
-                "std": np.std(vals)
-            }
-            for name, vals in fold_scores.items()
-        }
-
-        all_fi = pl.concat(fi_fold_frames, how="vertical_relaxed")
-        fi_mean = (
-            all_fi
-            .group_by("Feature")
-            .agg([
-                pl.sum("Importance").alias("Importance")
-            ])
-        ).sort("Importance", descending=True)
-
-        iter_mean = np.mean(iteration_list)
-
-        print(f"\n{' CV Results ':*^48}")
-        print("─" * 48)
-        print(f" {'Metric':^9}  {'OOF':>10}  {'Mean':>10} ± {'Std':<10} ")
-        print("-" * 48)
-        for name, stats in oof_stats.items():
-            print(f" {name.upper():^9} "
-                  f" {stats['oof']:>10.5f} "
-                  f" {stats['mean']:>10.5f} ± {stats['std']:<10.5f} ")
-        print("─" * 48)
-        print(f"Avg best iteration: {iter_mean}")
-
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        result = {
-            "oof": oof,
-            "test_pred": test_pred,
-            "oof_score": oofs[self.rep_metric],
-            "fi_mean": fi_mean
-        }
-        overall_summary = {"iter_mean": iter_mean}
-        for name, stats in oof_stats.items():
-            overall_summary[f"{name}_mean"] = stats["mean"]
-            overall_summary[f"{name}_std"] = stats["std"]
-            overall_summary[f"{name}_oof"] = oofs[name]
-
-        t_total_end = now()
-        overall_summary["total_runtime"] = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
-        )
-
-        for lg in loggers:
-            lg.on_end(overall_summary)
-
-        return result
-
-    def full_train(
-        self,
-        loggers: list[CVLogger] | None = None
-    ) -> dict:
-        t_total_start = now()
-
-        loggers = loggers or [NoOpLogger()]
-        meta = {
-            "data_id": self.data_id,
-            "seed": self.seed,
-            "n_folds": self.n_folds,
-            "early_stopping_rounds": self.early_stopping_rounds,
-            **self.params
-        }
-        for lg in loggers:
-            lg.on_start(meta)
-
-        test_rows = pq.ParquetFile(self.test_path).metadata.num_rows
-        test_pred = np.zeros(test_rows, dtype=np.float32)
-
-        self.num_boost_round = (
-            self.num_boost_round * (self.n_folds/(self.n_folds-1))
-        )
-
-        t_qdm_start = now()
-
+    def train_model(self, fold) -> TrainResult:
         train_it = ParquetIter(
             paths=self.train_paths,
             features=self.features,
             target=self.target,
             cat_cols=self.cat_cols,
             fold_col=self.fold_col,
+            exclude_fold=fold,
             weight_col=self.weight_col,
-            gpu=self.gpu
-        )
-
-        test_it = ParquetIter(
-            paths=self.test_paths,
-            features=self.features,
-            target=self.target,
-            cat_cols=self.cat_cols,
-            weight_col=self.weight_col,
-            predict_mode=True,
-            gpu=self.gpu
-        )
-
-        dtrain = xgb.QuantileDMatrix(
-            train_it,
-            enable_categorical=True
-        )
-        dtest = xgb.QuantileDMatrix(
-            test_it,
-            enable_categorical=True,
-            ref=dtrain
-        )
-        t_qdm_end = now()
-        print_duration(t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time")
-
-        t_fit_start = now()
-
-        model = xgb.train(
-            self.params,
-            dtrain,
-            num_boost_round=self.num_boost_round,
-            evals=[]
-        )
-        t_fit_end = now()
-
-        print_duration(t_fit_start, t_fit_end)
-
-        test_pred = model.predict(dtest)
-
-        t_total_end = now()
-        total_runtime = print_duration(
-            t_total_start, t_total_end, "Total Runtime"
-        )
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        result = {
-            "oof": None,
-            "test_pred": test_pred,
-            "oof_score": None
-        }
-        overall_summary = {
-            "total_runtime": total_runtime
-        }
-        for lg in loggers:
-            lg.on_end(overall_summary)
-
-        return result
-
-    def fit_one_fold(
-        self,
-        fold_idx: int = 0,
-        loggers: bool = None
-    ) -> float:
-        t_total_start = now()
-        fold_summary = {}
-
-        loggers = loggers or [NoOpLogger()]
-        meta = {
-            "data_id": self.data_id,
-            "seed": self.seed,
-            "n_folds": self.n_folds,
-            "early_stopping_rounds": self.early_stopping_rounds,
-            **self.params
-        }
-        for lg in loggers:
-            lg.on_start(meta)
-
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
-        evals_result = {}
-
-        t_qdm_start = now()
-
-        train_it = ParquetIter(
-            paths=self.train_paths,
-            features=self.features,
-            target=self.target,
-            cat_cols=self.cat_cols,
-            fold_col=self.fold_col,
-            exclude_fold=fold_idx,
-            weight_col=self.weight_col,
-            gpu=self.gpu
+            gpu=True
         )
         valid_it = ParquetIter(
             paths=self.train_paths,
@@ -672,77 +185,116 @@ class XGBCVTrainer:
             target=self.target,
             cat_cols=self.cat_cols,
             fold_col=self.fold_col,
-            include_fold=fold_idx,
+            include_fold=fold,
             weight_col=self.weight_col,
             gpu=self.gpu
         )
 
-        dtrain = xgb.QuantileDMatrix(
+        self.dtrain = xgb.QuantileDMatrix(
             train_it,
             enable_categorical=True
         )
         dvalid = xgb.QuantileDMatrix(
             valid_it,
             enable_categorical=True,
-            ref=dtrain
+            ref=self.dtrain
         )
 
-        y_valid = (
-            pl.read_parquet(
-                self.train_paths, columns=[self.target, self.fold_col]
-            ).filter(pl.col(self.fold_col) == fold_idx)
-            .select(self.target)
-            .to_numpy()
-            .astype(np.int32)
-            .ravel()
-        )
-
-        t_qdm_end = now()
-        print_duration(t_qdm_start, t_qdm_end, "\nQuantileDMatrix Build Time")
-
-        t_fit_start = now()
+        evals_result = {}
 
         model = xgb.train(
             self.params,
-            dtrain,
+            self.dtrain,
             num_boost_round=self.num_boost_round,
-            evals=[(dtrain, "train"), (dvalid, "valid")],
+            evals=[(self.dtrain, "train"), (dvalid, "valid")],
             early_stopping_rounds=self.early_stopping_rounds,
             verbose_eval=100,
             evals_result=evals_result,
         )
 
-        t_fit_end = now()
-        print_duration(t_fit_start, t_fit_end)
-
-        fold_summary["best_iter"] = model.best_iteration
-
+        importances = model.get_score(importance_type="total_gain")
+        total_gain = float(sum(importances.values()))
+        fi_df = pl.DataFrame(
+            {
+                "Feature": list(importances.keys()),
+                "Importance": [
+                    ((v/total_gain)*100.0)/self.n_folds
+                    for v in importances.values()
+                ],
+            }
+        )
         val_pred = model.predict(
             dvalid, iteration_range=(0, model.best_iteration + 1)
         )
-        for name, metric_func in self.metrics.items():
-            val_score = metric_func(y_valid, val_pred)
-            print(f"{name.upper()} Valid: {val_score:.5f}")
-            fold_summary[name] = val_score
+        # GPU配列(CuPy)ならCPU(NumPy)に戻す
+        if hasattr(val_pred, "get"):
+            val_pred = val_pred.get()
+        elif hasattr(val_pred, "to_numpy"):
+            val_pred = val_pred.to_numpy()
 
-        del train_it, valid_it, dtrain, dvalid, y_valid, model
-        gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
-        self.pmp.free_all_blocks()
+        return TrainResult(
+                    model=model,
+                    val_pred=val_pred,
+                    evals_result=evals_result,
+                    fi=fi_df,
+                    best_iteration=model.best_iteration
+                )
 
-        t_total_end = now()
-        fold_summary["runtime"] = print_duration(
-            t_total_start, t_total_end, "Total CV Runtime"
+    def predict_test(self, model):
+        test_it = ParquetIter(
+            paths=self.test_paths,
+            features=self.features,
+            target=self.target,
+            cat_cols=self.cat_cols,
+            predict_mode=True,
+            gpu=self.gpu
         )
-        print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
-        print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
+        dtest = xgb.QuantileDMatrix(
+            test_it,
+            enable_categorical=True,
+            ref=self.dtrain
+        )
+        pred = model.predict(
+            dtest,
+            iteration_range=(0, model.best_iteration + 1)
+        )
 
-        for lg in loggers:
-            lg.on_fold_end(
-                fold_idx,
-                "iter",
-                evals_result,
-                summary=fold_summary
-            )
+        if hasattr(pred, "get"):
+            pred = pred.get()
+        return pred
 
-        return fold_summary[self.rep_metric]
+    def train_on_all_data(self) -> TrainResult:
+        boost_rounds = int(
+            self.num_boost_round * (self.n_folds/(self.n_folds-1))
+        )
+
+        train_it = ParquetIter(
+            paths=self.train_paths,
+            features=self.features,
+            target=self.target,
+            cat_cols=self.cat_cols,
+            fold_col=self.fold_col,
+            weight_col=self.weight_col,
+            gpu=self.gpu
+        )
+
+        self.dtrain = xgb.QuantileDMatrix(
+            train_it,
+            enable_categorical=True
+        )
+
+        model = xgb.train(
+            self.params,
+            self.dtrain,
+            num_boost_round=boost_rounds,
+            evals=[]
+        )
+
+        return TrainResult(
+            model=model,
+            val_pred=None,
+            evals_result=None,
+            extra=None,
+            fi=None,
+            best_iteration=model.best_iteration
+        )

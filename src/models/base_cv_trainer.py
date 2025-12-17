@@ -1,5 +1,6 @@
 import gc
 import os
+import re
 from dataclasses import dataclass, field
 from time import perf_counter as now
 from typing import Optional
@@ -75,7 +76,7 @@ class BaseCVTrainer(ABC):
             "auc": roc_auc_score
         }
         hdr = pl.read_parquet(self.train_paths, n_rows=0)
-        self.all_cols = hdr.columns
+        self.all_cols = pl.read_parquet(self.train_paths, n_rows=0).columns
 
         if self.fold_col is None:
             self.fold_col = f"{self.n_folds}fold-s{self.seed}"
@@ -89,6 +90,18 @@ class BaseCVTrainer(ABC):
             self.cat_cols = [
                 c for c, dt in zip(hdr.columns, hdr.dtypes)
                 if dt == pl.Categorical
+            ]
+
+        if self.features is None:
+            meta = {
+                c
+                for c in ("row_id", self.target, self.weight_col, self.fold_col)
+                if c and c in self.all_cols
+            }
+            pat = re.compile(r"^\d+fold(?:-[A-Za-z0-9]+)?$")
+            self.features = [
+                c for c in self.all_cols
+                if c not in meta and not pat.fullmatch(c)
             ]
 
         self.fold_df = (
