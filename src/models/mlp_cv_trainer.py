@@ -711,7 +711,8 @@ class MLPCVTrainer:
                 ):
                     print(f"Early stopping at epoch {epoch+1}")
                     print(f"Loading best model from epoch {best_epoch} "
-                          f"with Logloss {logloss_val:.5f}")
+                          f"with Logloss {best_logloss:.5f}")
+                    epoch_list.append(best_epoch)
                     break
 
             model.load_state_dict(
